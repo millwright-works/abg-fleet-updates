@@ -31,7 +31,11 @@ param(
     [switch]$TokenOnly,
     [switch]$EnrollCert,
     [int]$EnrollValidityDays = 730,
-    [ValidateSet("", "CurrentUser", "LocalMachine")][string]$EnrollStore = ""
+    [ValidateSet("", "CurrentUser", "LocalMachine")][string]$EnrollStore = "",
+    # Minting a SECOND pending key pair is not what a repeated -EnrollCert usually means -- it is usually
+    # someone re-running the command because they lost the console output. Default to reusing the pending
+    # certificate and re-printing its public half; require an explicit -EnrollForce to mint a new one.
+    [switch]$EnrollForce
 )
 
 Set-StrictMode -Version Latest
@@ -318,7 +322,22 @@ $Col_Error        = "build_errordetails"
 # every command, and specifically it would turn a remote certificate enrollment (whose whole point is to
 # return the public cert without a visit to the bay) into a drive to the machine. Limit-ResultJson below is
 # the guard; keep this number in step with the column.
+# MEASURED against DEV on 2026-08-29: build_resultjson is a Memo column with MaxLength 2000.
+# THAT IS A DEV MEASUREMENT, AND IT IS NOT SELF-VERIFYING. Nothing here reads the column's real metadata,
+# so a customer tenant whose build_resultjson was provisioned with a different MaxLength would have this
+# agent trim to the wrong number -- too small silently loses detail, too large makes the result PATCH fail,
+# and that failure lands in the catch that marks the command Failed (an enrollment that created a key and
+# then reported that it had not). It is left as a constant rather than probed at startup because an
+# EntityDefinitions call on the boot path is a new way for an agent to fail to start, for a number that has
+# changed zero times. It is OVERRIDABLE so a tenant that differs can be corrected without a code change:
+# set "resultJsonMaxChars" in agent-config.json. Re-measure it per tenant at onboarding.
 $ResultJsonMaxChars = 2000
+if ($cfg -and ($cfg.PSObject.Properties.Name -contains "resultJsonMaxChars")) {
+    try {
+        $rjm = [int]$cfg.resultJsonMaxChars
+        if ($rjm -ge 256 -and $rjm -le 1048576) { $ResultJsonMaxChars = $rjm }
+    } catch { }
+}
 
 # Lookup logical name for Bay lookup in BayCommand (Web API filter uses _{lookup}_value)
 $Lookup_Bay      = "build_bay"
@@ -444,22 +463,61 @@ function Normalize-Thumbprint([string]$tp) {
     return $n
 }
 
+# Set by Read-CredentialState whenever the file EXISTS but does not parse. Surfaced in the heartbeat, and
+# consulted by Update-CredentialState, which must never write over a file it could not read.
+$Global:CredentialStateCorrupt = $false
+
 function Read-CredentialState {
-    try {
-        if (Test-Path -LiteralPath $CredentialStatePath) {
-            $raw = Get-Content -LiteralPath $CredentialStatePath -Raw
-            if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
-        }
-    } catch {
-        Write-Log ("credential.json unreadable ({0}); treating as absent" -f $_.Exception.Message) "WARN"
+    # ABSENCE AND CORRUPTION ARE NOT THE SAME EVENT, and treating them the same was a real defect. A truncated
+    # credential.json -- a power cut mid-write on an unmanned kiosk is the obvious cause -- used to read as
+    # "no state yet" at WARN, and the very next Update-CredentialState wrote a FRESH file containing only the
+    # keys of that one update. activeThumbprint, retiredThumbprints and fallbackCountTotal were gone
+    # permanently, and fallbackCountTotal is the number the irreversible retirement step is gated on. The bay
+    # would then look healthy on a zeroed counter.
+    #
+    # So: a file that is absent is absent (returns $null, no noise -- that is Day 0). A file that is PRESENT
+    # and unparseable is a fault. It is logged at ERROR, flagged for the heartbeat, and it still returns $null
+    # so the agent can keep running on what it CAN prove (its certificate store, its config) -- but
+    # Update-CredentialState refuses to write, so the corrupt bytes survive for a human to recover from the
+    # .bak beside them. Fail closed on the write, degrade on the read.
+    if (-not (Test-Path -LiteralPath $CredentialStatePath)) {
+        $Global:CredentialStateCorrupt = $false
+        return $null
     }
-    return $null
+    $raw = $null
+    try { $raw = Get-Content -LiteralPath $CredentialStatePath -Raw } catch {
+        $Global:CredentialStateCorrupt = $true
+        Write-Log ("credential.json is present but UNREADABLE ({0}); refusing to overwrite it. Recover from {1}.bak" -f $_.Exception.Message, $CredentialStatePath) "ERROR"
+        return $null
+    }
+    # An empty file is the one ambiguous case; treat it as absence rather than corruption, because
+    # Write-CredentialState's own temp-then-move never produces a zero-length target.
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $Global:CredentialStateCorrupt = $false
+        return $null
+    }
+    try {
+        $parsed = $raw | ConvertFrom-Json
+        $Global:CredentialStateCorrupt = $false
+        return $parsed
+    } catch {
+        $Global:CredentialStateCorrupt = $true
+        Write-Log ("credential.json is CORRUPT and will NOT be overwritten ({0}). The active thumbprint, the retired list and fallbackCountTotal cannot be trusted until it is repaired -- recover from {1}.bak by hand." -f $_.Exception.Message, $CredentialStatePath) "ERROR"
+        return $null
+    }
 }
 
 function Write-CredentialState($stateObj) {
     $dir = Split-Path -Parent $CredentialStatePath
     if (!(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     $json = ($stateObj | ConvertTo-Json -Depth 6)
+    # Keep the PREVIOUS good file beside the new one. It is the only recovery path from a corrupt state file,
+    # and it costs a file copy on a write that happens a handful of times in a bay's life.
+    if (Test-Path -LiteralPath $CredentialStatePath) {
+        try { Copy-Item -LiteralPath $CredentialStatePath -Destination "$CredentialStatePath.bak" -Force } catch {
+            Write-Log ("Could not write credential.json.bak ({0}); continuing" -f $_.Exception.Message) "WARN"
+        }
+    }
     $tmp = "$CredentialStatePath.tmp"
     [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $tmp -Destination $CredentialStatePath -Force
@@ -467,12 +525,38 @@ function Write-CredentialState($stateObj) {
 
 function Update-CredentialState([hashtable]$changes) {
     $cur = Read-CredentialState
+    # THE FAIL-CLOSED HALF. Read-CredentialState has already returned $null; writing now would replace the
+    # corrupt file with a fresh one holding only $changes, which is exactly the silent data loss this guards.
+    if ($Global:CredentialStateCorrupt) {
+        throw "credential.json is corrupt; refusing to write over it. Recover from $CredentialStatePath.bak (or delete the file deliberately if the bay is being re-enrolled), then retry."
+    }
     $st = [ordered]@{}
     if ($cur) { foreach ($p in $cur.PSObject.Properties) { $st[$p.Name] = $p.Value } }
     foreach ($k in $changes.Keys) { $st[$k] = $changes[$k] }
     $st["updatedUtc"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     Write-CredentialState $st
     return $st
+}
+
+function Test-HasUsableSecret {
+    # Does a secret credential ACTUALLY exist right now, as opposed to being named in the config?
+    # $HasSecretCredential is a startup-time reading of what agent-config.json MENTIONS; this is a reading of
+    # what is on disk. The two differ on exactly one bay: a Day-0 machine running the shipped config, whose
+    # clientSecretDpapiPath points at a file nobody has created yet. See Invoke-CredentialEnroll.
+    if ($null -ne $script:Secret) { return $true }
+    if ($script:SecretPath -and (Test-Path -LiteralPath $script:SecretPath)) { return $true }
+    return $false
+}
+
+function Read-LastUpdateResult {
+    # The durable outcome of the most recent fleet update, written by Update-BayAgent.ps1 (success or failure).
+    # It exists because a BayCommand StartProcess reports Succeeded the instant the process LAUNCHES -- it has
+    # no idea whether the updater then died. Carried in the heartbeat so a command result can be reconciled
+    # against what actually happened on the machine.
+    param([string]$Base = $BaseDir)
+    $p = Join-Path $Base "state\last-update-result.json"
+    if (-not (Test-Path -LiteralPath $p)) { return $null }
+    try { return (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json) } catch { return $null }
 }
 
 function Get-ActiveCertThumbprint {
@@ -729,6 +813,17 @@ function Sync-FallbackTelemetry {
     $t = $Global:CredentialTelemetry
     $persisted = 0
     $st = Read-CredentialState
+    # A CORRUPT STATE FILE MUST NOT REPORT A HEALTHY-LOOKING ZERO. The durable total lives in the file we
+    # just failed to read, so the honest answer is "unknown", not 0 -- and the difference is the whole point of
+    # the counter. KH-18 step 8 (deleting the estate's client secrets, the one irreversible act in the
+    # rotation) is gated on an operator reading fallbackCountTotal and seeing zero. If corruption rendered as
+    # zero, a bay that had been silently running on the secret for days would present exactly the reading that
+    # unlocks the irreversible step. $null renders as absent/unknown in the heartbeat JSON and cannot be
+    # mistaken for a clean zero; stateFileCorrupt says why.
+    if ($Global:CredentialStateCorrupt) {
+        Write-Log "fallbackCountTotal is UNKNOWN: credential.json is corrupt. Do not read this as zero, and do not treat the retirement gate as satisfied." "ERROR"
+        return $null
+    }
     try { $persisted = [int](Get-PropValue $st "fallbackCountTotal" 0) } catch { $persisted = 0 }
 
     $delta = [int]$t.fallbackCount - [int]$t.fallbackFlushed
@@ -776,8 +871,11 @@ function Get-CredentialTelemetry {
 
     $t = $Global:CredentialTelemetry
     return [ordered]@{
-        schema                 = 1
+        schema                 = 2
         configuredMode         = $(if ($activeTp) { "certificate" } else { "secret" })
+        # A corrupt state file is the one condition under which every OTHER number in this block is
+        # untrustworthy -- including fallbackCountTotal, which gates the irreversible retirement. Say so.
+        stateFileCorrupt       = [bool]$Global:CredentialStateCorrupt
         activeThumbprint       = $activeTp
         activeCertificate      = $certInfo
         pendingThumbprint      = $pendingTp
@@ -1267,6 +1365,10 @@ function Build-AgentCapabilitiesJson {
         # the last token, when the active certificate expires. Read by operators and the expiry monitor.
         credential = (Get-CredentialTelemetry)
 
+        # The durable outcome of the last fleet update. StartProcess reports Succeeded when the updater
+        # LAUNCHES, so this is the only signal that says whether it then installed anything.
+        lastUpdateResult = (Read-LastUpdateResult)
+
         # Keep this conservative; expand as you add commands.
         supportedCommandTypes = @(
             "HealthCheck",
@@ -1362,7 +1464,7 @@ function Get-AgentOperationalState {
 
     $blocked = ($status -eq $AGENTSTATUS_OFFLINE -or $status -eq $AGENTSTATUS_MAINTENANCE)
 
-    # If a temporary block has expired, treat as unblocked (and we’ll auto-clear the fields below)
+    # If a temporary block has expired, treat as unblocked (and we'll auto-clear the fields below)
     if ($blocked -and $expired) { $blocked = $false }
 
     $blockReason = ""
@@ -1390,7 +1492,7 @@ function Is-CommandAllowedInMode {
 
     if (-not $OpState -or -not $OpState.Blocked) { return $true }
 
-    # OFFLINE: allow only safe “read-only / diagnostics” style commands
+    # OFFLINE: allow only safe "read-only / diagnostics" style commands
     if ($OpState.Status -eq $AGENTSTATUS_OFFLINE) {
         return (
             $CommandType -eq $CMD_HEALTHCHECK -or
@@ -2607,14 +2709,36 @@ function Start-GenericProcess($payloadObj) {
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace([string]$args)) {
-        $p = Start-Process -FilePath $path -PassThru
-    } else {
-        $p = Start-Process -FilePath $path -ArgumentList $args -PassThru
+    # started=true MEANS "THE PROCESS LAUNCHED", NOT "THE WORK SUCCEEDED", and the difference is the whole
+    # bench-day failure mode. This is how a fleet update is triggered: the BayCommand result is written from
+    # this return value, so a StartProcess that hands off to Update-BayAgent.ps1 reports Succeeded the instant
+    # powershell.exe exists -- even when the updater dies a second later having installed nothing. The real
+    # case is a bay PC with no code-signing certificate: Get-CodeSigningCert throws, and before this round it
+    # threw into silence. The updater now writes a durable result marker that the heartbeat carries
+    # (lastUpdateResult), so the command result can be reconciled against what actually happened.
+    #
+    # What is fixed HERE is narrower and still worth having: a launch that THROWS must not be reported as a
+    # launch that worked.
+    try {
+        if ([string]::IsNullOrWhiteSpace([string]$args)) {
+            $p = Start-Process -FilePath $path -PassThru
+        } else {
+            $p = Start-Process -FilePath $path -ArgumentList $args -PassThru
+        }
+    } catch {
+        Write-Log ("StartProcess FAILED to launch '{0}': {1}" -f $path, $_.Exception.Message) "ERROR"
+        return @{
+            started = $false
+            path = $path
+            args = $args
+            error = $_.Exception.Message
+            note = "the process did not launch; nothing ran"
+        }
     }
 
     return @{
         started = $true
+        launchedOnly = $true   # says what started=true does and does not claim; see lastUpdateResult
         path = $path
         args = $args
         pid = $p.Id
@@ -2873,13 +2997,34 @@ function Invoke-CredentialEnroll($payloadObj) {
 
     # A bay with NO credential at all (fresh Day-0) has nothing to protect and nothing to prove against: the new
     # certificate becomes active at once. Any bay that already has a credential gets a PENDING certificate.
+    #
+    # THIS ASKS WHETHER A SECRET ACTUALLY WORKS, NOT WHETHER THE CONFIG MENTIONS ONE. $HasSecretCredential
+    # is computed at startup from the mere PRESENCE of clientSecretDpapiPath in agent-config.json, before
+    # anything checks that the file exists. The shipped agent-config.json names that path, so a fresh Day-0 bay
+    # that had not yet run the DPAPI setup looked to this line like a bay with a working secret: the new
+    # certificate went PENDING instead of ACTIVE, nothing could activate it (no credential to mint with), and
+    # the next startup threw on the missing DPAPI file. A bay with no credential could not enroll its way to
+    # one. Found by independent attack, 2026-09-14.
     $activeTp = Get-ActiveCertThumbprint
-    $activateNow = (-not $activeTp) -and (-not $HasSecretCredential)
+    $activateNow = (-not $activeTp) -and (-not (Test-HasUsableSecret))
     if ($activateNow) {
         Update-CredentialState @{ activeThumbprint = $cert.Thumbprint; pendingThumbprint = $null; activatedUtc = $nowStr; enrolledUtc = $nowStr } | Out-Null
         Write-Log ("Credential enrolled AND activated (no prior credential): certificate {0} notAfter={1}; public cert at {2}" -f $cert.Thumbprint, $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $cerPath) "INFO"
     } else {
-        Update-CredentialState @{ pendingThumbprint = $cert.Thumbprint; enrolledUtc = $nowStr } | Out-Null
+        # A pending certificate being REPLACED leaves a non-exportable private key on the machine. If its
+        # thumbprint is not written down, nothing points at it any more: it cannot be found by the ownership
+        # guard, so it cannot be retired, and it sits there for the life of the box. Record it.
+        $changes = @{ pendingThumbprint = $cert.Thumbprint; enrolledUtc = $nowStr }
+        $displaced = Get-PendingCertThumbprint
+        if ($displaced -and $displaced -ne $cert.Thumbprint) {
+            $sup = @()
+            $priorSup = Get-PropValue (Read-CredentialState) "superseded" $null
+            if ($priorSup) { $sup = @($priorSup) }
+            if ($sup -notcontains $displaced) { $sup += $displaced }
+            $changes.superseded = $sup
+            Write-Log ("Credential enroll SUPERSEDED pending certificate {0}; recorded so its orphaned private key can still be retired" -f $displaced) "WARN"
+        }
+        Update-CredentialState $changes | Out-Null
         Write-Log ("Credential enrolled as PENDING: certificate {0} notAfter={1}; public cert at {2}. Register it in Entra, then activate." -f $cert.Thumbprint, $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $cerPath) "INFO"
     }
     return (Build-CredentialEnrollResult -cert $cert -cerPath $cerPath -reused $false -activatedDirectly $activateNow)
@@ -2963,8 +3108,18 @@ function Test-IsAgentOwnedCertificate {
     # straight from a caller-supplied BayCommand payload. Without this predicate the payload is a
     # delete-any-certificate-with-its-private-key primitive against both of the agent account's stores -
     # which has nothing to do with credential rotation and is not a capability this command should carry.
-    # A certificate is retirable ONLY if this agent made it (subject prefix) or this agent has recorded it
-    # in credential.json. Anything else on the machine is out of scope by construction.
+    # A certificate is retirable ONLY if this agent RECORDED it in credential.json.
+    #
+    # THIS USED TO ALSO ACCEPT A SUBJECT PREFIX ("CN=ABG-BayAgent*"), AND THAT WAS A HOLE. A subject is
+    # not a fact about provenance -- it is a string the creator chooses. Anyone who can run
+    # New-SelfSignedCertificate on the box can name a certificate "CN=ABG-BayAgent anything" and have retire
+    # destroy it, private key and all. The prefix branch re-opened, in weaker form, the delete-any-certificate
+    # primitive the record branch was added to close. Found by independent attack, 2026-09-14.
+    #
+    # Every certificate this agent legitimately creates is recorded the moment it is created:
+    # Invoke-CredentialEnroll writes activeThumbprint or pendingThumbprint before it returns, a superseded
+    # pending certificate is pushed onto `superseded`, and retire pushes onto `retiredThumbprints`. So the
+    # record branch alone covers the whole legitimate set, and nothing else on the machine is in scope.
     param([Parameter(Mandatory=$true)][string]$Thumbprint)
     $tp = Normalize-Thumbprint $Thumbprint
     if (-not $tp) { return $false }
@@ -2975,11 +3130,10 @@ function Test-IsAgentOwnedCertificate {
         try { $v = Normalize-Thumbprint ([string](Get-PropValue $st $k "")) } catch {}
         if ($v -eq $tp) { return $true }
     }
-    $prior = Get-PropValue $st "retiredThumbprints" $null
-    if ($prior) { foreach ($r in @($prior)) { if (("$r").ToUpperInvariant() -eq $tp) { return $true } } }
-
-    $c = Find-ClientCertificate $tp
-    if ($c -and ("$($c.Subject)").StartsWith("CN=ABG-BayAgent", [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    foreach ($listKey in @("retiredThumbprints", "superseded")) {
+        $prior = Get-PropValue $st $listKey $null
+        if ($prior) { foreach ($r in @($prior)) { if (("$r").ToUpperInvariant() -eq $tp) { return $true } } }
+    }
 
     return $false
 }
@@ -2991,13 +3145,45 @@ function Invoke-CredentialRetire($payloadObj) {
     if (-not $tp -and -not $retireSecret) { throw "retire: give thumbprint and/or secret=true" }
 
     $active = Get-ActiveCertThumbprint
+
+    # A CORRUPT STATE FILE DISQUALIFIES THE ONLY ACTION THAT DESTROYS SOMETHING.
+    # Get-ActiveCertThumbprint falls back to agent-config.json's clientCertThumbprint whenever state names
+    # none -- and a corrupt state file names none, because Read-CredentialState returns $null on corruption.
+    # So without this, a corrupt state file silently promotes the CONFIG value to "active", and
+    # retire secret=true (which needs only a non-null $active that mints) would delete the DPAPI file on the
+    # strength of a credential the agent inferred while declaring its own records untrustworthy. The mint
+    # proof is live, so the bay would keep working -- which is exactly what makes it the wrong kind of
+    # failure: nothing looks broken. Found by independent verification, 2026-09-14.
+    if ($Global:CredentialStateCorrupt) {
+        throw "retire: credential.json is corrupt, so which certificate is active cannot be established. Recover it from $CredentialStatePath.bak first. Refusing to destroy anything on an inferred credential."
+    }
+
     $result = [ordered]@{ ok = $true; action = "retire" }
 
+    # ---- PHASE 1: every check, and the live proof, BEFORE anything is destroyed. ----
+    #
+    # THE ORDER IS THE CONTROL. This used to delete the named certificate first and only then perform the
+    # live mint proof for secret=true. A combined {thumbprint, secret:true} payload whose proof failed had
+    # already destroyed a private key by the time it threw, and there is no rollback for a destroyed private
+    # key -- the whole point of a non-exportable key is that no copy exists. Found by independent attack,
+    # 2026-09-14. Prove first. Delete after. Nothing between the two can fail.
     if ($tp) {
         # The credential the loop is living on is never removed.
         if ($tp -eq $active) { throw "retire: $tp is the ACTIVE credential; activate another certificate first" }
-        # ...and nothing this agent did not create or record is removable at all.
-        if (-not (Test-IsAgentOwnedCertificate -Thumbprint $tp)) { throw "retire: $tp is not an agent-owned certificate (subject must start CN=ABG-BayAgent, or the thumbprint must be recorded in credential.json); refusing to delete it" }
+        # ...and nothing this agent recorded is removable at all.
+        if (-not (Test-IsAgentOwnedCertificate -Thumbprint $tp)) { throw "retire: $tp is not an agent-owned certificate (its thumbprint must be recorded in credential.json as active, pending, previous, superseded or already retired); refusing to delete it" }
+    }
+
+    $secretProofTp = $null
+    if ($retireSecret) {
+        if (-not $active) { throw "retire secret: no active certificate; refusing to remove the only credential" }
+        # Live proof RIGHT NOW that the active certificate mints - not a cached token, not a remembered success.
+        $null = Acquire-TokenWithCertificate -Thumbprint $active
+        $secretProofTp = $active
+    }
+
+    # ---- PHASE 2: destroy. Every precondition above has passed. ----
+    if ($tp) {
         $removedFrom = @()
         foreach ($store in (Get-CertStoreSearchOrder)) {
             $p = "$store\$tp"
@@ -3021,10 +3207,14 @@ function Invoke-CredentialRetire($payloadObj) {
     }
 
     if ($retireSecret) {
-        if (-not $active) { throw "retire secret: no active certificate; refusing to remove the only credential" }
-        # Live proof RIGHT NOW that the active certificate mints - not a cached token, not a remembered success.
-        $null = Acquire-TokenWithCertificate -Thumbprint $active
-        $secretRes = [ordered]@{ proofMintedWithCertificate = $active }
+        # The proof already ran in phase 1; $secretProofTp names the certificate that carried it.
+        # BOTH outcome fields are always stated, never implied by the presence or absence of a note: a reader
+        # (and the bench-day sheet) has to be able to answer "is the secret gone?" from the result alone.
+        $secretRes = [ordered]@{
+            proofMintedWithCertificate = $secretProofTp
+            dpapiFileRemoved           = $false
+            plaintextSecretStillInConfig = $false
+        }
         if ($script:SecretPath) {
             try {
                 Remove-Item -LiteralPath $script:SecretPath -Force
@@ -3033,17 +3223,30 @@ function Invoke-CredentialRetire($payloadObj) {
                 $script:HasSecretCredential = ($null -ne $script:Secret)
                 Write-Log "Credential retired: DPAPI secret file removed; certificate-only from now on" "INFO"
             } catch {
-                $secretRes.dpapiFileRemoved = $false
                 $secretRes.error = $_.Exception.Message
+                $secretRes.reason = "ABG_CRED_DPAPI_REMOVE_FAILED"
                 $result.ok = $false
             }
         } else {
-            $secretRes.dpapiFileRemoved = $false
             $secretRes.note = "no DPAPI secret file configured"
         }
+
+        # THE PLAINTEXT BRANCH USED TO REPORT SUCCESS. On a bay whose secret is the DEPRECATED plaintext
+        # `clientSecret` in agent-config.json, there is no DPAPI file to delete, so this fell through the else
+        # branch above, set a note, and returned ok=true -- while the secret sat in the config and went on
+        # minting tokens. The operator's next act, on the strength of that ok, is KH-18 step 8: deleting the
+        # app's client secrets in Entra. The bay would then be running on a credential the operator believes
+        # is retired, and the one irreversible step in the whole rotation would have been taken on a false
+        # report. Found by independent attack, 2026-09-14.
+        #
+        # The agent deliberately does not rewrite its own config (see Invoke-CredentialActivate), so it cannot
+        # fix this itself. What it CAN do is refuse to call it done.
         if ($script:Secret) {
             $secretRes.plaintextSecretStillInConfig = $true
-            $secretRes.note = "agent-config.json clientSecret must be deleted by hand; the agent never rewrites its own config"
+            $secretRes.reason = "ABG_CRED_PLAINTEXT_SECRET_REMAINS"
+            $secretRes.note = "agent-config.json still carries a plaintext clientSecret and it still mints tokens. The agent never rewrites its own config: delete the clientSecret key by hand and restart, THEN re-run retire. Do not delete the app's secrets in Entra until this reports ok."
+            $result.ok = $false
+            Write-Log "retire secret: a plaintext clientSecret is STILL in agent-config.json; the secret is NOT retired. Reporting failure so the Entra deletion is not taken on a false success." "ERROR"
         }
         $result.secret = $secretRes
     }
@@ -3073,6 +3276,25 @@ function Invoke-CredentialStatus {
         state        = (Read-CredentialState)
         certificates = $certs
     }
+}
+
+function New-EnrollCertPayload {
+    # The payload the -EnrollCert CONSOLE path hands to Invoke-CredentialEnroll.
+    #
+    # This is a function purely so it can be TESTED. It used to be three lines of top-level code inside
+    # `if ($EnrollCert) { ... }`, and the suite lifts functions out of this script by AST -- so top-level
+    # code and the param() block are both invisible to it. An independent verifier proved the consequence
+    # on 2026-09-14: flipping `[switch]$EnrollForce` to default $true restores the original F5 defect (every
+    # Day-0 re-run mints and abandons another non-exportable private key) and all 181 assertions stay green.
+    # The payload half was pinned; the half the bench day actually runs was not covered at all.
+    param(
+        [int]$ValidityDays = 730,
+        [string]$Store = "",
+        [switch]$Force
+    )
+    $p = @{ validityDays = $ValidityDays; force = [bool]$Force }
+    if ($Store) { $p.store = $Store }
+    return $p
 }
 
 function Invoke-CredentialRotate($payloadObj) {
@@ -3744,8 +3966,7 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
 
 # ---------------- -EnrollCert: hands-on / Day-0 enrollment (no credential needed) ----------------
 if ($EnrollCert) {
-    $enrollPayload = @{ validityDays = $EnrollValidityDays; force = $true }
-    if ($EnrollStore) { $enrollPayload.store = $EnrollStore }
+    $enrollPayload = New-EnrollCertPayload -ValidityDays $EnrollValidityDays -Store $EnrollStore -Force:$EnrollForce
     $r = Invoke-CredentialEnroll $enrollPayload
     Write-Host ""
     Write-Host ("ENROLLED certificate credential for bay {0}" -f $BayId)

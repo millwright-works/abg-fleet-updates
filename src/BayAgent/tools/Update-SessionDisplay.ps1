@@ -158,7 +158,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $relDir "index.html"))) {
   throw "Release folder does not contain index.html at expected location: $relDir\index.html. Check zip structure."
 }
 
-# Stop display (so files aren’t locked)
+# Stop display (so files aren't locked)
 $killed = Stop-SessionDisplayEdge $ProfileDir
 Write-Log ("Stopped Edge PIDs: {0}" -f ($killed -join ","))
 

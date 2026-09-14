@@ -35,6 +35,17 @@ param(
   [string]$FleetRawBaseUrl = "https://raw.githubusercontent.com/kedaheaven/abg-fleet-updates/main/src/BayAgent",
   [string]$BayKioskUser = "BayKiosk",
 
+  # WHICH CREDENTIAL THIS BAY WILL AUTHENTICATE WITH, AND IT IS A CHOICE, NOT A REMINDER.
+  # Phase 6 used to print "You must run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret"
+  # unconditionally. On a bay being provisioned for the certificate credential that is the opposite of
+  # what should happen: a DPAPI file makes Test-HasUsableSecret true, so BayAgent.ps1 -EnrollCert leaves
+  # the new certificate PENDING instead of ACTIVE -- it cannot activate, because activation needs a
+  # working credential to mint with and the certificate is not registered in Entra yet. The bench proof
+  # then changes shape, and the operator was told to do it by the script's own output.
+  # Certificate is the default because the safe path should be the one you get by not deciding.
+  [ValidateSet("Certificate", "Secret")]
+  [string]$Credential = "Certificate",
+
   # Dataverse registration (optional, passed to Day0)
   [switch]$RegisterConfigItems,
   [string]$EnvironmentUrl = "https://builds-apps-dev.crm.dynamics.com",
@@ -448,24 +459,80 @@ if (-not $SkipLockdown) {
 }
 
 # ==================================================================
-# PHASE 6: DPAPI SECRET REMINDER
+# PHASE 6: CREDENTIAL SETUP -- certificate (default) or the legacy DPAPI secret
 # ==================================================================
-Write-Step "Phase 6: DPAPI Secret Setup"
+
+function Get-Day0CredentialGuidance {
+  # A FUNCTION so it can be tested rather than only printed. What this decides is which credential the
+  # bay will hold on its first start, and the wrong answer silently changes what the bench day proves.
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("Certificate", "Secret")][string]$Mode,
+    [Parameter(Mandatory = $true)][string]$DpapiPath,
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$BayKioskUser
+  )
+  if ($Mode -eq "Certificate") {
+    return [ordered]@{
+      mode          = "Certificate"
+      dpapiRequired = $false
+      lines = @(
+        "This bay will authenticate with a CERTIFICATE it mints itself.",
+        "DO NOT create a DPAPI secret on this machine, and do not copy one here.",
+        "A DPAPI secret file makes the agent believe it already has a working credential, so",
+        "  BayAgent.ps1 -EnrollCert leaves the new certificate PENDING instead of ACTIVE -- and it",
+        "  cannot be activated, because activation has to mint a live token and the certificate is",
+        "  not registered on the Entra app yet.",
+        "",
+        "Next, as the agent account:",
+        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\BayAgent.ps1`" -EnrollCert",
+        "",
+        "That prints a public certificate in base64. Send it to whoever holds the Entra app; they",
+        "register it as a certificate credential. Until that registration lands the agent will log",
+        "AADSTS700027 on every poll -- that is expected, not a fault."
+      )
+    }
+  }
+  return [ordered]@{
+    mode          = "Secret"
+    dpapiRequired = $true
+    lines = @(
+      "LEGACY PATH: this bay will authenticate with a shared client secret.",
+      "Note what this costs before you take it: a DPAPI secret here means the Day-0 -EnrollCert goes",
+      "  PENDING rather than ACTIVE, and the secret belongs to the APP, not to this bay -- so it",
+      "  cannot be revoked for one bay. Prefer -Credential Certificate unless you have a reason.",
+      "",
+      "Run this command as Administrator:",
+      "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1`" ``",
+      "    -OutPath `"$DpapiPath`" ``",
+      "    -AgentAccount `".\$BayKioskUser`"",
+      "",
+      "You will be prompted for the Azure app client secret."
+    )
+  }
+}
+
+Write-Step "Phase 6: Credential Setup ($Credential)"
 
 $dpapiPath = Join-Path $AllBirdiesRoot "BayAgent\secrets\clientsecret.dpapi"
-if (Test-Path $dpapiPath) {
-  Write-Host "  DPAPI secret file exists at: $dpapiPath" -ForegroundColor Green
+$guidance = Get-Day0CredentialGuidance -Mode $Credential -DpapiPath $dpapiPath -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser
+
+if ($guidance.dpapiRequired) {
+  if (Test-Path $dpapiPath) {
+    Write-Host "  DPAPI secret file exists at: $dpapiPath" -ForegroundColor Green
+  } else {
+    Write-Host "  DPAPI secret file NOT found at: $dpapiPath" -ForegroundColor Yellow
+    Write-Host ""
+    $guidance.lines | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor Yellow }
+  }
 } else {
-  Write-Host "  DPAPI secret file NOT found at: $dpapiPath" -ForegroundColor Yellow
-  Write-Host ""
-  Write-Host "  You must run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret." -ForegroundColor Yellow
-  Write-Host "  Run this command as Administrator:" -ForegroundColor Yellow
-  Write-Host ""
-  Write-Host "    powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$AllBirdiesRoot\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1`" ``" -ForegroundColor White
-  Write-Host "      -OutPath `"$dpapiPath`" ``" -ForegroundColor White
-  Write-Host "      -AgentAccount `".\$BayKioskUser`"" -ForegroundColor White
-  Write-Host ""
-  Write-Host "  You will be prompted for the Azure app client secret (Kevin has this)." -ForegroundColor Yellow
+  # The one thing worth shouting about on a certificate bay: a secret that is already here.
+  if (Test-Path $dpapiPath) {
+    Write-Host "  WARNING: a DPAPI secret file EXISTS at $dpapiPath" -ForegroundColor Red
+    Write-Host "  This bay was provisioned for the certificate credential. Remove that file before" -ForegroundColor Red
+    Write-Host "  running -EnrollCert, or the certificate will enroll as PENDING and cannot activate." -ForegroundColor Red
+    Write-Host ""
+  }
+  $guidance.lines | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor Cyan }
 }
 
 # ==================================================================
