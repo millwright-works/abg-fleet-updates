@@ -3145,6 +3145,19 @@ function Invoke-CredentialRetire($payloadObj) {
     if (-not $tp -and -not $retireSecret) { throw "retire: give thumbprint and/or secret=true" }
 
     $active = Get-ActiveCertThumbprint
+
+    # A CORRUPT STATE FILE DISQUALIFIES THE ONLY ACTION THAT DESTROYS SOMETHING.
+    # Get-ActiveCertThumbprint falls back to agent-config.json's clientCertThumbprint whenever state names
+    # none -- and a corrupt state file names none, because Read-CredentialState returns $null on corruption.
+    # So without this, a corrupt state file silently promotes the CONFIG value to "active", and
+    # retire secret=true (which needs only a non-null $active that mints) would delete the DPAPI file on the
+    # strength of a credential the agent inferred while declaring its own records untrustworthy. The mint
+    # proof is live, so the bay would keep working -- which is exactly what makes it the wrong kind of
+    # failure: nothing looks broken. Found by independent verification, 2026-09-14.
+    if ($Global:CredentialStateCorrupt) {
+        throw "retire: credential.json is corrupt, so which certificate is active cannot be established. Recover it from $CredentialStatePath.bak first. Refusing to destroy anything on an inferred credential."
+    }
+
     $result = [ordered]@{ ok = $true; action = "retire" }
 
     # ---- PHASE 1: every check, and the live proof, BEFORE anything is destroyed. ----
@@ -3263,6 +3276,25 @@ function Invoke-CredentialStatus {
         state        = (Read-CredentialState)
         certificates = $certs
     }
+}
+
+function New-EnrollCertPayload {
+    # The payload the -EnrollCert CONSOLE path hands to Invoke-CredentialEnroll.
+    #
+    # This is a function purely so it can be TESTED. It used to be three lines of top-level code inside
+    # `if ($EnrollCert) { ... }`, and the suite lifts functions out of this script by AST -- so top-level
+    # code and the param() block are both invisible to it. An independent verifier proved the consequence
+    # on 2026-09-14: flipping `[switch]$EnrollForce` to default $true restores the original F5 defect (every
+    # Day-0 re-run mints and abandons another non-exportable private key) and all 181 assertions stay green.
+    # The payload half was pinned; the half the bench day actually runs was not covered at all.
+    param(
+        [int]$ValidityDays = 730,
+        [string]$Store = "",
+        [switch]$Force
+    )
+    $p = @{ validityDays = $ValidityDays; force = [bool]$Force }
+    if ($Store) { $p.store = $Store }
+    return $p
 }
 
 function Invoke-CredentialRotate($payloadObj) {
@@ -3934,9 +3966,7 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
 
 # ---------------- -EnrollCert: hands-on / Day-0 enrollment (no credential needed) ----------------
 if ($EnrollCert) {
-    # force was hardcoded $true here, so every re-run minted and abandoned another non-exportable private key.
-    $enrollPayload = @{ validityDays = $EnrollValidityDays; force = [bool]$EnrollForce }
-    if ($EnrollStore) { $enrollPayload.store = $EnrollStore }
+    $enrollPayload = New-EnrollCertPayload -ValidityDays $EnrollValidityDays -Store $EnrollStore -Force:$EnrollForce
     $r = Invoke-CredentialEnroll $enrollPayload
     Write-Host ""
     Write-Host ("ENROLLED certificate credential for bay {0}" -f $BayId)

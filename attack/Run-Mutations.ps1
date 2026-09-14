@@ -1,24 +1,49 @@
-# Mutation harness: take the REAL BayAgent.ps1, apply one targeted mutation, run the 127
-# mock-mode assertions against the mutant, and record whether the suite goes red.
+# Mutation harness: take the REAL source tree, apply one targeted mutation, run the credential
+# suite against the mutated TREE, and record whether the suite goes red.
 # A mutation that stays GREEN is a behavior the suite does not actually pin.
 # Hyphens only in comments.
+#
+# ============================ WHAT THIS HARNESS GOT WRONG, AND WHY IT IS BUILT THIS WAY NOW
+# Independent verification on 2026-09-14 found three faults, all of the same shape: the harness
+# reported an absence of bad news as evidence of good news.
+#
+#  1. EOL-BLIND ANCHORS. It normalized the AGENT SOURCE to LF but its own multi-line `From` anchors
+#     are string literals inside this file, which carries whatever line endings it was checked out
+#     with. .gitattributes pins `*.ps1 text eol=crlf`, so on a CORRECT checkout the CRLF literals
+#     could never match the LF-normalized source. The three multi-line mutants -- M6, M18, M29 --
+#     silently never applied, and the run still printed "Survivors: 0". Both sides are normalized now.
+#
+#  2. NON-APPLICATION WAS SILENT AND UNCOUNTED. The ANCHOR MISS and PARSE ERR branches `continue`d
+#     before their Write-Host, so nothing appeared in the console as the run went by, and
+#     `Applied=$false` rows were excluded from the survivor count. THREE BEHAVIORS WERE NEVER TESTED
+#     AND THE RUN REPORTED CLEAN. A mutation that did not apply measured nothing.
+#
+#  3. CRASH WAS SCORED AS CAUGHT. A run with no `RESULT:` line was recorded as "CAUGHT (crash)".
+#     A crash is evidence the suite noticed SOMETHING; it is not evidence the suite ASSERTS the
+#     behavior -- and it truncates the run, so most assertions never execute. Three mutants (M6, M12,
+#     M25) were dying with ZERO failed assertions while wearing a caught label.
+#
+#  4. IT MUTATED ONLY BayAgent.ps1. The tests resolve the updater from the repo, so
+#     Update-BayAgent.ps1 ran pristine under every mutant and nothing in F7 that lives there was
+#     mutation-tested at all. This harness now copies the WHOLE TREE and can mutate any file in it.
+#
+# So: every verdict is now its own column, a crash with zero failed assertions is NOT a pass, and the
+# run EXITS NON-ZERO if anything did not apply. "Survivors: 0" must never be printable while a
+# mutant went untested.
 [CmdletBinding()]
 param([string]$Only = "")
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$Root   = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$Agent  = Join-Path $Root "src\BayAgent\BayAgent.ps1"
-$Tests  = Join-Path $Root "tests\BayAgent.Credential.Tests.ps1"
-$Work   = Join-Path $env:TEMP ("bayagent-mut-" + [guid]::NewGuid().ToString("N").Substring(0,6))
+$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$Work = Join-Path $env:TEMP ("bayagent-mut-" + [guid]::NewGuid().ToString("N").Substring(0, 6))
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 
 $crlf = [string][char]13 + [string][char]10
 $lf   = [string][char]10
-$src = ([IO.File]::ReadAllText($Agent)).Replace($crlf, $lf)
+function Norm([string]$t) { return $t.Replace($crlf, $lf) }
 
-# Each mutation: Id, Target (the invariant it breaks), From (exact substring), To (replacement).
 $Muts = @(
   @{ Id="M1"; Target="4 retire self-proof";       From='        $null = Acquire-TokenWithCertificate -Thumbprint $active'
                                                    To='        # MUTANT M1: self-proof removed' }
@@ -89,60 +114,161 @@ $Muts = @(
                                                    To='    Write-Log ("Credential activated' }
 )
 
+# Mutations that live OUTSIDE BayAgent.ps1. The old harness could not express these at all: it wrote a
+# lone mutated copy of the agent into a temp dir, and the suite resolves the updater from the repo, so
+# Update-BayAgent.ps1 always ran pristine. Both of F7's halves were untested by mutation.
+$Muts += @(
+  @{ Id="MU1"; File="src\BayAgent\tools\Update-BayAgent.ps1"; Target="7 failed update records a marker"
+     From='Write-UpdateResult -ok $false -reason $msg -stage "unknown"'
+     To='  # MUTANT MU1: a failed update leaves the previous run''s marker in place' }
+  @{ Id="MU2"; File="src\BayAgent\tools\Update-BayAgent.ps1"; Target="7 log follows -BaseDir"
+     From='if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $BaseDir "logs\Update-BayAgent.log" }'
+     To='if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = "C:\AllBirdies\BayAgent\logs\Update-BayAgent.log" }   # MUTANT MU2: log ignores -BaseDir again' }
+  @{ Id="MU3"; File="src\BayAgent\tools\Update-BayAgent.ps1"; Target="7 the failure reaches the log"
+     From='  Write-Log ("UPDATE FAILED: " + $msg)'
+     To='  # MUTANT MU3: the failure is not logged (the original silent-throw defect)' }
+  @{ Id="M30"; Target="5 EnrollForce is opt-in"
+     From='    [switch]$EnrollForce'
+     To='    [switch]$EnrollForce = $true   # MUTANT M30: Day-0 re-runs mint and abandon a key again' }
+  @{ Id="M31"; Target="2 bak written on EVERY write"
+     From='    if (Test-Path -LiteralPath $CredentialStatePath) {
+        try { Copy-Item -LiteralPath $CredentialStatePath -Destination "$CredentialStatePath.bak" -Force } catch {'
+     To='    if ((Test-Path -LiteralPath $CredentialStatePath) -and $Global:BakDone) {
+        $Global:BakDone = $true
+        try { Copy-Item -LiteralPath $CredentialStatePath -Destination "$CredentialStatePath.bak" -Force } catch {' }
+  @{ Id="M32"; Target="4 retire refuses on corrupt state"
+     From='    if ($Global:CredentialStateCorrupt) {
+        throw "retire: credential.json is corrupt'
+     To='    if ($false) {
+        throw "retire: credential.json is corrupt' }
+  @{ Id="M33"; Target="2 corrupt total is null not zero"
+     From='        return $null
+    }
+    try { $persisted = [int](Get-PropValue $st "fallbackCountTotal" 0) } catch { $persisted = 0 }'
+     To='        return 0   # MUTANT M33: corruption renders as a clean zero, which unlocks the gate
+    }
+    try { $persisted = [int](Get-PropValue $st "fallbackCountTotal" 0) } catch { $persisted = 0 }' }
+)
+
 $rows = @()
 foreach ($m in $Muts) {
-  if ($Only -and $m.Id -ne $Only) { continue }
-  $mutPath = Join-Path $Work ("BayAgent-{0}.ps1" -f $m.Id)
+    if ($Only -and $m.Id -ne $Only) { continue }
 
-  # NOTE: M12 used to have a hardcoded special case here, and it was an INERT MUTANT. It rewrote
-  # Get-TokenUrl to read tokenAuthorityHost from $payloadObj -- but it also added
-  # `param($payloadObj = $null)`, which DESTROYS the dynamic-scope lookup the mutation depends on. No
-  # caller passes that argument, so $payloadObj was always $null, the branch never fired, and the
-  # function behaved exactly like the original. It could not be caught by any suite, and it was being
-  # counted as an unpinned behavior. Replaced with an ordinary From/To mutation (see $Muts).
-  if ($false) {
-  } else {
-    if (-not $src.Contains($m.From)) {
-      $rows += [pscustomobject]@{ Id=$m.Id; Target=$m.Target; Applied=$false; Suite="n/a"; Caught="ANCHOR MISS" }
-      continue
+    $relFile = if ($m.ContainsKey("File")) { $m.File } else { "src\BayAgent\BayAgent.ps1" }
+
+    # A FULL TREE per mutant, so any file can be mutated and the suite's own relative lookups still work.
+    $tree = Join-Path $Work $m.Id
+    if (Test-Path $tree) { Remove-Item -LiteralPath $tree -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $tree | Out-Null
+    foreach ($d in @("src", "tests", "tools")) {
+        $s = Join-Path $Root $d
+        if (Test-Path $s) { Copy-Item -LiteralPath $s -Destination $tree -Recurse -Force }
     }
-    $new = $src.Replace($m.From, $m.To)
-  }
 
-  [IO.File]::WriteAllText($mutPath, $new, (New-Object Text.UTF8Encoding($false)))
+    $target = Join-Path $tree $relFile
+    if (-not (Test-Path $target)) {
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "NOT-APPLIED"; Detail = "target file missing: $relFile" }
+        Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "NOT-APPLIED", "target file missing") -ForegroundColor Red
+        continue
+    }
 
-  # The mutant must still parse, or the suite fails for the wrong reason.
-  $errs = $null; $toks = $null
-  [System.Management.Automation.Language.Parser]::ParseFile($mutPath, [ref]$toks, [ref]$errs) | Out-Null
-  if (@($errs).Count -gt 0) {
-    $rows += [pscustomobject]@{ Id=$m.Id; Target=$m.Target; Applied=$true; Suite="PARSE ERR"; Caught="INVALID MUTANT" }
-    continue
-  }
+    # BOTH SIDES NORMALIZED. This is fault 1: anchors are literals in THIS file and carry its line
+    # endings, while the source carries its own. Normalizing only one side is how three mutants
+    # silently stopped applying the moment someone checked the repo out correctly.
+    $src = Norm ([IO.File]::ReadAllText($target))
+    $from = Norm $m.From
+    $to   = Norm $m.To
 
-  $out = ""
-  $prevEA = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  try { $out = (& powershell -NoProfile -ExecutionPolicy Bypass -File $Tests -AgentScript $mutPath 2>&1 | Out-String) }
-  catch { $out = "HARNESS EXCEPTION: $($_.Exception.Message)" }
-  finally { $ErrorActionPreference = $prevEA; $global:LASTEXITCODE = 0 }
-  $res = ([regex]::Match($out, "RESULT: (\d+) passed, (\d+) failed"))
-  if ($res.Success) {
-    $failed = [int]$res.Groups[2].Value
-    $suite  = "$($res.Groups[1].Value)P/$($failed)F"
-    $caught = if ($failed -gt 0) { "CAUGHT" } else { "*** SURVIVED ***" }
-  } else {
-    $suite  = "CRASH"
-    $caught = "CAUGHT (crash)"
-    if ($out -match "Function '([^']+)' not found") { $caught = "INVALID MUTANT (lift failed)" }
-  }
-  $rows += [pscustomobject]@{ Id=$m.Id; Target=$m.Target; Applied=$true; Suite=$suite; Caught=$caught }
-  Write-Host ("{0,-4} {1,-32} {2,-12} {3}" -f $m.Id, $m.Target, $suite, $caught)
+    if (-not $src.Contains($from)) {
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "NOT-APPLIED"; Detail = "anchor not found in $relFile" }
+        Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "NOT-APPLIED", "ANCHOR MISS -- this behavior was NOT tested") -ForegroundColor Red
+        continue
+    }
+
+    $new = $src.Replace($from, $to)
+    if ($new -eq $src) {
+        # An INERT mutant: the anchor matched but the text did not change. M12 was one of these for
+        # weeks -- it could not be caught by any suite and was counted as an unpinned behavior.
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "INERT"; Detail = "From and To are identical after normalization" }
+        Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "INERT", "mutant changes nothing -- it can never be caught") -ForegroundColor Red
+        continue
+    }
+    [IO.File]::WriteAllText($target, $new, (New-Object Text.UTF8Encoding($false)))
+
+    $errs = $null; $toks = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$toks, [ref]$errs) | Out-Null
+    if (@($errs).Count -gt 0) {
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "INVALID"; Detail = "mutant does not parse" }
+        Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "INVALID", "mutant does not parse") -ForegroundColor Yellow
+        continue
+    }
+
+    $mutTests = Join-Path $tree "tests\BayAgent.Credential.Tests.ps1"
+    $out = ""
+    $prevEA = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $out = (& powershell -NoProfile -ExecutionPolicy Bypass -File $mutTests 2>&1 | Out-String) }
+    catch { $out = "HARNESS EXCEPTION: $($_.Exception.Message)" }
+    finally { $ErrorActionPreference = $prevEA; $global:LASTEXITCODE = 0 }
+
+    # Count assertions that actually FAILED, whether or not the run reached its summary line. A crash
+    # that carries a failed assertion did demonstrate the behavior; a crash with none did not.
+    $failLines = @([regex]::Matches($out, "(?m)^\s+FAIL\s")).Count
+    $res = [regex]::Match($out, "RESULT: (\d+) passed, (\d+) failed")
+
+    if ($res.Success) {
+        $failed = [int]$res.Groups[2].Value
+        if ($failed -gt 0) {
+            $verdict = "CAUGHT-ASSERT"; $detail = "$($res.Groups[1].Value)P/$($failed)F"
+        } else {
+            $verdict = "SURVIVED"; $detail = "$($res.Groups[1].Value)P/0F"
+        }
+    } elseif ($failLines -gt 0) {
+        $verdict = "CRASH-ASSERT"; $detail = "crashed after $failLines failed assertion(s)"
+    } else {
+        # THE ONE THAT USED TO READ AS A PASS. Nothing asserted anything; the suite simply died.
+        $verdict = "CRASH-ZERO"; $detail = "crashed with ZERO failed assertions -- behavior NOT demonstrated"
+    }
+
+    $color = switch ($verdict) {
+        "CAUGHT-ASSERT" { "Green" }
+        "CRASH-ASSERT"  { "DarkGreen" }
+        "CRASH-ZERO"    { "Red" }
+        "SURVIVED"      { "Red" }
+        default         { "Yellow" }
+    }
+    $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = $verdict; Detail = $detail }
+    Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, $verdict, $detail) -ForegroundColor $color
 }
 
 Write-Host ""
 Write-Host "==== MUTATION RESULTS ===="
-$rows | Format-Table -AutoSize | Out-String | Write-Host
-$survivors = @($rows | Where-Object { $_.Caught -like "*SURVIVED*" })
-Write-Host ("Survivors (unpinned behavior): {0}" -f $survivors.Count)
-$survivors | ForEach-Object { Write-Host ("  {0}  {1}" -f $_.Id, $_.Target) }
-Write-Host "Workdir: $Work"
+$rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+
+function Count([string]$v) { return @($rows | Where-Object { $_.Verdict -eq $v }).Count }
+
+$nCaught  = Count "CAUGHT-ASSERT"
+$nCrashA  = Count "CRASH-ASSERT"
+$nCrashZ  = Count "CRASH-ZERO"
+$nSurv    = Count "SURVIVED"
+$nNotApp  = Count "NOT-APPLIED"
+$nInert   = Count "INERT"
+$nInvalid = Count "INVALID"
+
+Write-Host ("Defined                       : {0}" -f @($rows).Count)
+Write-Host ("Caught by a failed assertion  : {0}" -f $nCaught)
+Write-Host ("Crashed WITH a failed assert  : {0}" -f $nCrashA)
+Write-Host ("Crashed with ZERO asserts     : {0}   <- NOT demonstrated" -f $nCrashZ)
+Write-Host ("SURVIVED (unpinned behavior)  : {0}" -f $nSurv)
+Write-Host ("Did not apply                 : {0}   <- measured NOTHING" -f $nNotApp)
+Write-Host ("Inert (mutant changes nothing): {0}   <- measured NOTHING" -f $nInert)
+Write-Host ("Invalid (does not parse)      : {0}" -f $nInvalid)
+Write-Host ("Workdir: {0}" -f $Work)
+
+$rows | Where-Object { $_.Verdict -in @("SURVIVED", "NOT-APPLIED", "INERT", "CRASH-ZERO") } |
+    ForEach-Object { Write-Host ("  !! {0}  {1}  [{2}]" -f $_.Id, $_.Target, $_.Verdict) -ForegroundColor Red }
+
+# A run is only clean if every mutant APPLIED and every one was demonstrated by an assertion.
+# "Survivors: 0" printed over three mutants that never ran is the exact failure this exit code closes.
+if (($nSurv + $nNotApp + $nInert + $nCrashZ) -gt 0) { exit 1 }
+exit 0

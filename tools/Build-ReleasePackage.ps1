@@ -119,10 +119,38 @@ foreach ($e in $Entries) {
         Write-Host ("  --  {0} parse gate exempt (known non-PowerShell payload, see header)" -f $e.Zip)
     }
 
+    $bytes = [IO.File]::ReadAllBytes($p)
+
+    # LINE ENDINGS MUST BE CRLF, AND THIS GATE EXISTS BECAUSE THE ABSENCE OF IT SHIPPED A DEFECT.
+    # .gitattributes pins `*.ps1 text eol=crlf`. Git normalizes text-marked files to LF in the INDEX,
+    # so a worktree whose files are LF-only reports `git status` CLEAN -- the dirt is invisible to every
+    # ordinary check. MEASURED 2026-09-14 by an independent verifier: the 1.2.0 package built from such a
+    # worktree was 68,082 bytes / e2164e37..., while a clean checkout of the same commit built 68,407 /
+    # f2141319... Same code, different bytes, and the release sheet carried the wrong hash into three
+    # Dataverse fields.
+    #
+    # Two things went wrong and this gate closes both. The hash stopped being derivable from the commit --
+    # which is the entire stated purpose of building reproducibly. And the package became the first ever
+    # to ship MIXED line endings: two files LF, three CRLF, where 1.1.2 through 1.1.8 were all measured
+    # internally consistent CRLF. Nobody chose that, in the file the bay Authenticode-signs.
+    #
+    # Refuse rather than silently repair: repairing here would hide a dirty worktree and let the next
+    # build differ from the next clean checkout all over again. The fix is `git add --renormalize .`
+    # followed by re-materializing the files, or simply building from a clean checkout.
+    $lf = 0; $crlf = 0
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 0x0A) {
+            $lf++
+            if ($i -gt 0 -and $bytes[$i - 1] -eq 0x0D) { $crlf++ }
+        }
+    }
+    if ($lf -ne $crlf) {
+        Fail ("{0} is not CRLF ({1} of {2} line endings are bare LF). .gitattributes pins *.ps1 text eol=crlf, but git normalizes to LF in the INDEX, so `git status` reads clean while the worktree is dirty. Run `git add --renormalize .` then re-materialize the files (git checkout-index -f -a), or build from a clean checkout of the commit." -f $e.Zip, ($lf - $crlf), $lf)
+    }
+
     # BA-15: non-ASCII in a comment produced a silent parse failure on Bay 1 under AllSigned.
     # A leading UTF-8 BOM is fine and is skipped -- it DECLARES the encoding rather than
     # relying on the host to guess it.
-    $bytes = [IO.File]::ReadAllBytes($p)
     $start = 0
     if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
     $bad = 0

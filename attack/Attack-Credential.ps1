@@ -56,7 +56,13 @@ $OrgUrl   = "https://mock-org.crm.dynamics.com"
 $BayId    = "33333333-3333-3333-3333-333333333333"
 $TokenAuthorityHost = "http://127.0.0.1:1"
 $AssertionAlg = "RS256"
+# Read from THE AGENT, not declared here. The identical fault was found and fixed in the test file
+# (it declared its own copy, so an assertion on it pinned the harness and passed whatever the agent
+# shipped) and then left standing in this file, 280 lines from where it was written up as worth naming.
+# A11 printed "ResultJsonMaxChars=2000" as a measurement when it was this script's own constant.
 $ResultJsonMaxChars = 2000
+$__capM = [regex]::Match([IO.File]::ReadAllText($AgentScript), '(?m)^\$ResultJsonMaxChars\s*=\s*(\d+)')
+if ($__capM.Success) { $ResultJsonMaxChars = [int]$__capM.Groups[1].Value }
 $CertThumbprintCfg = $null; $CertStoreCfg = $null
 $Secret = $null; $SecretPath = $null; $SecretPathCfg = $null; $HasSecretCredential = $false
 $Global:AccessToken = $null; $Global:TokenExpiresUtc = [DateTime]::MinValue

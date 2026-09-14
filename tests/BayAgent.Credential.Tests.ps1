@@ -72,7 +72,7 @@ $wanted = @(
     "Invoke-CredentialEnroll", "Invoke-CredentialTest", "Invoke-CredentialActivate", "Invoke-CredentialRetire",
     "Invoke-CredentialStatus", "Invoke-CredentialRotate",
     "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate", "Sync-FallbackTelemetry",
-    "Start-GenericProcess", "Read-LastUpdateResult", "Test-HasUsableSecret"
+    "Start-GenericProcess", "Read-LastUpdateResult", "Test-HasUsableSecret", "New-EnrollCertPayload"
 )
 $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $lifted = 0
@@ -378,7 +378,12 @@ try {
     Assert-True ($ret.ok -and $ret.secret.dpapiFileRemoved -and -not (Test-Path $dpapiFile)) "secret retired after a live certificate proof"
     Assert-True ($null -eq $SecretPath -and -not $HasSecretCredential) "in-memory fallback cleared"
     Assert-True ($ret.certificate.wasInStore -and $null -eq (Get-ChildItem "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue)) "old certificate removed from the store"
-    Assert-True (((Read-CredentialState).retiredThumbprints) -contains $cert.Thumbprint) "state records the retired thumbprint"
+    # Read through Get-PropValue, not as a direct property. Under Set-StrictMode -Version Latest a MISSING
+    # property is a terminating PropertyNotFoundStrict error, not $null -- so when mutation M25 removed the
+    # `$changes.retiredThumbprints = $retired` line, this assertion did not FAIL, it took the whole suite
+    # down. The harness then scored the crash as "caught", which made an unasserted behavior look pinned.
+    # A test that cannot fail cleanly cannot report what it found.
+    Assert-True (@(Get-PropValue (Read-CredentialState) "retiredThumbprints" @()) -contains $cert.Thumbprint) "state records the retired thumbprint"
     [void]$script:CreatedCerts.Remove($cert.Thumbprint)
 
     # ============================================================ T8: telemetry / capabilities payload
@@ -794,6 +799,170 @@ try {
     Assert-Throws { Normalize-Thumbprint ("A" * 39) } "40 hex" "M26: a 39-character thumbprint is refused"
     Assert-Throws { Normalize-Thumbprint ("A" * 41) } "40 hex" "M26: a 41-character thumbprint is refused"
     Assert-True ((Normalize-Thumbprint ("a1b2c3d4e5" * 4)) -eq ("A1B2C3D4E5" * 4)) "M26: a valid thumbprint normalizes to upper case"
+
+    # ============================================================ T23: the token endpoint comes from CONFIG.
+    # Asserted directly on the string rather than observed via a request, because mutation M12 (endpoint
+    # hardcoded to another host) previously killed the suite with a WebException deep inside
+    # Invoke-TokenEndpoint. A crash is evidence the suite noticed something; it is not evidence the suite
+    # ASSERTS the behavior, and roughly 160 of the 181 assertions never ran under that mutant.
+    Section "T23 the token endpoint is built from config, asserted without a network call"
+    $savedHost = $TokenAuthorityHost
+    $TokenAuthorityHost = "https://login.example.invalid"
+    $TenantId = "44444444-4444-4444-4444-444444444444"
+    $url = Get-TokenUrl
+    Assert-True ($url -eq "https://login.example.invalid/44444444-4444-4444-4444-444444444444/oauth2/v2.0/token") `
+        "Get-TokenUrl is exactly <configured authority>/<configured tenant>/oauth2/v2.0/token (got '$url')"
+    Assert-True ($url.StartsWith($TokenAuthorityHost)) "...and the host half is the CONFIGURED authority, not a literal"
+    $TokenAuthorityHost = "https://login.microsoftonline.com"
+    Assert-True ((Get-TokenUrl) -eq "https://login.microsoftonline.com/44444444-4444-4444-4444-444444444444/oauth2/v2.0/token") `
+        "...it tracks the config value rather than being fixed at load"
+    $TokenAuthorityHost = $savedHost
+    $TenantId = "11111111-1111-1111-1111-111111111111"
+
+    # ============================================================ T24: the CERTIFICATE is preferred when both
+    # credentials are present. Mutation M6 (skip the certificate branch entirely) previously died on an
+    # unhandled "SecretPath not configured" with ZERO failed assertions -- the suite had no case where a
+    # certificate and a secret were both usable at once, which is precisely the transitional state every bay
+    # is in between KH-18 step 7 and step 8.
+    Section "T24 with BOTH a certificate and a secret configured, the certificate is the one that mints"
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
+    $bothCert = New-BayClientCertificate -Subject "CN=ABG-BayAgent both-$([guid]::NewGuid().ToString('N').Substring(0,8))" -ValidityDays 60 -Store "CurrentUser"
+    [void]$script:CreatedCerts.Add($bothCert.Thumbprint)
+    Update-CredentialState @{ activeThumbprint = $bothCert.Thumbprint } | Out-Null
+    $bothDpapi = Join-Path $BaseDir "secrets\both.dpapi"
+    New-Item -ItemType Directory -Force -Path (Split-Path $bothDpapi) | Out-Null
+    [IO.File]::WriteAllBytes($bothDpapi, [byte[]](7, 7, 7))
+    $Secret = $null; $SecretPath = $bothDpapi; $SecretPathCfg = $bothDpapi; $HasSecretCredential = $true
+    $CertThumbprintCfg = $null
+    Reset-TokenState; Reset-TelemetryAsIfRestarted
+    $sync["Requests"].Clear()
+    $sync["CertResponse"]   = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"tok-from-certificate"}' }
+    $sync["SecretResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"tok-from-secret"}' }
+    $null = Acquire-Token
+    Assert-True ($Global:CredentialTelemetry.lastMintMode -eq "certificate") `
+        "the certificate mints even though a working secret is configured beside it (mode=$($Global:CredentialTelemetry.lastMintMode))"
+    Assert-True ($Global:CredentialTelemetry.fallbackCount -eq 0) "...and it is not counted as a fallback"
+    Assert-True (@($sync["Requests"]).Count -eq 1) "...exactly one token request was made"
+    $bodyBoth = "$($sync["Requests"][0].body)"
+    Assert-True ($bodyBoth -match "client_assertion=") "...and it carried a client_assertion (the certificate path)"
+    Assert-True (-not ($bodyBoth -match "client_secret=")) "...and NOT a client_secret (the secret was never reached)"
+
+    # ============================================================ T25: the -EnrollCert console path. The suite
+    # lifts functions by AST, so param() and top-level code are invisible to it -- an independent verifier
+    # flipped [switch]$EnrollForce to default $true, restoring the F5 defect on the Day-0 path the bench day
+    # actually runs, and all 181 assertions stayed green. Pin the default by PARSING the agent, and pin the
+    # payload assembly by making it a real function.
+    Section "T25 (V4a) the -EnrollCert entry path: force is opt-in, pinned against the parsed param block"
+    $agentAstErr = $null; $agentAstTok = $null
+    $agentAst = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$agentAstTok, [ref]$agentAstErr)
+    $paramBlock = $agentAst.ParamBlock
+    Assert-True ($null -ne $paramBlock) "the agent declares a script-level param block"
+    $efParam = @($paramBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "EnrollForce" })
+    Assert-True ($efParam.Count -eq 1) "-EnrollForce exists as a script parameter"
+    Assert-True (($efParam[0].StaticType.Name -eq "SwitchParameter") -or ("$($efParam[0].Attributes)" -match "switch")) "-EnrollForce is a [switch]"
+    Assert-True ($null -eq $efParam[0].DefaultValue) `
+        "-EnrollForce carries NO default, so it is OFF unless the operator types it (a default of \$true silently restores the F5 defect on the Day-0 path)"
+    $vdParam = @($paramBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "EnrollValidityDays" })
+    Assert-True ($vdParam.Count -eq 1 -and "$($vdParam[0].DefaultValue)" -eq "730") "-EnrollValidityDays still defaults to 730"
+
+    # And the payload the console path builds, now that it is a liftable function rather than top-level code.
+    $pDefault = New-EnrollCertPayload -ValidityDays 730
+    Assert-True ($pDefault.force -eq $false) "New-EnrollCertPayload defaults force to FALSE"
+    Assert-True (-not $pDefault.ContainsKey("store")) "...and omits store when none is given"
+    $pForced = New-EnrollCertPayload -ValidityDays 400 -Store "LocalMachine" -Force
+    Assert-True ($pForced.force -eq $true -and $pForced.validityDays -eq 400 -and $pForced.store -eq "LocalMachine") `
+        "...and passes force/validityDays/store through when they are given"
+    # The top-level path must go through it, not rebuild the payload inline with a literal.
+    $agentText = [IO.File]::ReadAllText($AgentScript)
+    Assert-True ($agentText -match "New-EnrollCertPayload\s+-ValidityDays\s+\`$EnrollValidityDays") `
+        "the -EnrollCert block builds its payload through the function"
+    Assert-True (-not ($agentText -match "force\s*=\s*\`$true")) "no code path hardcodes force = \$true"
+
+    # ============================================================ T26 (V3b): EVERY write leaves a .bak.
+    # "Never writes one" was already pinned; "every" was not -- a mutant that skipped the backup on the first
+    # write of each process stayed green. The backup must not depend on anything the process remembers.
+    Section "T26 (V3b) every write that replaces a state file leaves a .bak of what it replaced"
+    $bakDir = Join-Path $BaseDir "bakstate"
+    New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+    $savedStatePath = $CredentialStatePath
+    $CredentialStatePath = Join-Path $bakDir "credential.json"
+    $Global:CredentialStateCorrupt = $false
+    Update-CredentialState @{ marker = "one" } | Out-Null
+    Assert-True (-not (Test-Path "$CredentialStatePath.bak")) "the very first write has nothing to back up, so no .bak (correct, not a miss)"
+    Update-CredentialState @{ marker = "two" } | Out-Null
+    Assert-True (Test-Path "$CredentialStatePath.bak") "the next write leaves a .bak"
+    Assert-True ((Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker -eq "one") "...holding exactly what it replaced"
+    Update-CredentialState @{ marker = "three" } | Out-Null
+    Assert-True ((Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker -eq "two") "...and it is REFRESHED on the next write, not written once and left stale"
+    Update-CredentialState @{ marker = "four" } | Out-Null
+    Assert-True ((Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker -eq "three") "...and again, so the .bak is always one write behind"
+    # The structural half: a backup that depends on a remembered flag is not "every write". Write-CredentialState
+    # must carry no per-process state at all -- that is what a first-call skip requires.
+    $wcsDef = @($agentAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+                Where-Object { $_.Name -eq "Write-CredentialState" })[0]
+    $wcsText = $wcsDef.Extent.Text
+    Assert-True ($wcsText -match "\.bak") "Write-CredentialState is the function that writes the .bak"
+    Assert-True (-not ($wcsText -match '\$script:' -or $wcsText -match '\$Global:')) `
+        "...and it keeps NO per-process state, so the backup cannot be skipped on a first call"
+    $CredentialStatePath = $savedStatePath
+
+    # ============================================================ T27 (V5 residual): retire must not act on a
+    # credential it inferred from a config file while declaring its own state untrustworthy.
+    Section "T27 (V5 residual) retire refuses outright while credential.json is corrupt"
+    $corruptDir = Join-Path $BaseDir "corruptstate"
+    New-Item -ItemType Directory -Force -Path $corruptDir | Out-Null
+    $savedStatePath2 = $CredentialStatePath
+    $CredentialStatePath = Join-Path $corruptDir "credential.json"
+    [IO.File]::WriteAllText($CredentialStatePath, '{"activeThumbprint":"trunc')
+    $CertThumbprintCfg = $bothCert.Thumbprint     # the config fallback that would otherwise become "active"
+    $Secret = $null; $SecretPath = $bothDpapi; $SecretPathCfg = $bothDpapi; $HasSecretCredential = $true
+    [IO.File]::WriteAllBytes($bothDpapi, [byte[]](7, 7, 7))
+    $null = Read-CredentialState     # sets the corruption flag
+    Assert-True ($Global:CredentialStateCorrupt -eq $true) "the state file is corrupt"
+    Assert-Throws { Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; secret = $true }) } "corrupt" `
+        "retire refuses while state is corrupt, rather than acting on the config-inferred thumbprint"
+    Assert-True (Test-Path $bothDpapi) "...and the DPAPI secret is untouched"
+    $CredentialStatePath = $savedStatePath2
+    $CertThumbprintCfg = $null
+    $Global:CredentialStateCorrupt = $false
+
+    # ============================================================ T28 (F9 install half): Day-0 credential
+    # choice. The agent half of F9 is closed, but Setup-BayPC.ps1's Phase 6 still told the operator to create
+    # a DPAPI secret on the bay -- which is exactly the credential 1.2.0 exists to remove. A DPAPI file on
+    # BENCH-01 puts Test-HasUsableSecret back to true, so the Day-0 enroll goes PENDING instead of ACTIVE and
+    # the bench proof changes shape. The provisioning script must make this a CHOICE, not a reminder.
+    Section "T28 (F9 install half) Day-0 credential mode is a deliberate choice, and it defaults to certificate"
+    $setupPath = Join-Path $PSScriptRoot "..\src\BayAgent\tools\Setup-BayPC.ps1"
+    Assert-True (Test-Path $setupPath) "Setup-BayPC.ps1 is where the package puts it"
+    $setupPath = (Resolve-Path $setupPath).Path
+    $suErr = $null; $suTok = $null
+    $suAst = [System.Management.Automation.Language.Parser]::ParseFile($setupPath, [ref]$suTok, [ref]$suErr)
+    Assert-True (@($suErr).Count -eq 0) "Setup-BayPC.ps1 parses"
+    $credParam = @($suAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "Credential" })
+    Assert-True ($credParam.Count -eq 1) "Setup-BayPC.ps1 declares a -Credential parameter"
+    Assert-True ("$($credParam[0].DefaultValue)" -match "Certificate") `
+        "...and it DEFAULTS to Certificate, so the safe path is the one an operator gets by not deciding"
+    Assert-True ("$($credParam[0].Attributes)" -match "Certificate" -and "$($credParam[0].Attributes)" -match "Secret") `
+        "...constrained to Certificate or Secret (a typo must not silently pick a mode)"
+
+    $gdef = @($suAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+              Where-Object { $_.Name -eq "Get-Day0CredentialGuidance" })
+    Assert-True ($gdef.Count -eq 1) "the decision is a function, so it can be tested rather than only printed"
+    . ([scriptblock]::Create($gdef[0].Extent.Text))
+
+    $gCert = Get-Day0CredentialGuidance -Mode "Certificate" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
+    Assert-True ($gCert.dpapiRequired -eq $false) "certificate mode does NOT require a DPAPI secret"
+    Assert-True (($gCert.lines -join " ") -match "EnrollCert") "...and it tells the operator to run -EnrollCert"
+    Assert-True (-not (($gCert.lines -join " ") -match "SetClientSecretDpapi")) `
+        "...and does NOT tell them to create the secret 1.2.0 exists to remove"
+    Assert-True (($gCert.lines -join " ") -match "(?i)do not create") "...it says so in words, not by omission"
+
+    $gSec = Get-Day0CredentialGuidance -Mode "Secret" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
+    Assert-True ($gSec.dpapiRequired -eq $true) "secret mode still requires the DPAPI file (the legacy path is not removed, only un-defaulted)"
+    Assert-True (($gSec.lines -join " ") -match "SetClientSecretDpapi") "...and still gives the exact command"
+    Assert-True (($gSec.lines -join " ") -match "(?i)pending") `
+        "...and warns that a secret makes the Day-0 enroll go PENDING, which changes the bench proof"
 
     # ============================================================ T11 (opt-in): the real Entra endpoint parses the assertion
     if ($Live) {
