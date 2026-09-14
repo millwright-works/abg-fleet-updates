@@ -217,6 +217,130 @@ function Test-JwtSignature([string]$jwt, $cert, [string]$alg = "RS256") {
 }
 
 try {
+    # ================================================================ INVARIANTS, RUN FIRST
+    # These three used to sit near the end, and that made them unreachable by the mutations they exist to
+    # catch. MEASURED: mutant M6 (certificate no longer preferred over the secret) dies inside T2 with an
+    # unhandled "SecretPath not configured" -- so the suite never reached the assertion written for it, and
+    # the mutation harness scored the crash. A crash truncates the run: an assertion that exists but is not
+    # REACHED pins nothing. Foundational invariants therefore run before anything that can throw.
+    # Each restores every global it touches, so T1 onward sees the state it always did.
+
+    $__sv = @{ Secret = $Secret; SecretPath = $SecretPath; SecretPathCfg = $SecretPathCfg;
+               HasSecretCredential = $HasSecretCredential; CertThumbprintCfg = $CertThumbprintCfg;
+               TokenAuthorityHost = $TokenAuthorityHost; TenantId = $TenantId; StatePath = $CredentialStatePath }
+
+    # ============================================================ T23: the token endpoint comes from CONFIG.
+    # Asserted directly on the string rather than observed via a request, because mutation M12 (endpoint
+    # hardcoded to another host) previously killed the suite with a WebException deep inside
+    # Invoke-TokenEndpoint. A crash is evidence the suite noticed something; it is not evidence the suite
+    # ASSERTS the behavior, and roughly 160 of the 181 assertions never ran under that mutant.
+    Section "T23 the token endpoint is built from config, asserted without a network call"
+    $savedHost = $TokenAuthorityHost
+    $TokenAuthorityHost = "https://login.example.invalid"
+    $TenantId = "44444444-4444-4444-4444-444444444444"
+    $url = Get-TokenUrl
+    Assert-True ($url -eq "https://login.example.invalid/44444444-4444-4444-4444-444444444444/oauth2/v2.0/token") `
+        "Get-TokenUrl is exactly <configured authority>/<configured tenant>/oauth2/v2.0/token (got '$url')"
+    Assert-True ($url.StartsWith($TokenAuthorityHost)) "...and the host half is the CONFIGURED authority, not a literal"
+    $TokenAuthorityHost = "https://login.microsoftonline.com"
+    Assert-True ((Get-TokenUrl) -eq "https://login.microsoftonline.com/44444444-4444-4444-4444-444444444444/oauth2/v2.0/token") `
+        "...it tracks the config value rather than being fixed at load"
+    $TokenAuthorityHost = $savedHost
+    $TenantId = "11111111-1111-1111-1111-111111111111"
+
+    # ============================================================ T24: the CERTIFICATE is preferred when both
+    # credentials are present. Mutation M6 (skip the certificate branch entirely) previously died on an
+    # unhandled "SecretPath not configured" with ZERO failed assertions -- the suite had no case where a
+    # certificate and a secret were both usable at once, which is precisely the transitional state every bay
+    # is in between KH-18 step 7 and step 8.
+    Section "T24 with BOTH a certificate and a secret configured, the certificate is the one that mints"
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
+    $bothCert = New-BayClientCertificate -Subject "CN=ABG-BayAgent both-$([guid]::NewGuid().ToString('N').Substring(0,8))" -ValidityDays 60 -Store "CurrentUser"
+    [void]$script:CreatedCerts.Add($bothCert.Thumbprint)
+    Update-CredentialState @{ activeThumbprint = $bothCert.Thumbprint } | Out-Null
+    $bothDpapi = Join-Path $BaseDir "secrets\both.dpapi"
+    New-Item -ItemType Directory -Force -Path (Split-Path $bothDpapi) | Out-Null
+    [IO.File]::WriteAllBytes($bothDpapi, [byte[]](7, 7, 7))
+    $Secret = $null; $SecretPath = $bothDpapi; $SecretPathCfg = $bothDpapi; $HasSecretCredential = $true
+    $CertThumbprintCfg = $null
+    Reset-TokenState; Reset-TelemetryAsIfRestarted
+    $sync["Requests"].Clear()
+    $sync["CertResponse"]   = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"tok-from-certificate"}' }
+    $sync["SecretResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"tok-from-secret"}' }
+    # Guarded: with the certificate branch removed, Acquire-Token falls through to the secret and throws
+    # on the throwaway DPAPI bytes -- which killed the run before this section's own assertion could fail.
+    # A test that cannot fail cleanly cannot report what it found, and the harness scores the crash.
+    $t24Err = ""
+    try { $null = Acquire-Token } catch { $t24Err = $_.Exception.Message }
+    Assert-True ($t24Err -eq "") "Acquire-Token succeeds with both credentials present (err: $t24Err)"
+    Assert-True ($Global:CredentialTelemetry.lastMintMode -eq "certificate") `
+        "the certificate mints even though a working secret is configured beside it (mode=$($Global:CredentialTelemetry.lastMintMode))"
+    Assert-True ($Global:CredentialTelemetry.fallbackCount -eq 0) "...and it is not counted as a fallback"
+    Assert-True (@($sync["Requests"]).Count -eq 1) "...exactly one token request was made"
+    $bodyBoth = "$($sync["Requests"][0].body)"
+    Assert-True ($bodyBoth -match "client_assertion=") "...and it carried a client_assertion (the certificate path)"
+    Assert-True (-not ($bodyBoth -match "client_secret=")) "...and NOT a client_secret (the secret was never reached)"
+
+    # ============================================================ T26 (V3b): EVERY write leaves a .bak.
+    # "Never writes one" was already pinned; "every" was not -- a mutant that skipped the backup on the first
+    # write of each process stayed green. The backup must not depend on anything the process remembers.
+    Section "T26 (V3b) every write that replaces a state file leaves a .bak of what it replaced"
+    $bakDir = Join-Path $BaseDir "bakstate"
+    New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+    $savedStatePath = $CredentialStatePath
+    $CredentialStatePath = Join-Path $bakDir "credential.json"
+    $Global:CredentialStateCorrupt = $false
+    # Guarded for the same reason as T24: a mutant that gates the backup on a remembered flag reads that
+    # flag before setting it, which under StrictMode is a terminating error, not a failed assertion.
+    function Write-Marker([string]$m) {
+        try { Update-CredentialState @{ marker = $m } | Out-Null; return "" } catch { return $_.Exception.Message }
+    }
+    function Read-Bak {
+        if (-not (Test-Path "$CredentialStatePath.bak")) { return "<no .bak>" }
+        try { return (Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker } catch { return "<unreadable>" }
+    }
+    $e1 = Write-Marker "one"
+    Assert-True ($e1 -eq "") "the first write succeeds (err: $e1)"
+    Assert-True (-not (Test-Path "$CredentialStatePath.bak")) "the very first write has nothing to back up, so no .bak (correct, not a miss)"
+    $e2 = Write-Marker "two"
+    Assert-True ($e2 -eq "") "the second write succeeds (err: $e2)"
+    Assert-True (Test-Path "$CredentialStatePath.bak") "the next write leaves a .bak"
+    Assert-True ((Read-Bak) -eq "one") "...holding exactly what it replaced"
+    $e3 = Write-Marker "three"
+    Assert-True ($e3 -eq "") "the third write succeeds (err: $e3)"
+    Assert-True ((Read-Bak) -eq "two") "...and it is REFRESHED on the next write, not written once and left stale"
+    $e4 = Write-Marker "four"
+    Assert-True ($e4 -eq "") "the fourth write succeeds (err: $e4)"
+    Assert-True ((Read-Bak) -eq "three") "...and again, so the .bak is always one write behind"
+    # The structural half: a backup that depends on a remembered flag is not "every write". Write-CredentialState
+    # must carry no per-process state at all -- that is what a first-call skip requires.
+    # Parsed here rather than reusing a variable from a later section -- this block now runs FIRST, and a
+    # test that depends on another section having run is a test that stops working the moment order changes.
+    $wcsErr = $null; $wcsTok = $null
+    $wcsAst = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$wcsTok, [ref]$wcsErr)
+    $wcsDef = @($wcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+                Where-Object { $_.Name -eq "Write-CredentialState" })[0]
+    $wcsText = $wcsDef.Extent.Text
+    Assert-True ($wcsText -match "\.bak") "Write-CredentialState is the function that writes the .bak"
+    Assert-True (-not ($wcsText -match '\$script:' -or $wcsText -match '\$Global:')) `
+        "...and it keeps NO per-process state, so the backup cannot be skipped on a first call"
+    $CredentialStatePath = $savedStatePath
+
+
+    # Put every global back exactly as T1 expects to find it.
+    $Secret = $__sv.Secret; $SecretPath = $__sv.SecretPath; $SecretPathCfg = $__sv.SecretPathCfg
+    $HasSecretCredential = $__sv.HasSecretCredential; $CertThumbprintCfg = $__sv.CertThumbprintCfg
+    $TokenAuthorityHost = $__sv.TokenAuthorityHost; $TenantId = $__sv.TenantId
+    $CredentialStatePath = $__sv.StatePath
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
+    $Global:CredentialStateCorrupt = $false
+    Reset-TokenState; Reset-TelemetryAsIfRestarted
+    $sync["Requests"].Clear()
+    $sync["CertResponse"]   = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"mock-cert-token"}' }
+    $sync["SecretResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"mock-secret-token"}' }
+
     # ============================================================ T1: certificate creation + JWT shape
     Section "T1 enrollment creates a non-exportable key and the assertion has the documented shape"
     $cert = New-BayClientCertificate -Subject "CN=ABG-BayAgent credtest $BayId" -ValidityDays 30 -Store CurrentUser
@@ -800,54 +924,6 @@ try {
     Assert-Throws { Normalize-Thumbprint ("A" * 41) } "40 hex" "M26: a 41-character thumbprint is refused"
     Assert-True ((Normalize-Thumbprint ("a1b2c3d4e5" * 4)) -eq ("A1B2C3D4E5" * 4)) "M26: a valid thumbprint normalizes to upper case"
 
-    # ============================================================ T23: the token endpoint comes from CONFIG.
-    # Asserted directly on the string rather than observed via a request, because mutation M12 (endpoint
-    # hardcoded to another host) previously killed the suite with a WebException deep inside
-    # Invoke-TokenEndpoint. A crash is evidence the suite noticed something; it is not evidence the suite
-    # ASSERTS the behavior, and roughly 160 of the 181 assertions never ran under that mutant.
-    Section "T23 the token endpoint is built from config, asserted without a network call"
-    $savedHost = $TokenAuthorityHost
-    $TokenAuthorityHost = "https://login.example.invalid"
-    $TenantId = "44444444-4444-4444-4444-444444444444"
-    $url = Get-TokenUrl
-    Assert-True ($url -eq "https://login.example.invalid/44444444-4444-4444-4444-444444444444/oauth2/v2.0/token") `
-        "Get-TokenUrl is exactly <configured authority>/<configured tenant>/oauth2/v2.0/token (got '$url')"
-    Assert-True ($url.StartsWith($TokenAuthorityHost)) "...and the host half is the CONFIGURED authority, not a literal"
-    $TokenAuthorityHost = "https://login.microsoftonline.com"
-    Assert-True ((Get-TokenUrl) -eq "https://login.microsoftonline.com/44444444-4444-4444-4444-444444444444/oauth2/v2.0/token") `
-        "...it tracks the config value rather than being fixed at load"
-    $TokenAuthorityHost = $savedHost
-    $TenantId = "11111111-1111-1111-1111-111111111111"
-
-    # ============================================================ T24: the CERTIFICATE is preferred when both
-    # credentials are present. Mutation M6 (skip the certificate branch entirely) previously died on an
-    # unhandled "SecretPath not configured" with ZERO failed assertions -- the suite had no case where a
-    # certificate and a secret were both usable at once, which is precisely the transitional state every bay
-    # is in between KH-18 step 7 and step 8.
-    Section "T24 with BOTH a certificate and a secret configured, the certificate is the one that mints"
-    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
-    $bothCert = New-BayClientCertificate -Subject "CN=ABG-BayAgent both-$([guid]::NewGuid().ToString('N').Substring(0,8))" -ValidityDays 60 -Store "CurrentUser"
-    [void]$script:CreatedCerts.Add($bothCert.Thumbprint)
-    Update-CredentialState @{ activeThumbprint = $bothCert.Thumbprint } | Out-Null
-    $bothDpapi = Join-Path $BaseDir "secrets\both.dpapi"
-    New-Item -ItemType Directory -Force -Path (Split-Path $bothDpapi) | Out-Null
-    [IO.File]::WriteAllBytes($bothDpapi, [byte[]](7, 7, 7))
-    $Secret = $null; $SecretPath = $bothDpapi; $SecretPathCfg = $bothDpapi; $HasSecretCredential = $true
-    $CertThumbprintCfg = $null
-    Reset-TokenState; Reset-TelemetryAsIfRestarted
-    $sync["Requests"].Clear()
-    $sync["CertResponse"]   = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"tok-from-certificate"}' }
-    $sync["SecretResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"tok-from-secret"}' }
-    $null = Acquire-Token
-    Assert-True ($Global:CredentialTelemetry.lastMintMode -eq "certificate") `
-        "the certificate mints even though a working secret is configured beside it (mode=$($Global:CredentialTelemetry.lastMintMode))"
-    Assert-True ($Global:CredentialTelemetry.fallbackCount -eq 0) "...and it is not counted as a fallback"
-    Assert-True (@($sync["Requests"]).Count -eq 1) "...exactly one token request was made"
-    $bodyBoth = "$($sync["Requests"][0].body)"
-    Assert-True ($bodyBoth -match "client_assertion=") "...and it carried a client_assertion (the certificate path)"
-    Assert-True (-not ($bodyBoth -match "client_secret=")) "...and NOT a client_secret (the secret was never reached)"
-
     # ============================================================ T25: the -EnrollCert console path. The suite
     # lifts functions by AST, so param() and top-level code are invisible to it -- an independent verifier
     # flipped [switch]$EnrollForce to default $true, restoring the F5 defect on the Day-0 path the bench day
@@ -878,34 +954,6 @@ try {
     Assert-True ($agentText -match "New-EnrollCertPayload\s+-ValidityDays\s+\`$EnrollValidityDays") `
         "the -EnrollCert block builds its payload through the function"
     Assert-True (-not ($agentText -match "force\s*=\s*\`$true")) "no code path hardcodes force = \$true"
-
-    # ============================================================ T26 (V3b): EVERY write leaves a .bak.
-    # "Never writes one" was already pinned; "every" was not -- a mutant that skipped the backup on the first
-    # write of each process stayed green. The backup must not depend on anything the process remembers.
-    Section "T26 (V3b) every write that replaces a state file leaves a .bak of what it replaced"
-    $bakDir = Join-Path $BaseDir "bakstate"
-    New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
-    $savedStatePath = $CredentialStatePath
-    $CredentialStatePath = Join-Path $bakDir "credential.json"
-    $Global:CredentialStateCorrupt = $false
-    Update-CredentialState @{ marker = "one" } | Out-Null
-    Assert-True (-not (Test-Path "$CredentialStatePath.bak")) "the very first write has nothing to back up, so no .bak (correct, not a miss)"
-    Update-CredentialState @{ marker = "two" } | Out-Null
-    Assert-True (Test-Path "$CredentialStatePath.bak") "the next write leaves a .bak"
-    Assert-True ((Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker -eq "one") "...holding exactly what it replaced"
-    Update-CredentialState @{ marker = "three" } | Out-Null
-    Assert-True ((Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker -eq "two") "...and it is REFRESHED on the next write, not written once and left stale"
-    Update-CredentialState @{ marker = "four" } | Out-Null
-    Assert-True ((Get-Content "$CredentialStatePath.bak" -Raw | ConvertFrom-Json).marker -eq "three") "...and again, so the .bak is always one write behind"
-    # The structural half: a backup that depends on a remembered flag is not "every write". Write-CredentialState
-    # must carry no per-process state at all -- that is what a first-call skip requires.
-    $wcsDef = @($agentAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-                Where-Object { $_.Name -eq "Write-CredentialState" })[0]
-    $wcsText = $wcsDef.Extent.Text
-    Assert-True ($wcsText -match "\.bak") "Write-CredentialState is the function that writes the .bak"
-    Assert-True (-not ($wcsText -match '\$script:' -or $wcsText -match '\$Global:')) `
-        "...and it keeps NO per-process state, so the backup cannot be skipped on a first call"
-    $CredentialStatePath = $savedStatePath
 
     # ============================================================ T27 (V5 residual): retire must not act on a
     # credential it inferred from a config file while declaring its own state untrustworthy.
