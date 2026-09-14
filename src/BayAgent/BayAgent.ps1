@@ -1362,7 +1362,7 @@ function Get-AgentOperationalState {
 
     $blocked = ($status -eq $AGENTSTATUS_OFFLINE -or $status -eq $AGENTSTATUS_MAINTENANCE)
 
-    # If a temporary block has expired, treat as unblocked (and we’ll auto-clear the fields below)
+    # If a temporary block has expired, treat as unblocked (and we'll auto-clear the fields below)
     if ($blocked -and $expired) { $blocked = $false }
 
     $blockReason = ""
@@ -1390,7 +1390,7 @@ function Is-CommandAllowedInMode {
 
     if (-not $OpState -or -not $OpState.Blocked) { return $true }
 
-    # OFFLINE: allow only safe “read-only / diagnostics” style commands
+    # OFFLINE: allow only safe "read-only / diagnostics" style commands
     if ($OpState.Status -eq $AGENTSTATUS_OFFLINE) {
         return (
             $CommandType -eq $CMD_HEALTHCHECK -or
