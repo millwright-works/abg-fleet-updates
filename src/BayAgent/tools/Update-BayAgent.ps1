@@ -67,7 +67,12 @@ param(
   [switch]$RequestRestart,
 
   # Logging
-  [string]$LogPath = "C:\AllBirdies\BayAgent\logs\Update-BayAgent.log",
+  # Empty means "derive from -BaseDir" (resolved just below). It used to be hardcoded to the default
+  # install path, so an updater run against any other -BaseDir wrote its log into a DIFFERENT install's
+  # log directory -- or into one that did not exist. On a real bay the two coincide, which is why it was
+  # never noticed; it showed up the moment a test ran the updater against its own BaseDir and the failure
+  # it was looking for had been written somewhere else entirely.
+  [string]$LogPath = "",
 
   # Download retry count
   [int]$DownloadRetries = 3,
@@ -82,6 +87,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $BaseDir "logs\Update-BayAgent.log" }
 
 function Ensure-Dir([string]$p) {
   if (-not (Test-Path -LiteralPath $p)) {
@@ -101,6 +108,48 @@ function Write-Log([string]$msg) {
 
 function Get-Sha([string]$path) {
   return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Write-UpdateResult([bool]$ok, [string]$reason, [string]$stage) {
+  # THE DURABLE OUTCOME OF THIS RUN, and the only thing that can contradict a Succeeded BayCommand.
+  #
+  # A fleet update is triggered by StartProcess, whose result is written the instant powershell.exe launches.
+  # Nothing downstream ever learns what this script then did. MEASURED 2026-09-14: on a bay PC with no
+  # code-signing certificate, Get-CodeSigningCert throws, the script dies, and the command reports Succeeded
+  # having installed nothing -- with not one line in the log, because the throw happened before any Write-Log
+  # on that path. That is the bench-day failure: BENCH-01 is a fresh machine, and a fresh machine only has a
+  # code-signing certificate if Day-0 setup ran.
+  #
+  # So every exit writes here, success or failure, and the agent carries it in the heartbeat as
+  # lastUpdateResult. A version that did not install can then be SEEN rather than inferred from a bay that
+  # keeps reporting its old version for no stated reason.
+  try {
+    $dir = Join-Path $BaseDir "state"
+    Ensure-Dir $dir
+    $obj = [ordered]@{
+      ok        = $ok
+      version   = $Version
+      stage     = $stage
+      reason    = $reason
+      packageUrl = $PackageUrl
+      utc       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+      machine   = $env:COMPUTERNAME
+    }
+    $json = $obj | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText((Join-Path $dir "last-update-result.json"), $json, (New-Object Text.UTF8Encoding($false)))
+  } catch {
+    # A marker we cannot write must not itself break the update.
+    Write-Log ("WARNING: could not write last-update-result.json: " + $_.Exception.Message)
+  }
+}
+
+# Catches EVERY terminating error in the linear body below -- including the ones thrown before their own
+# stage had logged anything. `break` re-throws after running, so the caller still sees a failure.
+trap {
+  $msg = $_.Exception.Message
+  Write-Log ("UPDATE FAILED: " + $msg)
+  Write-UpdateResult -ok $false -reason $msg -stage "unknown"
+  break
 }
 
 function Invoke-Robo([string]$src, [string]$dst, [string[]]$extraArgs) {
@@ -338,5 +387,6 @@ if ($RequestRestart) {
   Write-Log "Wrote restart marker: $marker"
 }
 
+Write-UpdateResult -ok $true -reason "" -stage "complete"
 Write-Log "Update complete OK. Version=$Version"
 Write-Output ("OK: Updated BayAgent to {0}. ReleaseDir={1}. CurrentDir={2}. SignedFiles={3}. RestartRequested={4}" -f $Version, $relDir, $CurrentDir, $signCount, [bool]$RequestRestart)

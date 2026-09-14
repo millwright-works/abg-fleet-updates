@@ -71,7 +71,8 @@ $wanted = @(
     "New-BayClientCertificate", "Export-PublicCertificate", "Build-CredentialEnrollResult",
     "Invoke-CredentialEnroll", "Invoke-CredentialTest", "Invoke-CredentialActivate", "Invoke-CredentialRetire",
     "Invoke-CredentialStatus", "Invoke-CredentialRotate",
-    "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate", "Sync-FallbackTelemetry"
+    "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate", "Sync-FallbackTelemetry",
+    "Start-GenericProcess", "Read-LastUpdateResult", "Test-HasUsableSecret"
 )
 $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $lifted = 0
@@ -367,6 +368,12 @@ try {
     Assert-Throws { Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; secret = $true }) } "AADSTS700027" "secret retire refused while the active certificate cannot mint"
     Assert-True (Test-Path $dpapiFile) "DPAPI file untouched after refused retire"
     $sync["CertResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"mock-cert-token-2"}' }
+    # $cert is only retirable because the agent RECORDED it. In a real rotation Invoke-CredentialActivate
+    # writes previousThumbprint as it switches; this section reached T6 with no active certificate, so that
+    # never happened and the record has to be made here. Before F3 this line was unnecessary -- the ownership
+    # guard accepted $cert on its SUBJECT alone, which is the hole F3 closed (see T17).
+    Update-CredentialState @{ previousThumbprint = $cert.Thumbprint } | Out-Null
+    Assert-True ((Test-IsAgentOwnedCertificate -Thumbprint $cert.Thumbprint) -eq $true) "a recorded previous certificate is retirable"
     $ret = Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; secret = $true; thumbprint = $cert.Thumbprint })
     Assert-True ($ret.ok -and $ret.secret.dpapiFileRemoved -and -not (Test-Path $dpapiFile)) "secret retired after a live certificate proof"
     Assert-True ($null -eq $SecretPath -and -not $HasSecretCredential) "in-memory fallback cleared"
@@ -479,10 +486,15 @@ try {
         "retire REFUSES a certificate this agent did not create"
     Assert-True (Test-Path -LiteralPath "Cert:\CurrentUser\My\$($foreign.Thumbprint)") "...and the foreign certificate is still in the store"
 
-    # The positive half: an agent-made certificate IS retirable, so the guard has not simply disabled retire.
+    # The positive half: an agent-RECORDED certificate IS retirable, so the guard has not simply disabled retire.
+    # ⚠️ This used to assert that the SUBJECT alone made a certificate agent-owned. It no longer does, and that
+    # is the F3 fix: a subject is chosen by whoever creates the certificate, so trusting it re-opened the
+    # delete-any-private-key primitive in weaker form. T17 pins the refusal; this pins that the record still works.
     $ownDead = New-BayClientCertificate -Subject "CN=ABG-BayAgent retire-me" -ValidityDays 60 -Store "CurrentUser" -KeyLength 2048
     [void]$script:CreatedCerts.Add($ownDead.Thumbprint)
-    Assert-True (Test-IsAgentOwnedCertificate -Thumbprint $ownDead.Thumbprint) "an ABG-BayAgent certificate IS agent-owned"
+    Assert-True ((Test-IsAgentOwnedCertificate -Thumbprint $ownDead.Thumbprint) -eq $false) "an ABG-subjected certificate is NOT agent-owned on its subject alone"
+    Update-CredentialState @{ previousThumbprint = $ownDead.Thumbprint } | Out-Null
+    Assert-True (Test-IsAgentOwnedCertificate -Thumbprint $ownDead.Thumbprint) "...but a RECORDED certificate is agent-owned"
     $retOwn = Invoke-CredentialRetire @{ thumbprint = $ownDead.Thumbprint }
     Assert-True ($retOwn.ok -eq $true) "retire still works on an agent-owned certificate"
     Assert-True (-not (Test-Path -LiteralPath "Cert:\CurrentUser\My\$($ownDead.Thumbprint)")) "...and it is actually gone"
@@ -548,6 +560,240 @@ try {
     Assert-True ($tel4.fallbackCountTotal -eq 5) "post-restart fallbacks ACCUMULATE onto the durable total (3 + 2)"
     $stTotal = [int](Get-PropValue (Read-CredentialState) "fallbackCountTotal" 0)
     Assert-True ($stTotal -eq 5) "...and the total is actually on disk in credential.json, not just in memory"
+
+    # ============================================================ T15 (F1): retire secret=true must NOT report success
+    # while a PLAINTEXT clientSecret is still in agent-config.json and still mints a token.
+    Section "T15 (F1) retire secret=true refuses to report success while a plaintext secret survives"
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    $f1cert = New-BayClientCertificate -Subject "CN=ABG-BayAgent f1-$([guid]::NewGuid().ToString('N').Substring(0,8))" -ValidityDays 60 -Store "CurrentUser"
+    [void]$script:CreatedCerts.Add($f1cert.Thumbprint)
+    Update-CredentialState @{ activeThumbprint = $f1cert.Thumbprint } | Out-Null
+    $CertThumbprintCfg = $null
+    $Secret = "plaintext-secret-that-still-works"; $SecretPath = $null; $SecretPathCfg = $null; $HasSecretCredential = $true
+    $sync["CertResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"mock-f1"}' }
+    $f1 = Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; secret = $true })
+    Assert-True ($f1.ok -eq $false) "a plaintext secret that survives the retire makes the RESULT NOT ok (it still mints a token)"
+    Assert-True (@($f1.secret.Keys) -contains "plaintextSecretStillInConfig" -and $f1.secret.plaintextSecretStillInConfig -eq $true) `
+        "...and plaintextSecretStillInConfig is stated explicitly, not implied by a note"
+    Assert-True (@($f1.secret.Keys) -contains "dpapiFileRemoved" -and $f1.secret.dpapiFileRemoved -eq $false) `
+        "...and dpapiFileRemoved is stated explicitly even when there was no DPAPI file"
+    Assert-True ("$(Get-PropValue $f1.secret 'reason' '')" -match "PLAINTEXT") "...and carries a coded reason naming the plaintext secret"
+    # The clean case still reports ok, so the guard is not simply always-false.
+    $Secret = $null; $HasSecretCredential = $false
+    $f1b = Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; secret = $true })
+    Assert-True ($f1b.ok -eq $true -and $f1b.secret.plaintextSecretStillInConfig -eq $false) "with no plaintext secret the same call reports ok (the guard is not always-false)"
+
+    # ============================================================ T16 (F2): a corrupt credential.json must never be
+    # silently rewritten -- that would permanently zero activeThumbprint / retiredThumbprints / fallbackCountTotal.
+    Section "T16 (F2) a truncated credential.json fails CLOSED and is never overwritten"
+    Update-CredentialState @{ activeThumbprint = $f1cert.Thumbprint; fallbackCountTotal = 17; retiredThumbprints = @("AAAA") } | Out-Null
+    $goodBytes = [IO.File]::ReadAllBytes($CredentialStatePath)
+    Assert-True (Test-Path "$CredentialStatePath.bak") "every write leaves a .bak behind"
+    # Truncate it the way a power cut would.
+    $truncated = '{"activeThumbprint":"' + $f1cert.Thumbprint + '","fallbackCountT'
+    [IO.File]::WriteAllText($CredentialStatePath, $truncated, (New-Object Text.UTF8Encoding($false)))
+    $script:LogLines.Clear()
+    $readBack = Read-CredentialState
+    Assert-True ($null -eq $readBack) "a corrupt state file reads as no-state so the agent can still run on what it can prove"
+    Assert-True ((($script:LogLines | Where-Object { $_ -match "^\[ERROR\].*corrupt" }) | Measure-Object).Count -ge 1) `
+        "...and it is logged at ERROR, not WARN -- this is not a routine absence"
+    Assert-Throws { Update-CredentialState @{ pendingThumbprint = $f1cert.Thumbprint } } "corrupt" `
+        "a write over a corrupt state file is REFUSED"
+    Assert-True ([IO.File]::ReadAllText($CredentialStatePath) -eq $truncated) `
+        "...and the corrupt file is left exactly as it was, so it can still be recovered by hand"
+    $telC = Get-CredentialTelemetry
+    Assert-True ($telC.stateFileCorrupt -eq $true) "the heartbeat SURFACES the corruption (a silent corrupt state is the whole failure mode)"
+    # ⚠️ THE GATE UNDER THE IRREVERSIBLE STEP. KH-18 step 8 is unlocked by an operator reading
+    # fallbackCountTotal and seeing zero. A corrupt state file must therefore NOT render as zero -- that is
+    # the one value that would let corruption unlock the estate's only irreversible act.
+    Assert-True ($null -eq $telC.fallbackCountTotal) "a corrupt state file reports the durable total as UNKNOWN, never as a clean zero"
+    Assert-True ((($script:LogLines | Where-Object { $_ -match "^\[ERROR\].*UNKNOWN" }) | Measure-Object).Count -ge 1) `
+        "...and says so at ERROR, naming the retirement gate"
+    # Recovering by hand from the .bak restores the numbers the truncation would have zeroed.
+    [IO.File]::WriteAllBytes($CredentialStatePath, $goodBytes)
+    Assert-True ([int](Get-PropValue (Read-CredentialState) "fallbackCountTotal" 0) -eq 17) "after recovery the durable total is intact (it was never zeroed)"
+    Assert-True ((Get-CredentialTelemetry).stateFileCorrupt -eq $false) "...and the corruption flag clears once the file parses again"
+
+    # ============================================================ T17 (F3): the ownership guard must not trust a SUBJECT
+    # STRING. Anyone who can create a certificate can choose its subject.
+    Section "T17 (F3) retire refuses an ABG-subjected certificate this agent never recorded"
+    $imposter = New-SelfSignedCertificate -Type Custom -Subject "CN=ABG-BayAgent imposter" -CertStoreLocation "Cert:\CurrentUser\My" `
+        -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm sha256 -KeyExportPolicy NonExportable -KeyUsage DigitalSignature `
+        -NotAfter (Get-Date).AddDays(60)
+    [void]$script:CreatedCerts.Add($imposter.Thumbprint)
+    Assert-True ((Test-IsAgentOwnedCertificate -Thumbprint $imposter.Thumbprint) -eq $false) `
+        "a certificate whose SUBJECT merely looks like ours is NOT agent-owned (the subject is caller-chosen)"
+    Assert-Throws { Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; thumbprint = $imposter.Thumbprint }) } "not an agent-owned" `
+        "retire refuses it"
+    Assert-True ($null -ne (Get-ChildItem "Cert:\CurrentUser\My\$($imposter.Thumbprint)" -ErrorAction SilentlyContinue)) `
+        "...and the certificate is still in the store"
+    # A certificate this agent actually recorded IS retirable -- the guard is not simply always-false.
+    Update-CredentialState @{ previousThumbprint = $imposter.Thumbprint } | Out-Null
+    Assert-True ((Test-IsAgentOwnedCertificate -Thumbprint $imposter.Thumbprint) -eq $true) "a RECORDED thumbprint is agent-owned"
+    Update-CredentialState @{ previousThumbprint = $null } | Out-Null
+
+    # ============================================================ T18 (F4): a combined {thumbprint, secret:true} payload
+    # must prove the certificate mints BEFORE it destroys anything. There is no rollback for a deleted private key.
+    Section "T18 (F4) a combined retire proves first and deletes after -- a failed proof destroys nothing"
+    $f4old = New-BayClientCertificate -Subject "CN=ABG-BayAgent f4old-$([guid]::NewGuid().ToString('N').Substring(0,8))" -ValidityDays 60 -Store "CurrentUser"
+    [void]$script:CreatedCerts.Add($f4old.Thumbprint)
+    $f4dpapi = Join-Path $BaseDir "secrets\f4.dpapi"
+    New-Item -ItemType Directory -Force -Path (Split-Path $f4dpapi) | Out-Null
+    [IO.File]::WriteAllBytes($f4dpapi, [byte[]](9, 9, 9))
+    Update-CredentialState @{ activeThumbprint = $f1cert.Thumbprint; previousThumbprint = $f4old.Thumbprint } | Out-Null
+    $Secret = $null; $SecretPath = $f4dpapi; $SecretPathCfg = $f4dpapi; $HasSecretCredential = $true
+    $sync["CertResponse"] = @{ status = 401; body = '{"error":"invalid_client","error_description":"AADSTS700027: key not found"}' }
+    Assert-Throws { Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; thumbprint = $f4old.Thumbprint; secret = $true }) } "AADSTS700027" `
+        "the combined retire fails on the live proof"
+    Assert-True ($null -ne (Get-ChildItem "Cert:\CurrentUser\My\$($f4old.Thumbprint)" -ErrorAction SilentlyContinue)) `
+        "...and the certificate was NOT deleted first (no rollback exists for a destroyed private key)"
+    Assert-True (Test-Path $f4dpapi) "...and the DPAPI secret is untouched"
+    # With a working proof the same call does both, in one go.
+    $sync["CertResponse"] = @{ status = 200; body = '{"token_type":"Bearer","expires_in":3599,"access_token":"mock-f4"}' }
+    $f4 = Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; thumbprint = $f4old.Thumbprint; secret = $true })
+    Assert-True ($f4.ok -and $f4.certificate.wasInStore -and -not (Test-Path $f4dpapi)) "with a valid proof the same call retires both"
+    [void]$script:CreatedCerts.Remove($f4old.Thumbprint)
+
+    # ============================================================ T19 (F5): superseding a pending certificate must record
+    # the thumbprint it replaced, or the old private key is orphaned on the machine with nothing pointing at it.
+    Section "T19 (F5) a superseded pending certificate is recorded, and force is not the default"
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
+    Update-CredentialState @{ activeThumbprint = $f1cert.Thumbprint } | Out-Null
+    $Secret = $null; $SecretPath = $null; $SecretPathCfg = $null; $HasSecretCredential = $false
+    $e1 = Invoke-CredentialEnroll @{ validityDays = 60 }
+    [void]$script:CreatedCerts.Add($e1.thumbprint)
+    $e1again = Invoke-CredentialEnroll @{ validityDays = 60 }
+    Assert-True ($e1again.reused -eq $true -and $e1again.thumbprint -eq $e1.thumbprint) "without force, a repeated enroll REUSES the pending certificate (it does not mint another key)"
+    $e2 = Invoke-CredentialEnroll @{ validityDays = 60; force = $true }
+    [void]$script:CreatedCerts.Add($e2.thumbprint)
+    Assert-True ($e2.thumbprint -ne $e1.thumbprint) "force mints a new one"
+    $sup = @(Get-PropValue (Read-CredentialState) "superseded" @())
+    Assert-True ($sup -contains $e1.thumbprint) "...and the SUPERSEDED thumbprint is recorded, so its orphaned private key can still be found and retired"
+    Assert-True ((Test-IsAgentOwnedCertificate -Thumbprint $e1.thumbprint) -eq $true) "...which also makes the superseded certificate retirable"
+
+    # ============================================================ T20 (F7): a fleet update that dies before it installs
+    # must not report Succeeded. The bench-day failure is a bay PC with no code-signing certificate.
+    Section "T20 (F7) a failed update is recorded durably instead of reporting Succeeded"
+    $f7base = Join-Path $BaseDir "f7"
+    New-Item -ItemType Directory -Force -Path $f7base | Out-Null
+    # Resolved from the REPO, never from -AgentScript. The mutation harness points -AgentScript at a lone
+    # mutated copy of BayAgent.ps1 in a temp folder with no tools\ beside it; resolving relatively there made
+    # this section explode and every single mutant register as "CRASH", which silently hid whether the suite
+    # actually catches anything. The updater is not the thing under mutation.
+    $updater = Join-Path $PSScriptRoot "..\src\BayAgent\tools\Update-BayAgent.ps1"
+    Assert-True (Test-Path $updater) "the updater is where the package puts it"
+    $updater = (Resolve-Path $updater).Path
+    # A Dataverse URL is refused by name, which is the cheapest way to make the updater die early.
+    # The updater writes its refusal to stderr and exits non-zero; with $ErrorActionPreference=Stop that would
+    # abort the test harness itself, so the child is run with its own preference and its streams swallowed.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updater -Version "9.9.9" `
+            -PackageUrl "https://builds-apps-dev.crm.dynamics.com/api/data/v9.2/build_fleetreleases(x)/build_packagefile/value" `
+            -Sha256 ("0" * 64) -BaseDir $f7base 2>&1 | Out-Null
+    } catch { }
+    $ErrorActionPreference = $prevEap
+    $marker = Join-Path $f7base "state\last-update-result.json"
+    Assert-True (Test-Path $marker) "a failed update writes a durable result marker"
+    $mk = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+    Assert-True ($mk.ok -eq $false) "...saying it FAILED"
+    Assert-True ("$($mk.reason)" -match "Dataverse") "...and why, in the reason"
+    $f7log = @(Get-ChildItem (Join-Path $f7base "logs") -Filter *.log -ErrorAction SilentlyContinue)
+    Assert-True ($f7log.Count -ge 1 -and ((Get-Content $f7log[0].FullName -Raw) -match "UPDATE FAILED")) `
+        "...and the failure reaches the log, which it did not before (Get-CodeSigningCert threw into silence)"
+    Assert-True ((Read-LastUpdateResult -Base $f7base).ok -eq $false) "the agent can read the marker back for the heartbeat"
+    # A missing executable is refused up front and always was -- that check is correct and is pinned here so
+    # the F7 change cannot be mistaken for having weakened it.
+    Assert-Throws { Start-GenericProcess ([pscustomobject]@{ path = "C:\definitely\not\here\nope.exe" }) } "Executable not found" `
+        "StartProcess still refuses a path that does not exist"
+    # The gap was a file that EXISTS but cannot be launched: Start-Process threw, and the throw escaped as an
+    # opaque command failure rather than a result saying the process never ran.
+    $unlaunchable = Join-Path $BaseDir "not-a-program.abgnope"
+    [IO.File]::WriteAllText($unlaunchable, "this is not an executable")
+    $bad = Start-GenericProcess ([pscustomobject]@{ path = $unlaunchable })
+    Assert-True ($bad.started -eq $false -and "$($bad.error)".Length -gt 0) "StartProcess reports started=false with a reason when the launch itself fails"
+    Assert-True ((($script:LogLines | Where-Object { $_ -match "^\[ERROR\] StartProcess FAILED to launch" }) | Measure-Object).Count -ge 1) `
+        "...and says so in the log"
+    # And a launch that DOES work still says started=true, flagged as a launch rather than a completion.
+    $good = Start-GenericProcess ([pscustomobject]@{ path = "C:\Windows\System32\cmd.exe"; args = "/c exit 0" })
+    Assert-True ($good.started -eq $true -and $good.launchedOnly -eq $true) "a real launch reports started=true, labelled launchedOnly (it does not claim the work succeeded)"
+
+    # ============================================================ T21 (F9): the Day-0 trap. A shipped config names a DPAPI
+    # path whose file does not exist; the bay has no usable credential at all, so enroll must ACTIVATE, not go pending.
+    Section "T21 (F9) enroll reads ACTUAL credential availability, not the config's claim"
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
+    $ghost = Join-Path $BaseDir "secrets\never-created.dpapi"
+    $Secret = $null; $SecretPath = $ghost; $SecretPathCfg = $ghost; $HasSecretCredential = $true
+    $CertThumbprintCfg = $null
+    $day0b = Invoke-CredentialEnroll @{ validityDays = 60 }
+    [void]$script:CreatedCerts.Add($day0b.thumbprint)
+    Assert-True ($day0b.activatedDirectly -eq $true) "a config that NAMES a DPAPI file which does not exist is not a credential; the new certificate activates"
+    Assert-True ((Get-ActiveCertThumbprint) -eq $day0b.thumbprint) "...and it is the active credential"
+    $script:LogLines.Clear()
+    Write-CredentialStartupSummary
+    Assert-True ((($script:LogLines | Where-Object { $_ -match "^\[INFO\] Auth mode: CERTIFICATE" }) | Measure-Object).Count -eq 1) `
+        "...so startup no longer throws on the missing DPAPI file (the Day-0 trap is closed end to end)"
+    # And a DPAPI file that DOES exist still counts as a credential, so enroll still goes pending.
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    $realDpapi = Join-Path $BaseDir "secrets\real.dpapi"
+    [IO.File]::WriteAllBytes($realDpapi, [byte[]](4, 5, 6))
+    $Secret = $null; $SecretPath = $realDpapi; $SecretPathCfg = $realDpapi; $HasSecretCredential = $true
+    $pend = Invoke-CredentialEnroll @{ validityDays = 60 }
+    [void]$script:CreatedCerts.Add($pend.thumbprint)
+    Assert-True ($pend.activatedDirectly -eq $false) "a DPAPI file that EXISTS is a credential, so enroll still goes pending (the fix is not simply always-activate)"
+
+    # ============================================================ T22: pins on the behaviours the attack found already
+    # holding, so a later edit cannot quietly remove them.
+    Section "T22 pins on the survivors (M2, M17, M18, M24, M26)"
+    # M2 -- retire secret must refuse outright when there is no active certificate to fall back to.
+    Remove-Item -LiteralPath $CredentialStatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$CredentialStatePath.bak" -Force -ErrorAction SilentlyContinue
+    $CertThumbprintCfg = $null
+    $Secret = $null; $SecretPath = $realDpapi; $SecretPathCfg = $realDpapi; $HasSecretCredential = $true
+    Assert-Throws { Invoke-CredentialRotate ([pscustomobject]@{ action = "retire"; secret = $true }) } "no active certificate" `
+        "M2: retiring the secret with NO active certificate is refused -- it is the only credential"
+    # M17 -- an expired certificate is refused before any network call.
+    $expired = New-SelfSignedCertificate -Type Custom -Subject "CN=ABG-BayAgent expired" -CertStoreLocation "Cert:\CurrentUser\My" `
+        -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm sha256 -KeyExportPolicy NonExportable -KeyUsage DigitalSignature `
+        -NotBefore (Get-Date).AddDays(-40) -NotAfter (Get-Date).AddDays(-1)
+    [void]$script:CreatedCerts.Add($expired.Thumbprint)
+    Assert-Throws { Acquire-TokenWithCertificate -Thumbprint $expired.Thumbprint } "expired" `
+        "M17: an expired certificate is refused locally, before a token request is made"
+    # M18 -- state wins over config. A stale config thumbprint must never pin a revoked certificate.
+    Update-CredentialState @{ activeThumbprint = $f1cert.Thumbprint } | Out-Null
+    $CertThumbprintCfg = $expired.Thumbprint
+    Assert-True ((Get-ActiveCertThumbprint) -eq $f1cert.Thumbprint) `
+        "M18: state\credential.json activeThumbprint OUTRANKS agent-config.json clientCertThumbprint"
+    Update-CredentialState @{ activeThumbprint = $null } | Out-Null
+    Assert-True ((Get-ActiveCertThumbprint) -eq $expired.Thumbprint) "...and the config value is the fallback only when state names none"
+    $CertThumbprintCfg = $null
+    # M24 -- the result cap constant, read out of THE AGENT rather than out of this harness.
+    # ⚠️ The obvious assertion here is `$ResultJsonMaxChars -eq 2000`, and it is worthless: this test file
+    # declares its own $ResultJsonMaxChars at the top, so that assertion pins the HARNESS and would pass no
+    # matter what the shipped agent says. Mutation M24 (cap raised to 100000) survived exactly that way.
+    # Pin the value the agent actually ships.
+    $agentSrc = [IO.File]::ReadAllText($AgentScript)
+    $capMatch = [regex]::Match($agentSrc, '(?m)^\$ResultJsonMaxChars\s*=\s*(\d+)')
+    Assert-True ($capMatch.Success) "M24: the agent declares a build_resultjson cap"
+    Assert-True ([int]$capMatch.Groups[1].Value -eq 2000) `
+        "M24: the cap THE AGENT SHIPS is 2000 (measured against Dev; over-large silently makes the result PATCH fail, which lands in the catch that marks the command Failed)"
+
+    # M19 -- activate's own private-key check must be the one that fires. Without it the call still fails,
+    # because Acquire-TokenWithCertificate looks the certificate up again -- but it fails LATER and with a
+    # message about token minting rather than about the certificate the operator named. Pin the early,
+    # specific refusal, not merely "something threw".
+    $ghostTp = "0123456789ABCDEF0123456789ABCDEF01234567"
+    $m19 = ""
+    try { Invoke-CredentialActivate ([pscustomobject]@{ thumbprint = $ghostTp }) } catch { $m19 = $_.Exception.Message }
+    Assert-True ($m19 -match "^activate:") "M19: activate refuses a thumbprint with no private key in ITS OWN check (message: $m19)"
+    Assert-True ($m19 -match "private key") "M19: ...and says the private key is what is missing"
+    # M26 -- thumbprints are exactly 40 hex characters.
+    Assert-Throws { Normalize-Thumbprint ("A" * 39) } "40 hex" "M26: a 39-character thumbprint is refused"
+    Assert-Throws { Normalize-Thumbprint ("A" * 41) } "40 hex" "M26: a 41-character thumbprint is refused"
+    Assert-True ((Normalize-Thumbprint ("a1b2c3d4e5" * 4)) -eq ("A1B2C3D4E5" * 4)) "M26: a valid thumbprint normalizes to upper case"
 
     # ============================================================ T11 (opt-in): the real Entra endpoint parses the assertion
     if ($Live) {
