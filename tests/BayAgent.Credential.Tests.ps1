@@ -840,7 +840,17 @@ try {
     if ($f7log.Count -ge 1) { try { $f7logText = (Get-Content $f7log[0].FullName -Raw) } catch { } }
     Assert-True ($f7log.Count -ge 1 -and ($f7logText -match "UPDATE FAILED")) `
         "...and the failure reaches the log, which it did not before (Get-CodeSigningCert threw into silence)"
-    Assert-True ((Read-LastUpdateResult -Base $f7base).ok -eq $false) "the agent can read the marker back for the heartbeat"
+    # Guarded, and this is the FIFTH instance of the same shape in this file -- one line past the four
+    # fixed in 8c0a0d5. Read-LastUpdateResult returns $null when the marker is absent, which is EXACTLY
+    # what mutant MU1 causes; under StrictMode reading .ok off $null is a terminating
+    # PropertyNotFoundStrict, not a failed assertion. So the one test written to catch MU1 was itself
+    # killing the run: MU1 reached 22 of 28 sections instead of finishing.
+    #
+    # The pattern is worth stating once more because it recurred five times in one file: ANY read of a
+    # value the mutation under test is designed to remove must be written so that its absence FAILS rather
+    # than THROWS. Asserting on a property is a read of the thing you are trying to prove is missing.
+    $f7read = Read-LastUpdateResult -Base $f7base
+    Assert-True ($null -ne $f7read -and $f7read.ok -eq $false) "the agent can read the marker back for the heartbeat"
     # A missing executable is refused up front and always was -- that check is correct and is pinned here so
     # the F7 change cannot be mistaken for having weakened it.
     Assert-Throws { Start-GenericProcess ([pscustomobject]@{ path = "C:\definitely\not\here\nope.exe" }) } "Executable not found" `
