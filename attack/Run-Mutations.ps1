@@ -44,6 +44,12 @@ $crlf = [string][char]13 + [string][char]10
 $lf   = [string][char]10
 function Norm([string]$t) { return $t.Replace($crlf, $lf) }
 
+# How many sections the suite declares, so each mutant's run can be reported as "N of M sections ran".
+$script:TotalSections = @([regex]::Matches(
+    [IO.File]::ReadAllText((Join-Path $Root "tests\BayAgent.Credential.Tests.ps1")),
+    "(?m)^\s*Section\s+`"")).Count
+Write-Host ("Suite declares {0} sections; each mutant reports how many it reached." -f $script:TotalSections)
+
 $Muts = @(
   @{ Id="M1"; Target="4 retire self-proof";       From='        $null = Acquire-TokenWithCertificate -Thumbprint $active'
                                                    To='        # MUTANT M1: self-proof removed' }
@@ -167,7 +173,7 @@ foreach ($m in $Muts) {
 
     $target = Join-Path $tree $relFile
     if (-not (Test-Path $target)) {
-        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "NOT-APPLIED"; Detail = "target file missing: $relFile" }
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "NOT-APPLIED"; Ran = "0/$script:TotalSections sections"; Detail = "target file missing: $relFile" }
         Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "NOT-APPLIED", "target file missing") -ForegroundColor Red
         continue
     }
@@ -180,7 +186,7 @@ foreach ($m in $Muts) {
     $to   = Norm $m.To
 
     if (-not $src.Contains($from)) {
-        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "NOT-APPLIED"; Detail = "anchor not found in $relFile" }
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "NOT-APPLIED"; Ran = "0/$script:TotalSections sections"; Detail = "anchor not found in $relFile" }
         Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "NOT-APPLIED", "ANCHOR MISS -- this behavior was NOT tested") -ForegroundColor Red
         continue
     }
@@ -189,7 +195,7 @@ foreach ($m in $Muts) {
     if ($new -eq $src) {
         # An INERT mutant: the anchor matched but the text did not change. M12 was one of these for
         # weeks -- it could not be caught by any suite and was counted as an unpinned behavior.
-        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "INERT"; Detail = "From and To are identical after normalization" }
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "INERT"; Ran = "0/$script:TotalSections sections"; Detail = "From and To are identical after normalization" }
         Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "INERT", "mutant changes nothing -- it can never be caught") -ForegroundColor Red
         continue
     }
@@ -198,7 +204,7 @@ foreach ($m in $Muts) {
     $errs = $null; $toks = $null
     [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$toks, [ref]$errs) | Out-Null
     if (@($errs).Count -gt 0) {
-        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "INVALID"; Detail = "mutant does not parse" }
+        $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = "INVALID"; Ran = "0/$script:TotalSections sections"; Detail = "mutant does not parse" }
         Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, "INVALID", "mutant does not parse") -ForegroundColor Yellow
         continue
     }
@@ -215,6 +221,13 @@ foreach ($m in $Muts) {
     # that carries a failed assertion did demonstrate the behavior; a crash with none did not.
     $failLines = @([regex]::Matches($out, "(?m)^\s+FAIL\s")).Count
     $res = [regex]::Match($out, "RESULT: (\d+) passed, (\d+) failed")
+
+    # HOW MUCH OF THE SUITE ACTUALLY RAN. A crash truncates everything after it, so "caught" can hide the
+    # fact that most of the battery never executed -- and an assertion that is not REACHED pins nothing.
+    # Printing sections-run makes that visible per mutant instead of leaving it to be inferred from a
+    # verdict word.
+    $sectionsRun = @([regex]::Matches($out, "(?m)^== ")).Count
+    $coverage = "{0}/{1} sections" -f $sectionsRun, $script:TotalSections
 
     if ($res.Success) {
         $failed = [int]$res.Groups[2].Value
@@ -237,8 +250,8 @@ foreach ($m in $Muts) {
         "SURVIVED"      { "Red" }
         default         { "Yellow" }
     }
-    $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = $verdict; Detail = $detail }
-    Write-Host ("{0,-5} {1,-34} {2,-14} {3}" -f $m.Id, $m.Target, $verdict, $detail) -ForegroundColor $color
+    $rows += [pscustomobject]@{ Id = $m.Id; Target = $m.Target; Verdict = $verdict; Ran = $coverage; Detail = $detail }
+    Write-Host ("{0,-5} {1,-34} {2,-14} {3,-16} {4}" -f $m.Id, $m.Target, $verdict, $coverage, $detail) -ForegroundColor $color
 }
 
 Write-Host ""

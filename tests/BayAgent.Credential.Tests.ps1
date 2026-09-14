@@ -826,11 +826,19 @@ try {
     $ErrorActionPreference = $prevEap
     $marker = Join-Path $f7base "state\last-update-result.json"
     Assert-True (Test-Path $marker) "a failed update writes a durable result marker"
-    $mk = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
-    Assert-True ($mk.ok -eq $false) "...saying it FAILED"
-    Assert-True ("$($mk.reason)" -match "Dataverse") "...and why, in the reason"
+    # Guarded. An unguarded Get-Content here turns ONE failed assertion into a dead suite: under a mutant
+    # that stops the marker being written, Test-Path fails, this line throws on a file that is not there,
+    # and the five sections after it never run. MEASURED: that cost five sections of coverage under the
+    # crash mutants. A test that cannot fail cleanly cannot report what it found -- fourth instance of the
+    # same shape in this file (see also M25's property read, T24, T26).
+    $mk = $null
+    if (Test-Path $marker) { try { $mk = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { } }
+    Assert-True ($null -ne $mk -and $mk.ok -eq $false) "...saying it FAILED"
+    Assert-True ($null -ne $mk -and "$($mk.reason)" -match "Dataverse") "...and why, in the reason"
     $f7log = @(Get-ChildItem (Join-Path $f7base "logs") -Filter *.log -ErrorAction SilentlyContinue)
-    Assert-True ($f7log.Count -ge 1 -and ((Get-Content $f7log[0].FullName -Raw) -match "UPDATE FAILED")) `
+    $f7logText = ""
+    if ($f7log.Count -ge 1) { try { $f7logText = (Get-Content $f7log[0].FullName -Raw) } catch { } }
+    Assert-True ($f7log.Count -ge 1 -and ($f7logText -match "UPDATE FAILED")) `
         "...and the failure reaches the log, which it did not before (Get-CodeSigningCert threw into silence)"
     Assert-True ((Read-LastUpdateResult -Base $f7base).ok -eq $false) "the agent can read the marker back for the heartbeat"
     # A missing executable is refused up front and always was -- that check is correct and is pinned here so
