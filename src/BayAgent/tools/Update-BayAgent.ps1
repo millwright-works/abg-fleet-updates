@@ -85,10 +85,13 @@ param(
   [string]$TimeStampServer = "http://timestamp.digicert.com"
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $BaseDir "logs\Update-BayAgent.log" }
+# NOTHING EXECUTABLE RUNS BEFORE THE TRAP BELOW IS ARMED WITH FUNCTIONS THAT EXIST.
+# A trap is hoisted to the top of its script block, so it catches errors raised above the line it is
+# written on -- at which point the functions it calls may not have been defined yet (MEASURED on Windows
+# PowerShell 5.1, 2026-09-21). Set-StrictMode, $ErrorActionPreference and the $LogPath default used to sit
+# here, above these definitions; any failure in them reached a trap that called three functions that did
+# not exist, and the update died with nothing in the log and no last-update-result.json. Function
+# definitions cannot throw, so they go first and the executable prologue goes after the trap.
 
 function Ensure-Dir([string]$p) {
   if (-not (Test-Path -LiteralPath $p)) {
@@ -151,6 +154,12 @@ trap {
   Write-UpdateResult -ok $false -reason $msg -stage "unknown"
   break
 }
+
+# The executable prologue, moved below the trap so the trap is armed before anything can fail.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $BaseDir "logs\Update-BayAgent.log" }
 
 function Invoke-Robo([string]$src, [string]$dst, [string[]]$extraArgs) {
   Ensure-Dir $dst

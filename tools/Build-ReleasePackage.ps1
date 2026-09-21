@@ -50,7 +50,7 @@ KNOWN, DELIBERATE: tools\Publish-Current.ps1 is JavaScript with a .ps1 extension
   dropped file is not deleted from a bay). Until then it is exempt from the parse gate.
 
 USAGE
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\Build-ReleasePackage.ps1 -Version 1.2.0
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\Build-ReleasePackage.ps1 -Version 1.2.1
 
 Hyphens only in comments -- em-dashes break AllSigned parsing.
 #>

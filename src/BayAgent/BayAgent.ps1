@@ -86,14 +86,45 @@ function Write-Log {
 # ---------------- Fatal error trap ----------------
 # If something blows up outside the main loop (e.g., config parse, auth init), we still want a clear log line.
 # NOTE: This trap only fires for UNHANDLED terminating errors.
+#
+# IT CALLS NO FUNCTION FROM THIS SCRIPT AND READS NO SCRIPT VARIABLE, AND THAT IS THE POINT.
+# (Built-in cmdlets are always there; anything this file defines is not.)
+# A trap is HOISTED: it is registered for the whole script block, so it fires for errors raised ABOVE the
+# line it is written on. MEASURED on Windows PowerShell 5.1, 2026-09-21: a throw on line 3 is caught by a
+# trap written on line 4, and a function defined on line 5 is NOT available inside it.
+#
+# This trap used to call Write-Log, which is defined further up but AFTER the three statements that create
+# the log directory and check for agent-config.json -- the statements most likely to fail on a Day-0 or
+# mis-provisioned bay. A missing agent-config.json therefore exited 1 having written NOTHING, because
+# Write-Log did not exist yet and the try/catch around it swallowed that too. The handler of last resort
+# cannot depend on initialization having succeeded, so it now writes the two lines itself, in exactly the
+# format Write-Log produces.
+#
 trap {
-    $err = $_
-    $msg = $null
-    try { $msg = $err.Exception.Message } catch { $msg = [string]$err }
-    try { Write-Log ("FATAL (pid={0}): {1}" -f $PID, $msg) "ERROR" } catch {}
+    $abgErr = $_
+    $abgMsg = $null
+    try { $abgMsg = $abgErr.Exception.Message } catch { $abgMsg = [string]$abgErr }
+    $abgTs = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    # $LogFile is assigned BELOW this trap, so it may or may not exist when the trap fires. Get-Variable
+    # rather than $LogFile: reading an unset variable is a terminating error under Set-StrictMode, and the
+    # handler of last resort must not fail in its own first line. It is written this way rather than
+    # wrapped in try/catch so the "it might not be there" is stated, not hidden, and so the fallback is
+    # visible on the next line. Hardcoding the path instead was measured wrong: a sandboxed test run wrote
+    # its FATAL into the LIVE install's log directory.
+    $abgPath = Get-Variable -Name LogFile -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $abgPath) {
+        $abgPath = "C:\AllBirdies\BayAgent\logs\BayAgent-{0}.log" -f (Get-Date).ToString("yyyyMMdd")
+    }
+
+    $abgOut = @("$abgTs [ERROR] FATAL (pid=$PID): $abgMsg")
     try {
-        if ($err.ScriptStackTrace) { Write-Log ("STACK: {0}" -f $err.ScriptStackTrace) "ERROR" }
+        if ($abgErr.ScriptStackTrace) { $abgOut += "$abgTs [ERROR] STACK: $($abgErr.ScriptStackTrace)" }
     } catch {}
+    foreach ($abgLine in $abgOut) {
+        try { Write-Host $abgLine } catch {}
+        try { Add-Content -Path $abgPath -Value $abgLine } catch {}
+    }
     exit 1
 }
 
@@ -424,6 +455,32 @@ function Read-WebExceptionBody {
         }
     } catch {}
     return $null
+}
+
+# ---------------- Generic object helper ----------------
+# MOVED UP FROM THE COMMAND-EXECUTION SECTION (it used to sit beside Try-ParseJson, around line 1563).
+# It is read by Get-ActiveCertThumbprint, which Write-CredentialStartupSummary calls at script level long
+# before the interpreter ever reached the old definition. PowerShell defines a function when it REACHES the
+# definition, so BayAgent 1.2.0 died on every real bay inside a second:
+#   FATAL: The term 'Get-PropValue' is not recognized ... at Get-ActiveCertThumbprint line 564
+# It has no dependencies of its own, so the only thing keeping it where it was, was habit.
+# tests\BayAgent.StartupOrder.Tests.ps1 now fails the build if anything is used above its definition again.
+function Get-PropValue($obj, [string]$name, $default = $null) {
+    if ($null -eq $obj) { return $default }
+
+    # Hashtable / dictionary
+    if ($obj -is [System.Collections.IDictionary]) {
+        foreach ($k in $obj.Keys) { if ($k -ieq $name) { return $obj[$k] } }
+        return $default
+    }
+
+    # PSCustomObject or other PSObject
+    try {
+        foreach ($p in $obj.PSObject.Properties) {
+            if ($p.Name -ieq $name) { return $p.Value }
+        }
+    } catch {}
+    return $default
 }
 
 # ---------------- Certificate credential (client_assertion) ----------------
@@ -1560,24 +1617,8 @@ function Try-ParseJson([string]$jsonText) {
     try { return ($jsonText | ConvertFrom-Json) } catch { return $null }
 }
 
-function Get-PropValue($obj, [string]$name, $default = $null) {
-    if ($null -eq $obj) { return $default }
-
-    # Hashtable / dictionary
-    if ($obj -is [System.Collections.IDictionary]) {
-        foreach ($k in $obj.Keys) { if ($k -ieq $name) { return $obj[$k] } }
-        return $default
-    }
-
-    # PSCustomObject or other PSObject
-    try {
-        foreach ($p in $obj.PSObject.Properties) {
-            if ($p.Name -ieq $name) { return $p.Value }
-        }
-    } catch {}
-    return $default
-}
-
+# Get-PropValue used to be defined here. It is now defined with the other generic helpers, above the
+# credential section, because script-level startup code reaches it. See the comment at its definition.
 
 function Set-PropValue {
     param(
