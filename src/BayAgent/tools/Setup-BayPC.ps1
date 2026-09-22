@@ -81,6 +81,64 @@ function Test-IsAdmin {
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-ShellActivationPlan {
+  # AG-47: what HKLM Winlogon Shell should be set to, and it is a decision that has to be made AFTER
+  # checking the file, never before. The defect this replaces: the script set Shell to the launcher
+  # wrapper's path unconditionally, then Test-Path'd the file and printed a warning if it was missing --
+  # by then the registry was already wrong. On Bay 1, 2026-09-21, the file was absent (no fleet package
+  # or Day0 run ships it, it exists only in this repo's source tree) and the next BayKiosk logon would
+  # have started a missing file and shown no desktop. Kevin caught it and repaired the machine by hand.
+  #
+  # This function never trusts that the wrapper is where the script expects it. It looks: does the file
+  # exist, and is it at least plausibly a real script rather than a zero-byte or truncated placeholder.
+  # Only if both hold does it hand back the launcher command; otherwise it hands back "explorer.exe" and
+  # says exactly why, so the machine can always show a desktop and the operator is never told something
+  # false about what happened.
+  param(
+    [Parameter(Mandatory = $true)][string]$WrapperPath,
+    [Parameter(Mandatory = $true)][string]$ShellCommand,
+    [int]$MinSizeBytes = 1024
+  )
+
+  $exists = Test-Path -LiteralPath $WrapperPath
+  $sizeBytes = 0
+  $sha256 = $null
+  if ($exists) {
+    $sizeBytes = (Get-Item -LiteralPath $WrapperPath).Length
+    try { $sha256 = (Get-FileHash -LiteralPath $WrapperPath -Algorithm SHA256).Hash } catch {}
+  }
+  $verified = $exists -and ($sizeBytes -ge $MinSizeBytes)
+
+  if ($verified) {
+    return [ordered]@{
+      action     = "ActivateLauncher"
+      shellValue = $ShellCommand
+      verified   = $true
+      wrapperPath = $WrapperPath
+      sizeBytes  = $sizeBytes
+      sha256     = $sha256
+      message    = "Launcher shell verified at $WrapperPath ($sizeBytes bytes, sha256=$sha256) -- HKLM Shell set to it."
+    }
+  }
+
+  $reason = if ($exists) {
+    "exists but is only $sizeBytes bytes (below the $MinSizeBytes-byte sanity floor) -- treated as not deployed, not activated"
+  } else {
+    "was not found"
+  }
+  return [ordered]@{
+    action     = "FallbackExplorer"
+    shellValue = "explorer.exe"
+    verified   = $false
+    wrapperPath = $WrapperPath
+    sizeBytes  = $sizeBytes
+    sha256     = $sha256
+    message    = "Launcher shell at $WrapperPath $reason. HKLM Shell set to explorer.exe so this bay can show a desktop. " +
+                 "The wrapper is not deployed by Day0 or the current fleet package (AG-47 residual: nothing places it on a bay " +
+                 "today); it must be placed at this exact path and pass this check before Setup-BayPC will activate it as the shell."
+  }
+}
+
 # ==================================================================
 # PHASE 1: PRE-FLIGHT CHECKS
 # ==================================================================
@@ -276,10 +334,13 @@ if (-not $SkipLockdown) {
   # ------------------------------------------------------------------
   # 5A: SHELL REPLACEMENT
   # ------------------------------------------------------------------
-  # Replace Explorer with ABG.LauncherShell.ps1 for BayKiosk user.
-  # Admin accounts keep Explorer via HKCU override.
+  # Replace Explorer with ABG.LauncherShell.ps1 for BayKiosk user -- but ONLY once the file has been
+  # checked to actually be there. AG-47: this used to write the registry first and check second, which
+  # is backwards; see Get-ShellActivationPlan above for what changed and why. As of this fix, nothing in
+  # the current fleet package or Day0 places this file on a bay, so on every bay today this will fall
+  # back to explorer.exe -- correctly, not as a bug (see REPORT.md for what it would take to close that).
   #
-  # How it works:
+  # How it works when the wrapper IS present and verified:
   #   - HKLM Shell = our wrapper (machine-wide default)
   #   - HKCU Shell = explorer.exe (per-user override for admin accounts)
   #   - BayKiosk has no HKCU Shell set, so HKLM applies -> our wrapper
@@ -292,25 +353,24 @@ if (-not $SkipLockdown) {
   $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
   $shellCommand = "$psExe -NoProfile -WindowStyle Hidden -File `"$shellWrapperPath`""
 
-  # Set machine-wide default shell to our wrapper
-  $winlogonHKLM = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-  Set-ItemProperty -Path $winlogonHKLM -Name "Shell" -Value $shellCommand
-  Write-Host "  HKLM Shell set to LauncherShell.ps1" -ForegroundColor Green
+  # Decide what to do BEFORE touching the registry -- never the other way around.
+  $shellPlan = Get-ShellActivationPlan -WrapperPath $shellWrapperPath -ShellCommand $shellCommand
 
-  # Preserve Explorer shell for the current admin user (HKCU takes precedence)
+  # Set machine-wide default shell to whatever the plan verified, and only that.
+  $winlogonHKLM = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+  Set-ItemProperty -Path $winlogonHKLM -Name "Shell" -Value $shellPlan.shellValue
+  if ($shellPlan.verified) {
+    Write-Host "  $($shellPlan.message)" -ForegroundColor Green
+  } else {
+    Write-Host "  $($shellPlan.message)" -ForegroundColor Yellow
+  }
+
+  # Preserve Explorer shell for the current admin user (HKCU takes precedence) -- unconditional, and
+  # correctly so: this account is never the launcher wrapper's target regardless of what HKLM holds.
   $winlogonHKCU = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
   if (-not (Test-Path $winlogonHKCU)) { New-Item -Path $winlogonHKCU -Force | Out-Null }
   Set-ItemProperty -Path $winlogonHKCU -Name "Shell" -Value "explorer.exe"
   Write-Host "  HKCU Shell for current admin set to explorer.exe" -ForegroundColor Green
-
-  # Verify the wrapper script exists (it ships with the fleet package)
-  if (Test-Path $shellWrapperPath) {
-    Write-Host "  Shell wrapper found at: $shellWrapperPath" -ForegroundColor Green
-  } else {
-    Write-Host "  WARNING: Shell wrapper not found at: $shellWrapperPath" -ForegroundColor Yellow
-    Write-Host "  The wrapper will be deployed by the first fleet update (Update-BayAgent.ps1)." -ForegroundColor Yellow
-    Write-Host "  Until then, BayKiosk login will show a PowerShell error." -ForegroundColor Yellow
-  }
 
   Write-Host ""
   Write-Host "  NOTE: Additional admin accounts that log in via RDP must have" -ForegroundColor Yellow
@@ -677,18 +737,25 @@ $checks += [PSCustomObject]@{
   Result = if ($netTest.TcpTestSucceeded) { "PASS" } else { "FAIL" }
 }
 
-# Shell wrapper script
+# Shell wrapper script -- AG-47: this file is not deployed by Day0 or the current fleet package. Its
+# absence is the expected state today, not a pending step that some other process will complete.
 $shellWrapperCheck = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.LauncherShell.ps1"
 $checks += [PSCustomObject]@{
   Check  = "Shell wrapper script"
-  Result = if (Test-Path $shellWrapperCheck) { "PASS" } else { "PENDING (deployed by fleet update)" }
+  Result = if (Test-Path $shellWrapperCheck) { "PASS" } else { "NOT PRESENT (not shipped by Day0 or the fleet package today -- see AG-47)" }
 }
 
-# Custom shell configured (HKLM)
+# Custom shell configured (HKLM) -- AG-47: explorer.exe is a correct, intentional result here, not a
+# failure. Phase 5A only activates the launcher wrapper once Get-ShellActivationPlan has verified it; a
+# bay with the wrapper unverified is EXPECTED to be running explorer.exe. Only a third value -- neither
+# the wrapper nor explorer.exe -- means the machine cannot show a desktop.
 $hklmShell = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -ErrorAction SilentlyContinue).Shell
 $checks += [PSCustomObject]@{
   Check  = "Custom shell (HKLM)"
-  Result = if ($hklmShell -like "*LauncherShell*") { "PASS" } else { "FAIL (Shell=$hklmShell)" }
+  Result =
+    if ($hklmShell -like "*LauncherShell*") { "PASS (kiosk launcher active)" }
+    elseif ($hklmShell -eq "explorer.exe") { "PASS (explorer.exe -- launcher wrapper not verified/deployed, see AG-47)" }
+    else { "FAIL (Shell=$hklmShell -- neither the launcher wrapper nor explorer.exe; this bay cannot show a desktop)" }
 }
 
 # Admin shell override (HKCU)
