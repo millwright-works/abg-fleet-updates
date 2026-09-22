@@ -108,6 +108,59 @@ try {
         Assert-True ($hklcuShellSets.Count -eq 1 -and $hklcuShellSets[0].Extent.Text -match "explorer\.exe") `
             "the admin HKCU override is untouched by this fix: still set unconditionally to explorer.exe"
 
+        Section "Binding: the HKLM Shell write uses the PLAN'S value, not just runs after it"
+        # AG-47 QA (VERDICT.txt B1): the ordering check above proves Get-ShellActivationPlan runs before
+        # the write, but it never inspected what the write actually WRITES. A mutant that restores the
+        # shipped defect in a single identifier -- Set-ItemProperty ... -Value $shellCommand, plan
+        # computed and then ignored -- passed every assertion above (mutant M5, verifier's tree). This
+        # section closes that: it resolves the BINDING, not the spelling. It finds the variable the
+        # Get-ShellActivationPlan call result was assigned to, then requires the -Value argument of the
+        # HKLM Shell Set-ItemProperty call to be a member access on that same variable (".shellValue" in
+        # the current source, but this asserts the binding, not the literal member name, so a rename
+        # doesn't false-fail it).
+        function Get-AG47CommandParamValueAst {
+            param(
+                [Parameter(Mandatory = $true)][System.Management.Automation.Language.CommandAst]$CommandAst,
+                [Parameter(Mandatory = $true)][string]$ParamName
+            )
+            for ($i = 0; $i -lt $CommandAst.CommandElements.Count; $i++) {
+                $el = $CommandAst.CommandElements[$i]
+                if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and $el.ParameterName -eq $ParamName) {
+                    if ($el.Argument) { return $el.Argument }
+                    if ($i + 1 -lt $CommandAst.CommandElements.Count) { return $CommandAst.CommandElements[$i + 1] }
+                }
+            }
+            return $null
+        }
+
+        $planVarName = $null
+        if ($planCalls.Count -ge 1) {
+            $walk = $planCalls[0]
+            while ($walk -and -not ($walk -is [System.Management.Automation.Language.AssignmentStatementAst])) {
+                $walk = $walk.Parent
+            }
+            if ($walk -and $walk.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                $planVarName = $walk.Left.VariablePath.UserPath
+            }
+        }
+        Assert-True (-not [string]::IsNullOrEmpty($planVarName)) `
+            "Get-ShellActivationPlan's call site is a direct assignment to a variable (found: `$$planVarName)"
+
+        $bindingOk = $false
+        $valueArg = $null
+        if ($hklmShellSets.Count -ge 1) {
+            $valueArg = Get-AG47CommandParamValueAst -CommandAst $hklmShellSets[0] -ParamName "Value"
+        }
+        if ($valueArg -and $planVarName -and ($valueArg -is [System.Management.Automation.Language.MemberExpressionAst])) {
+            $baseExpr = $valueArg.Expression
+            if ($baseExpr -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $baseExpr.VariablePath.UserPath -eq $planVarName) {
+                $bindingOk = $true
+            }
+        }
+        Assert-True $bindingOk `
+            "the HKLM Shell Set-ItemProperty -Value is a member access on `$$planVarName (the variable the plan's result was assigned to) -- not a re-derived, hardcoded, or bypassed value (catches mutant M5: -Value `$shellCommand, plan computed and then ignored)"
+
         Section "Behavior: wrapper file absent -> fall back to explorer.exe, and say so truthfully"
         $missingPath = Join-Path $BaseDir "does-not-exist\ABG.LauncherShell.ps1"
         $planMissing = Get-ShellActivationPlan -WrapperPath $missingPath -ShellCommand "powershell -File `"$missingPath`""

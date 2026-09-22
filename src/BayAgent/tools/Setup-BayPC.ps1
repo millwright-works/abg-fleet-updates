@@ -742,7 +742,13 @@ $checks += [PSCustomObject]@{
 $shellWrapperCheck = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.LauncherShell.ps1"
 $checks += [PSCustomObject]@{
   Check  = "Shell wrapper script"
-  Result = if (Test-Path $shellWrapperCheck) { "PASS" } else { "NOT PRESENT (not shipped by Day0 or the fleet package today -- see AG-47)" }
+  # AG-47 QA (VERDICT.txt M1): this used to read "NOT PRESENT (...)", a string that matches none of
+  # the three summary buckets below (FAIL / PENDING / PASS are plain regex over Result), so this row
+  # silently fell out of the count and the summary printed "ALL N CHECKS PASSED" on a bay where the
+  # wrapper is absent -- the exact bay state of every bay today. "PENDING" is the token the summary
+  # recognizes for "not wrong, not done"; it also matches the residual framing used elsewhere in this
+  # script (see the comment on Get-ShellActivationPlan above).
+  Result = if (Test-Path $shellWrapperCheck) { "PASS" } else { "PENDING (not shipped by Day0 or the fleet package today -- see AG-47)" }
 }
 
 # Custom shell configured (HKLM) -- AG-47: explorer.exe is a correct, intentional result here, not a
@@ -753,7 +759,12 @@ $hklmShell = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersi
 $checks += [PSCustomObject]@{
   Check  = "Custom shell (HKLM)"
   Result =
-    if ($hklmShell -like "*LauncherShell*") { "PASS (kiosk launcher active)" }
+    # AG-47 QA (VERDICT.txt M2): Shell pointing at the launcher is not enough on its own -- this is
+    # the exact Bay 1 state of 2026-09-21 (Shell=launcher, file absent) that this row used to report
+    # PASS for. $shellWrapperCheck is already computed above for the row immediately before this one;
+    # reuse it so PASS means the wrapper is both configured AND actually on disk.
+    if ($hklmShell -like "*LauncherShell*" -and (Test-Path $shellWrapperCheck)) { "PASS (kiosk launcher active)" }
+    elseif ($hklmShell -like "*LauncherShell*") { "FAIL (Shell=$hklmShell but the wrapper file is not present at $shellWrapperCheck -- this bay cannot show a desktop)" }
     elseif ($hklmShell -eq "explorer.exe") { "PASS (explorer.exe -- launcher wrapper not verified/deployed, see AG-47)" }
     else { "FAIL (Shell=$hklmShell -- neither the launcher wrapper nor explorer.exe; this bay cannot show a desktop)" }
 }
