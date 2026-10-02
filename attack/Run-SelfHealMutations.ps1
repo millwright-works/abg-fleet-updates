@@ -8,6 +8,7 @@
 # Expect column: KILLED, SURVIVED (the baseline), or EITHER (a single layer of a check that is enforced twice;
 # its all-layers twin must be KILLED). Measured 2026-10-02 at cf6839b: 49 killed of 52; survivors M15a, M16a and
 # M23 are single layers of checks enforced two or three times, and their all-layer twins M15d, M16c, M23c are killed.
+# Fix round (2026-10-02, verifier F1/R1/R2/R7): F1a-F1i, R2a, R2b, R7a, and V01/V05/V07 on the live suite.
 [CmdletBinding()]
 param([string]$Only = "", [string]$Repo = "", [string]$WorkDir = "", [string]$ResultsName = "mutation-results.txt", [string]$LockName = "mutation.lock")
 
@@ -22,6 +23,7 @@ $Results = Join-Path $Lane $ResultsName
 $Src = Join-Path $Repo "src\BayAgent"
 $SuiteSelfHeal = Join-Path $Repo "tests\BayAgent.SelfHeal.Tests.ps1"
 $SuiteLaunch = Join-Path $Repo "tests\BayAgent.Launch.Tests.ps1"
+$SuiteLive = Join-Path $Repo "tests\BayAgent.SelfHeal.Live.Tests.ps1"
 
 function M([string]$Id, [string]$Why, [string[]]$From, [string[]]$To, [string]$Suite = "selfheal", [string]$Expect = "KILLED") {
     return [pscustomobject]@{ Id = $Id; Why = $Why; From = $From; To = $To; Suite = $Suite; Expect = $Expect }
@@ -56,7 +58,7 @@ $Muts = @(
     (M "M19b" "closer deny list removed" @('foreach ($d in $SelfHealDenyNames) { if ($name -ieq $d) { return $false } }') @('# MUTANT deny removed'))
     (M "M20" "name shape check removed" @("if (`$n -notmatch '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}`$') { return `$null }") @('if ($false) { return $null }'))
     (M "M21" "target from the overlaid cfg" @('$lname = ConvertTo-SelfHealTargetName ([string](Get-PropValue (Get-PropValue $root "launcher" $null) "processName" ""))') @('$lname = ConvertTo-SelfHealTargetName ([string]$cfg.launcher.processName)'))
-    (M "M22" "flag accepts truthy text" @('return (($v -is [bool]) -and $v)') @('return [bool]$v'))
+    (M "M22" "flag accepts truthy text" @('return (($v -is [bool]) -and ($v -eq $true))') @('return [bool]$v'))
     (M "M23" "master flag ignored at one layer (two more hold)" @('if (-not $s.Enabled) { $s.WatchdogEnabled = $false; $s.HealthEnabled = $false }') @('# MUTANT master flag ignored') "selfheal" "EITHER")
     (M "M24" "maintenance does not hold" @('if ($op.Blocked) { return') @('if ($false) { return'))
     (M "M25" "emergency stop does not hold" @('if ($Global:EmergencyStopEngaged) { return "emergency_stop" }') @('# MUTANT estop ignored'))
@@ -80,6 +82,21 @@ $Muts = @(
     (M "M43" "agent relaunch never starts" @('if ($instances.Count -eq 0) {') @('if ($false) {'))
     (M "M15d" "all three session checks removed" @('if ($null -eq $layer.OwnSessionId -or $pi.SessionId -ne $layer.OwnSessionId) { continue }', 'if ($null -eq $Layer.OwnSessionId -or $ProcInfo.SessionId -ne $Layer.OwnSessionId) {', 'if ($fresh.SessionId -ne $Layer.OwnSessionId) {') @('if ($false) { continue }', 'if ($false) {', 'if ($false) {'))
     (M "M23c" "master flag removed at all three layers" @('if (-not $s.Enabled) { $s.WatchdogEnabled = $false; $s.HealthEnabled = $false }', 'if (-not $script:SelfHealSettings.Enabled) {', ("param([Parameter(Mandatory=`$true)][DateTime]`$Now)`r`n    if (`$null -eq `$script:SelfHealSettings -or -not `$script:SelfHealSettings.Enabled) { return }")) @('# MUTANT master flag ignored', 'if ($false) {', ("param([Parameter(Mandatory=`$true)][DateTime]`$Now)`r`n    if (`$null -eq `$script:SelfHealSettings) { return }")))
+    (M "F1a" "count: object check removed" @('if ($null -eq $o -or -not ($o -is [System.Management.Automation.PSCustomObject])) {') @('if ($false) {') "selfheal" "EITHER")
+    (M "F1b" "count: array check removed" @('if ($null -eq $arr -or -not ($arr -is [System.Array])) {') @('if ($false) {'))
+    (M "F1c" "count: bad entries skipped instead of refused" @('if ($null -eq $d) { $fail.Reason = "an entry is not a timestamp"; return $fail }') @('if ($null -eq $d) { continue }'))
+    (M "F1d" "count: empty file check removed" @('if ([string]::IsNullOrWhiteSpace($Text)) { $fail.Reason = "empty"; return $fail }') @('if ($false) { return $fail }') "selfheal" "EITHER")
+    (M "F1e" "count: NUL check removed" @('if ($Text.IndexOf([char]0) -ge 0) { $fail.Reason = "NUL bytes"; return $fail }') @('# MUTANT NUL check removed') "selfheal" "EITHER")
+    (M "F1f" "count: renamed key accepted as empty" @('if ($prop.Count -ne 1) { $fail.Reason = "no restartHistoryUtc"; return $fail }') @('if ($prop.Count -ne 1) { return @{ Ok = $true; Dates = @(); Reason = "" } }'))
+    (M "F1g" "closes even when the count was not saved" @('if (-not (Save-SelfHealState)) {') @('if ($false) {'))
+    (M "F1h" "save does not read back" @('if (-not $back.Ok -or @($back.Dates).Count -ne $hist.Count) {') @('if ($false) {'))
+    (M "F1i" "count saved to whole seconds" @('ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", [Globalization.CultureInfo]::InvariantCulture)') @('ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)'))
+    (M "R2a" "grace floor back to 60" @('"launchGraceSeconds" 120 120 1800') @('"launchGraceSeconds" 120 60 1800'))
+    (M "R2b" "loading floor back to unresponsiveSeconds" @('"loadingMaxSeconds" 180 ([Math]::Max(180, $s.UnresponsiveSeconds)) 3600') @('"loadingMaxSeconds" 180 $s.UnresponsiveSeconds 3600'))
+    (M "R7a" "flag read through Get-PropValue (unrolls [true])" @('$v = $hit[0].Value') @('$v = Get-PropValue $obj $name $null'))
+    (M "V01" "real layer start time left in local time" @('try { $start = $proc.StartTime.ToUniversalTime() } catch {}') @('try { $start = $proc.StartTime } catch {}') "live")
+    (M "V05" "real layer closes by NAME" @('Stop-Process -Id $procId -Force -ErrorAction Stop') @('Stop-Process -Name (Get-Process -Id $procId).ProcessName -Force -ErrorAction Stop') "live")
+    (M "V07" "real layer own session hardcoded" @('try { $own = [int](Get-Process -Id $SessionOfProcessId).SessionId } catch {}') @('$own = 1') "live")
     (M "M44" "health row Warning" @('-Category $SelfHealCatDisplay -Severity $SelfHealSevInfo') @('-Category $SelfHealCatDisplay -Severity $SelfHealSevWarning'))
 )
 if ($Only) { $Muts = @($Muts | Where-Object { $_.Id -in ($Only -split ",") }) }
@@ -108,7 +125,7 @@ try {
         [IO.File]::WriteAllText($agent, $text, (New-Object Text.UTF8Encoding($true)))
         Copy-Item -LiteralPath (Join-Path $Src "agent-config.json") -Destination $work
         Copy-Item -LiteralPath (Join-Path $Src "manifest.json") -Destination $work
-        $suite = $(if ($m.Suite -eq "launch") { $SuiteLaunch } else { $SuiteSelfHeal })
+        $suite = $(if ($m.Suite -eq "launch") { $SuiteLaunch } elseif ($m.Suite -eq "live") { $SuiteLive } else { $SuiteSelfHeal })
         $log = Join-Path $work "suite.log"
         $started = Get-Date
         # A suite's stderr must not become a terminating NativeCommandError in this runner (measured: it aborted run 1).

@@ -521,7 +521,8 @@ try {
     Reset-World
     Start-SelfHeal
     $script:SelfHealRuntime.History = [DateTime[]]@($T0.AddMilliseconds(900))
-    Assert-True (Save-SelfHealState) "a normal save reports success"
+    $savedOk = Save-SelfHealState
+    Assert-True ($savedOk -eq $true) "a normal save reports success"
     $back = Read-SelfHealState -Now $T0 -MaxRestarts 2
     Assert-True (@($back).Count -eq 1 -and $back[0] -eq $T0.AddMilliseconds(900)) "the saved restart time reads back to the tick ($(if (@($back).Count) { $back[0].ToString('o') }))"
 
