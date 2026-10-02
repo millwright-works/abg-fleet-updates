@@ -182,7 +182,9 @@ try {
         @{ Label = "no selfHeal block"; Block = $null },
         @{ Label = "selfHeal.enabled = false"; Block = [ordered]@{ enabled = $false; watchdog = [ordered]@{ enabled = $true; detector = "fake" }; healthReports = [ordered]@{ enabled = $true } } },
         @{ Label = "selfHeal.enabled = ""true"" (text, not a JSON true)"; Block = [ordered]@{ enabled = "true"; watchdog = [ordered]@{ enabled = $true; detector = "fake" }; healthReports = [ordered]@{ enabled = $true } } },
-        @{ Label = "selfHeal.enabled = 1"; Block = [ordered]@{ enabled = 1; watchdog = [ordered]@{ enabled = $true; detector = "fake" } } }
+        @{ Label = "selfHeal.enabled = 1"; Block = [ordered]@{ enabled = 1; watchdog = [ordered]@{ enabled = $true; detector = "fake" } } },
+        @{ Label = "selfHeal.enabled = [true] (an array, verifier R7)"; Block = [ordered]@{ enabled = @($true); watchdog = [ordered]@{ enabled = $true; detector = "fake" }; healthReports = [ordered]@{ enabled = $true } } },
+        @{ Label = "watchdog.enabled = [true] under a true master flag"; Block = [ordered]@{ enabled = $true; watchdog = [ordered]@{ enabled = @($true); detector = "fake" } } }
     )) {
         Reset-World
         Add-FakeProc -Id 1001 -Responding $false
@@ -337,10 +339,23 @@ try {
     # (g) config cannot make it quicker: unresponsiveSeconds 5 and launchGraceSeconds 1 are clamped.
     Reset-World
     Add-FakeProc -Id 2006 -Responding $false
-    Start-SelfHeal -WatchdogExtra @{ unresponsiveSeconds = 5; launchGraceSeconds = 1; maxRestarts = 9; windowMinutes = 1 }
-    Assert-True ($script:SelfHealSettings.UnresponsiveSeconds -eq 30 -and $script:SelfHealSettings.MaxRestarts -eq 2 -and $script:SelfHealSettings.WindowMinutes -eq 15 -and $script:SelfHealSettings.LaunchGraceSeconds -ge 60) "(g) floors hold: 30 s, 2 restarts, 15 minutes, 60 s grace minimum"
+    Start-SelfHeal -WatchdogExtra @{ unresponsiveSeconds = 5; launchGraceSeconds = 1; loadingMaxSeconds = 1; maxRestarts = 9; windowMinutes = 1 }
+    Assert-True ($script:SelfHealSettings.UnresponsiveSeconds -eq 30 -and $script:SelfHealSettings.MaxRestarts -eq 2 -and $script:SelfHealSettings.WindowMinutes -eq 15) "(g) floors hold: 30 s, 2 restarts, 15 minutes"
+    Assert-True ($script:SelfHealSettings.LaunchGraceSeconds -eq 120 -and $script:SelfHealSettings.LoadingMaxSeconds -eq 180) "(g) ...and the 120 s launch grace and 180 s loading bound (verifier R2: they could be lowered to 60 and 30)"
     Invoke-Ticks -From 0 -To 25
     Assert-True ($script:Stopped.Count -eq 0) "(g) ...behaviorally: a config asking for 5 s still waits 30 s"
+    # Behaviorally for R2: a config asking for a 30 s loading bound still lets a busy program load for 170 s,
+    # and one asking for a 60 s grace still leaves a just-launched program alone for 115 s.
+    Reset-World
+    Add-FakeProc -Id 2010 -Responding $false
+    Start-SelfHeal -WatchdogExtra @{ loadingMaxSeconds = 30 }
+    Invoke-Ticks -From 0 -To 170 -Each { param($t) Set-FakeCounter 2010 "CpuSeconds" (10.0 + 0.4 * $t) }
+    Assert-True ($script:Stopped.Count -eq 0) "(g) loadingMaxSeconds 30 in config: a busy program is still not closed at 170 s"
+    Reset-World
+    Add-FakeProc -Id 2011 -Start $T0.AddSeconds(-10) -Responding $false
+    Start-SelfHeal -WatchdogExtra @{ launchGraceSeconds = 60 }
+    Invoke-Ticks -From 0 -To 105
+    Assert-True ($script:Stopped.Count -eq 0) "(g) launchGraceSeconds 60 in config: a program 115 s old is still inside the 120 s grace"
 
     # (h) counters that cannot be read count as BUSY: not frozen until the 180 s bound.
     Reset-World
@@ -425,6 +440,90 @@ try {
     Assert-True ($script:Stopped.Count -eq 0) "an unreadable state file holds restarts for a window rather than reading as zero"
     Invoke-Ticks -From 905 -To 960
     Assert-True ($script:Stopped.Count -eq 1) "...and releases them once that window has passed"
+
+    # F1 (verifier, 2026-10-02, DO-NOT-MERGE): EVERY damaged shape of the count file holds, not only a parse error.
+    # Two restarts used; the agent restarts and finds the file damaged; the program keeps freezing. No third restart
+    # may happen inside 15 minutes of the first. (Lifted from the verifier's VFY-A, widened to its probe table.)
+    $recentIso = $T0.AddSeconds(60).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $shapes = [ordered]@{
+        "empty (0 bytes)"            = [byte[]]@()
+        "whitespace"                 = [Text.Encoding]::ASCII.GetBytes("  `r`n")
+        "UTF-8 BOM only"             = [byte[]]@(0xEF, 0xBB, 0xBF)
+        "NUL bytes"                  = (New-Object byte[] 80)
+        "json null"                  = [Text.Encoding]::ASCII.GetBytes("null")
+        "json {}"                    = [Text.Encoding]::ASCII.GetBytes("{}")
+        "json []"                    = [Text.Encoding]::ASCII.GetBytes("[]")
+        "history null"               = [Text.Encoding]::ASCII.GetBytes('{"restartHistoryUtc":null}')
+        "history text"               = [Text.Encoding]::ASCII.GetBytes('{"restartHistoryUtc":"garbage"}')
+        "history [garbage]"          = [Text.Encoding]::ASCII.GetBytes('{"restartHistoryUtc":["garbage"]}')
+        "history [number]"           = [Text.Encoding]::ASCII.GetBytes('{"restartHistoryUtc":[12345]}')
+        "history [one good, one bad]" = [Text.Encoding]::ASCII.GetBytes(('{"restartHistoryUtc":["' + $recentIso + '","x"]}'))
+        "renamed key"                = [Text.Encoding]::ASCII.GetBytes(('{"restarts":["' + $recentIso + '"]}'))
+        "truncated json"             = [Text.Encoding]::ASCII.GetBytes(('{"restartHistoryUtc":["' + $recentIso + '"'))
+    }
+    foreach ($shapeName in $shapes.Keys) {
+        Reset-World
+        Start-SelfHeal
+        $script:NextId = 3401
+        Invoke-Ticks -From 0 -To 400 -Each $each
+        $usedBefore = $script:Stopped.Count
+        [IO.File]::WriteAllBytes($SelfHealStatePath, $shapes[$shapeName])
+        $script:FakeProcs = @{}; $script:FakeResponding = @{}
+        Start-SelfHeal -KeepState
+        Invoke-Ticks -From 405 -To 800 -Each $each
+        $more = $script:Stopped.Count - $usedBefore
+        Assert-True ($usedBefore -eq 2 -and $more -eq 0) "count file '$shapeName' after an agent restart: no third restart inside 15 minutes (got $usedBefore, then $more more)"
+        Assert-True (@($script:LogLines | Where-Object { $_ -match "watchdog state unreadable" }).Count -ge 1) "...and the log says the count was unreadable"
+    }
+    # The control: a valid file holding two recent restarts also holds (it is read, not reset).
+    Reset-World
+    [IO.File]::WriteAllText($SelfHealStatePath, ('{"restartHistoryUtc":["' + $recentIso + '","' + $recentIso + '"]}'))
+    Start-SelfHeal -KeepState
+    Assert-True (@($script:SelfHealRuntime.History).Count -eq 2 -and @($script:LogLines | Where-Object { $_ -match "unreadable" }).Count -eq 0) "control: a valid count file is read as its two restarts, with no 'unreadable' line"
+    Reset-World
+    [IO.File]::WriteAllText($SelfHealStatePath, '{"restartHistoryUtc":[]}')
+    Start-SelfHeal -KeepState
+    Assert-True (@($script:SelfHealRuntime.History).Count -eq 0 -and @($script:LogLines | Where-Object { $_ -match "unreadable" }).Count -eq 0) "control: a valid EMPTY history reads as zero (not held)"
+
+    # The count cannot be SAVED (a directory where the temp file goes stands in for a locked file or a full disk):
+    # nothing is ever closed, and the bay says why. (Lifted from the verifier's VFY-B.)
+    Reset-World
+    Start-SelfHeal
+    $script:NextId = 3501
+    New-Item -ItemType Directory -Force -Path ($SelfHealStatePath + ".tmp") | Out-Null
+    try {
+        Invoke-Ticks -From 0 -To 400 -Each $each
+        $usedB = $script:Stopped.Count
+        $script:FakeProcs = @{}; $script:FakeResponding = @{}
+        Start-SelfHeal -KeepState
+        Invoke-Ticks -From 405 -To 800 -Each $each
+        $moreB = $script:Stopped.Count - $usedB
+        Assert-True ($usedB -eq 0 -and $moreB -eq 0) "count cannot be saved: nothing is closed, before or after an agent restart (got $usedB, then $moreB)"
+        $cns = @(Get-OutboxRows "software.golf.frozen" | Where-Object { (Get-Metric $_).reason -eq "count_not_saved" })
+        Assert-True ($cns.Count -ge 1) "...and a 'gave up' report says the count could not be saved"
+    } finally {
+        Remove-Item -LiteralPath ($SelfHealStatePath + ".tmp") -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # A save that "succeeds" but does not read back (the write landed something else) also never closes.
+    Reset-World
+    Add-FakeProc -Id 3601 -Responding $false
+    Start-SelfHeal
+    $realWriteTextAtomic = ${function:Write-TextAtomic}
+    function Write-TextAtomic([string]$path, [string]$text) { [IO.File]::WriteAllText($path, "{}") }
+    try {
+        Invoke-Ticks -From 0 -To 120
+        Assert-True ($script:Stopped.Count -eq 0) "a count file that does not read back after the save: nothing is closed"
+    } finally {
+        Set-Item -Path function:Write-TextAtomic -Value $realWriteTextAtomic
+    }
+    # The round trip keeps full precision (verifier R5: whole seconds let a slot free up to 1 s early).
+    Reset-World
+    Start-SelfHeal
+    $script:SelfHealRuntime.History = [DateTime[]]@($T0.AddMilliseconds(900))
+    Assert-True (Save-SelfHealState) "a normal save reports success"
+    $back = Read-SelfHealState -Now $T0 -MaxRestarts 2
+    Assert-True (@($back).Count -eq 1 -and $back[0] -eq $T0.AddMilliseconds(900)) "the saved restart time reads back to the tick ($(if (@($back).Count) { $back[0].ToString('o') }))"
 
     # The pure gate itself.
     $g = Get-SelfHealRestartAllowed -History @($T0, $T0.AddMinutes(5)) -Now $T0.AddMinutes(10) -MaxRestarts 2 -WindowMinutes 15

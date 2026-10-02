@@ -4094,9 +4094,13 @@ function Get-SelfHealSettingInt($obj, [string]$name, [int]$default, [int]$min, [
 }
 
 function Test-SelfHealFlag($obj, [string]$name) {
-    # Only a JSON true turns a flag on. "true" as text, 1, or anything else is OFF.
-    $v = Get-PropValue $obj $name $null
-    return (($v -is [bool]) -and $v)
+    # Only a JSON true turns a flag on. "true" as text, 1, [true], or anything else is OFF. The property is read
+    # directly: Get-PropValue returns through the pipeline, which unrolls [true] into $true (verifier R7).
+    if ($null -eq $obj -or -not ($obj -is [System.Management.Automation.PSCustomObject])) { return $false }
+    $hit = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq $name })
+    if ($hit.Count -ne 1) { return $false }
+    $v = $hit[0].Value
+    return (($v -is [bool]) -and ($v -eq $true))
 }
 
 function ConvertTo-SelfHealTargetName([string]$raw) {
@@ -4144,8 +4148,8 @@ function Read-SelfHealSettings {
 
         # Floors are the ruling's numbers: config may make the watchdog MORE patient, never quicker or more often.
         $s.UnresponsiveSeconds = Get-SelfHealSettingInt $wd "unresponsiveSeconds" 30 30 600
-        $s.LaunchGraceSeconds  = Get-SelfHealSettingInt $wd "launchGraceSeconds" 120 60 1800
-        $s.LoadingMaxSeconds   = Get-SelfHealSettingInt $wd "loadingMaxSeconds" 180 $s.UnresponsiveSeconds 3600
+        $s.LaunchGraceSeconds  = Get-SelfHealSettingInt $wd "launchGraceSeconds" 120 120 1800
+        $s.LoadingMaxSeconds   = Get-SelfHealSettingInt $wd "loadingMaxSeconds" 180 ([Math]::Max(180, $s.UnresponsiveSeconds)) 3600
         $s.MaxRestarts         = Get-SelfHealSettingInt $wd "maxRestarts" 2 0 2
         $s.WindowMinutes       = Get-SelfHealSettingInt $wd "windowMinutes" 15 15 1440
         $s.SampleSeconds       = Get-SelfHealSettingInt $wd "sampleSeconds" 5 2 15
@@ -4314,8 +4318,12 @@ function ConvertTo-SelfHealProcInfo($proc) {
 }
 
 function New-SelfHealProcessLayer {
+    # -SessionOfProcessId exists for the real-process test only: it proves the session is READ from a process, not
+    # assumed (on a dev PC the agent's own session is 1, so a hardcoded 1 would pass). The agent never passes it.
+    param([int]$SessionOfProcessId = 0)
+    if ($SessionOfProcessId -le 0) { $SessionOfProcessId = $PID }
     $own = $null
-    try { $own = [int](Get-Process -Id $PID).SessionId } catch {}
+    try { $own = [int](Get-Process -Id $SessionOfProcessId).SessionId } catch {}
     return @{
         OwnSessionId = $own
         List = {
@@ -4617,19 +4625,52 @@ function Send-SelfHealOutboxIfDue {
 }
 
 # ---- persisted watchdog state: the restart count must survive an agent restart ----
+function ConvertFrom-SelfHealStateText {
+    # STRICT. The count file is valid only as an OBJECT whose restartHistoryUtc is an ARRAY of entries that are all
+    # UTC timestamps in the form this agent writes. Anything else is UNREADABLE, never "zero restarts": a 0-byte, NUL,
+    # whitespace or BOM-only file (power loss), null, {}, [], a missing, null or non-array key, and any entry that is
+    # not such a timestamp. Measured by the verifier (2026-10-02): every one of those used to read as a zero count, and
+    # a bay restarted 4 times in 13 minutes across an agent restart.
+    param([string]$Text)
+    $fail = @{ Ok = $false; Dates = @(); Reason = "" }
+    if ([string]::IsNullOrWhiteSpace($Text)) { $fail.Reason = "empty"; return $fail }
+    if ($Text.IndexOf([char]0) -ge 0) { $fail.Reason = "NUL bytes"; return $fail }
+    $o = $null
+    try { $o = ConvertFrom-Json -InputObject $Text -ErrorAction Stop } catch { $fail.Reason = "not JSON"; return $fail }
+    if ($null -eq $o -or -not ($o -is [System.Management.Automation.PSCustomObject])) { $fail.Reason = "not an object"; return $fail }
+    # Read the property directly: Get-PropValue would unroll a one-element array into a scalar.
+    $prop = @($o.PSObject.Properties | Where-Object { $_.Name -ceq "restartHistoryUtc" })
+    if ($prop.Count -ne 1) { $fail.Reason = "no restartHistoryUtc"; return $fail }
+    $arr = $prop[0].Value
+    if ($null -eq $arr -or -not ($arr -is [System.Array])) { $fail.Reason = "restartHistoryUtc is not an array"; return $fail }
+    $dates = @()
+    foreach ($e in $arr) {
+        $d = $null
+        if ($e -is [DateTime]) { $d = $e.ToUniversalTime() }
+        elseif ($e -is [string]) {
+            $parsed = [DateTime]::MinValue
+            $formats = [string[]]@("yyyy-MM-ddTHH:mm:ss.fffffffZ", "yyyy-MM-ddTHH:mm:ssZ")
+            if ([DateTime]::TryParseExact($e, $formats, [Globalization.CultureInfo]::InvariantCulture,
+                    ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal), [ref]$parsed)) { $d = $parsed }
+        }
+        if ($null -eq $d) { $fail.Reason = "an entry is not a timestamp"; return $fail }
+        $dates += $d
+    }
+    return @{ Ok = $true; Dates = $dates; Reason = "" }
+}
+
 function Read-SelfHealState {
     param([Parameter(Mandatory=$true)][DateTime]$Now, [int]$MaxRestarts)
     $hist = @()
     if (Test-Path -LiteralPath $SelfHealStatePath) {
-        try {
-            $o = Get-Content -LiteralPath $SelfHealStatePath -Raw -ErrorAction Stop | ConvertFrom-Json
-            foreach ($h in @(Get-PropValue $o "restartHistoryUtc" @())) {
-                $t = ConvertTo-SelfHealUtc $h
-                if ($null -ne $t -and $t -gt $Now.AddDays(-1)) { $hist += $t }
-            }
-        } catch {
+        $parsed = @{ Ok = $false; Dates = @(); Reason = "unreadable" }
+        try { $parsed = ConvertFrom-SelfHealStateText -Text ([IO.File]::ReadAllText($SelfHealStatePath)) }
+        catch { $parsed = @{ Ok = $false; Dates = @(); Reason = $_.Exception.Message } }
+        if ($parsed.Ok) {
+            foreach ($d in @($parsed.Dates)) { if ($d -gt $Now.AddDays(-1)) { $hist += $d } }
+        } else {
             # An unreadable count is not a zero count: assume the limit is used up for one window.
-            Write-Log ("[SELFHEAL] watchdog state unreadable ({0}); restarts are held for one window" -f $_.Exception.Message) "WARN"
+            Write-Log ("[SELFHEAL] watchdog state unreadable ({0}); restarts are held for one window" -f $parsed.Reason) "WARN"
             $hist = @(); for ($i = 0; $i -lt [Math]::Max(1, $MaxRestarts); $i++) { $hist += $Now }
         }
     }
@@ -4637,9 +4678,23 @@ function Read-SelfHealState {
 }
 
 function Save-SelfHealState {
-    $o = [ordered]@{ restartHistoryUtc = @(@($script:SelfHealRuntime.History) | ForEach-Object { Format-SelfHealUtc $_ }) }
-    try { Write-TextAtomic -path $SelfHealStatePath -text (ConvertTo-Json -InputObject $o -Depth 4) }
-    catch { Write-Log ("[SELFHEAL] could not save the restart count: {0}" -f $_.Exception.Message) "WARN" }
+    # Returns $true only when the file on disk reads back, through the same strict reader, holding every attempt in
+    # memory. The caller never closes a program on $false: an attempt that is not durable could be repeated after an
+    # agent restart. Full tick precision, so a slot never frees early after a restart (verifier R5).
+    $hist = @(@($script:SelfHealRuntime.History))
+    $o = [ordered]@{ restartHistoryUtc = @($hist | ForEach-Object { ([DateTime]$_).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", [Globalization.CultureInfo]::InvariantCulture) }) }
+    try {
+        Write-TextAtomic -path $SelfHealStatePath -text (ConvertTo-Json -InputObject $o -Depth 4)
+        $back = ConvertFrom-SelfHealStateText -Text ([IO.File]::ReadAllText($SelfHealStatePath))
+        if (-not $back.Ok -or @($back.Dates).Count -ne $hist.Count) {
+            Write-Log ("[SELFHEAL] the restart count did not read back ({0})" -f $(if ($back.Ok) { "count differs" } else { $back.Reason })) "ERROR"
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log ("[SELFHEAL] could not save the restart count: {0}" -f $_.Exception.Message) "ERROR"
+        return $false
+    }
 }
 
 function Initialize-SelfHeal {
@@ -4786,8 +4841,17 @@ function Invoke-SelfHealWatchdogTick {
             }
             # One restart per tick: the oldest frozen instance.
             $victim = $frozen[0].Proc
+            # The attempt is counted in memory first (so a save that keeps failing still uses up the limit) and must be
+            # DURABLE before anything is closed; otherwise an agent restart could forget it and close again.
             $rt.History = [DateTime[]](@($rt.History) + @($Now))
-            Save-SelfHealState
+            if (-not (Save-SelfHealState)) {
+                Write-Log ("[SELFHEAL] {0} pid={1} NOT closed: the restart count could not be saved" -f $target.Name, $victim.Id) "ERROR"
+                if (-not $ep.GaveUp) {
+                    $ep.GaveUp = $true
+                    Add-SelfHealOutbox (New-SelfHealEpisodeRow -Kind "frozen" -Episode $ep -Now $Now -Reason "count_not_saved")
+                }
+                continue
+            }
             $res = Invoke-SelfHealRestart -Layer $layer -ProcInfo $victim -Targets $s.Targets
             if ($res.Stopped) {
                 $ep.Restarts = [int]$ep.Restarts + 1
