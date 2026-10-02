@@ -2280,13 +2280,31 @@ function Move-ProcessWindowToRole {
         [Parameter(Mandatory=$true)][ValidateSet("play","control","session")][string]$role,
         $payloadObj,
         [int]$timeoutSec = 8,
+        [int]$windowGraceSec = 10,
         [switch]$Maximize
     )
 
     $screen = Get-ScreenForRole $role $payloadObj
     if ($null -eq $screen) { return @{ moved = $false; reason = "no_target_screen"; role = $role; pid = $ProcessId } }
 
-    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    # Bound the wait (R2). Waiting for a window only makes sense for a process that is still opening one: a process
+    # older than windowGraceSec that shows no window now is not going to, so it costs one check, not timeoutSec.
+    # A process that is gone costs one check too. If the age cannot be read, keep the full wait (never skip a move).
+    $waitSec = $timeoutSec
+    $procGone = $false
+    try {
+        $rp = Get-Process -Id $ProcessId -ErrorAction Stop
+        if ($rp.HasExited) { $procGone = $true }
+        else {
+            try {
+                $ageSec = ((Get-Date) - $rp.StartTime).TotalSeconds
+                $waitSec = [Math]::Min([double]$timeoutSec, [Math]::Max(0.0, [double]$windowGraceSec - $ageSec))
+            } catch { }
+        }
+    } catch { $procGone = $true }
+    if ($procGone) { return @{ moved = $false; reason = "no_process"; role = $role; pid = $ProcessId } }
+
+    $deadline = (Get-Date).AddSeconds($waitSec)
     $hWnd = [IntPtr]::Zero
     do {
         $hWnd = Get-FirstVisibleWindowHandleForPid $ProcessId
@@ -2933,10 +2951,8 @@ function Stop-SessionDisplay {
 
     # Clear state
     $Global:SessionDisplayProcId = $null
-
-# Emergency stop latch (cleared only by explicit command)
-$Global:EmergencyStopEngaged = $false
-$Global:EmergencyStopReason = $null
+    # NOTE: this function must never touch the emergency-stop latch. It is cleared only by the explicit
+    # EmergencyStop command with action=clear (Clear-EmergencyStopInternal).
     $Global:SessionDisplayUrl = $null
     try { if (Test-Path $Global:SessionDisplayStatePath) { Remove-Item $Global:SessionDisplayStatePath -Force -ErrorAction SilentlyContinue } } catch { }
 
