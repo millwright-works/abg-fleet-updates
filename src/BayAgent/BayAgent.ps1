@@ -1035,19 +1035,31 @@ function Invoke-DvSafe {
         }
     }
     catch {
-        $ex = $_.Exception
+        # Capture the error record first: a nested try/catch below rebinds $_.
+        $errRec = $_
+        $ex = $errRec.Exception
         Write-Log "Dataverse call failed: $Method $Uri :: $($ex.Message)" "ERROR"
 
-        # Best-effort: read Dataverse error JSON body
+        # Best-effort: log the Dataverse error JSON body. On Windows PowerShell 5.1 Invoke-RestMethod has
+        # already consumed the response stream, so the body lives in ErrorDetails.Message; read that first
+        # and fall back to the stream only when it is empty.
+        $body = $null
         try {
-            $resp = $ex.Response
-            if ($resp -ne $null) {
-                $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-                $body = $reader.ReadToEnd()
-                $reader.Close()
-                if ($body) { Write-Log "Dataverse response body: $body" "ERROR" }
+            if ($null -ne $errRec.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$errRec.ErrorDetails.Message)) {
+                $body = [string]$errRec.ErrorDetails.Message
             }
         } catch {}
+        if ([string]::IsNullOrWhiteSpace($body)) {
+            try {
+                $resp = $ex.Response
+                if ($resp -ne $null) {
+                    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                    $body = $reader.ReadToEnd()
+                    $reader.Close()
+                }
+            } catch {}
+        }
+        if (-not [string]::IsNullOrWhiteSpace($body)) { Write-Log "Dataverse response body: $body" "ERROR" }
 
         throw
     }
@@ -1991,7 +2003,7 @@ function Start-LauncherIfNeeded([string]$context, $launcherCfg) {
             try {
                 $role = Get-PropValue $launcherCfg "displayRole" $null
                 if ([string]::IsNullOrWhiteSpace([string]$role)) { $role = "control" }
-                foreach ($id in $pids) { $null = Safe-RouteProcessWindow -context $context -pid ([int]$id) -role $role -payloadObj $null -Maximize }
+                foreach ($id in $pids) { $null = Safe-RouteProcessWindow -context $context -ProcessId ([int]$id) -role $role -payloadObj $null -Maximize }
             } catch {}
             return @{ started = $false; reason = "already_running"; processName = $base; pids = $pids; context = $context }
         }
@@ -2007,7 +2019,7 @@ function Start-LauncherIfNeeded([string]$context, $launcherCfg) {
     try {
         $role = Get-PropValue $launcherCfg "displayRole" $null
         if ([string]::IsNullOrWhiteSpace([string]$role)) { $role = "control" }
-        $null = Safe-RouteProcessWindow -context $context -pid ([int]$proc.Id) -role $role -payloadObj $null -Maximize
+        $null = Safe-RouteProcessWindow -context $context -ProcessId ([int]$proc.Id) -role $role -payloadObj $null -Maximize
     } catch {}
 
     return @{ started = $true; pid = $proc.Id; path = $path; args = $args; context = $context }
@@ -2240,7 +2252,7 @@ function Get-ScreenForRole([string]$role, $payloadObj) {
     return $null
 }
 
-function Get-FirstVisibleWindowHandleForPid([int]$pid) {
+function Get-FirstVisibleWindowHandleForPid([int]$ProcessId) {
     # Returns the first visible top-level window for a PID, or IntPtr::Zero.
     $script:__abgFoundHwnd = [IntPtr]::Zero
     try {
@@ -2250,7 +2262,7 @@ function Get-FirstVisibleWindowHandleForPid([int]$pid) {
                 if (-not [ABGWin32]::IsWindowVisible($hWnd)) { return $true }
                 $outPid = 0
                 [void][ABGWin32]::GetWindowThreadProcessId($hWnd, [ref]$outPid)
-                if ([int]$outPid -eq $pid) {
+                if ([int]$outPid -eq $ProcessId) {
                     $script:__abgFoundHwnd = $hWnd
                     return $false
                 }
@@ -2264,7 +2276,7 @@ function Get-FirstVisibleWindowHandleForPid([int]$pid) {
 
 function Move-ProcessWindowToRole {
     param(
-        [Parameter(Mandatory=$true)][int]$pid,
+        [Parameter(Mandatory=$true)][int]$ProcessId,
         [Parameter(Mandatory=$true)][ValidateSet("play","control","session")][string]$role,
         $payloadObj,
         [int]$timeoutSec = 8,
@@ -2272,18 +2284,18 @@ function Move-ProcessWindowToRole {
     )
 
     $screen = Get-ScreenForRole $role $payloadObj
-    if ($null -eq $screen) { return @{ moved = $false; reason = "no_target_screen"; role = $role; pid = $pid } }
+    if ($null -eq $screen) { return @{ moved = $false; reason = "no_target_screen"; role = $role; pid = $ProcessId } }
 
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     $hWnd = [IntPtr]::Zero
     do {
-        $hWnd = Get-FirstVisibleWindowHandleForPid $pid
+        $hWnd = Get-FirstVisibleWindowHandleForPid $ProcessId
         if ($hWnd -ne [IntPtr]::Zero) { break }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
 
     if ($hWnd -eq [IntPtr]::Zero) {
-        return @{ moved = $false; reason = "no_window_handle"; role = $role; pid = $pid }
+        return @{ moved = $false; reason = "no_window_handle"; role = $role; pid = $ProcessId }
     }
 
     $b = $screen.Bounds
@@ -2296,35 +2308,35 @@ function Move-ProcessWindowToRole {
         return @{
             moved = $true
             role = $role
-            pid = $pid
+            pid = $ProcessId
             deviceName = $screen.DeviceName
             deviceDesc = (Get-DisplayDeviceString $screen.DeviceName)
             bounds = @{ left=$b.Left; top=$b.Top; width=$b.Width; height=$b.Height }
         }
     } catch {
-        return @{ moved = $false; role = $role; pid = $pid; error = $_.Exception.Message }
+        return @{ moved = $false; role = $role; pid = $ProcessId; error = $_.Exception.Message }
     }
 }
 
 function Safe-RouteProcessWindow {
     param(
         [string]$context,
-        [int]$pid,
+        [int]$ProcessId,
         [string]$role,
         $payloadObj,
         [switch]$Maximize
     )
     try {
-        $res = Move-ProcessWindowToRole -pid $pid -role $role -payloadObj $payloadObj -Maximize:$Maximize
+        $res = Move-ProcessWindowToRole -ProcessId $ProcessId -role $role -payloadObj $payloadObj -Maximize:$Maximize
         if ($res.moved) {
-            Write-Log "DisplayRouting: moved pid=$pid to role=$role ($($res.deviceName) / $($res.deviceDesc)) context=$context" "INFO"
+            Write-Log "DisplayRouting: moved pid=$ProcessId to role=$role ($($res.deviceName) / $($res.deviceDesc)) context=$context" "INFO"
         } else {
-            Write-Log "DisplayRouting: no move pid=$pid role=$role reason=$($res.reason) context=$context" "DEBUG"
+            Write-Log "DisplayRouting: no move pid=$ProcessId role=$role reason=$($res.reason) context=$context" "DEBUG"
         }
         return $res
     } catch {
-        Write-Log "DisplayRouting: exception context=$context pid=$pid role=$role :: $($_.Exception.Message)" "WARN"
-        return @{ moved = $false; role = $role; pid = $pid; error = $_.Exception.Message }
+        Write-Log "DisplayRouting: exception context=$context pid=$ProcessId role=$role :: $($_.Exception.Message)" "WARN"
+        return @{ moved = $false; role = $role; pid = $ProcessId; error = $_.Exception.Message }
     }
 }
 
@@ -2620,7 +2632,7 @@ function Start-SessionDisplay($payloadObj) {
         $Global:SessionDisplayUrl = $url
 
         # Best-effort route to the Session screen and maximize
-        try { $null = Safe-RouteProcessWindow -context "SessionDisplay:already_running" -pid ([int]$pidToUse) -role $role -payloadObj $payloadObj -Maximize } catch {}
+        try { $null = Safe-RouteProcessWindow -context "SessionDisplay:already_running" -ProcessId ([int]$pidToUse) -role $role -payloadObj $payloadObj -Maximize } catch {}
 
         return @{ started = $false; reason = "already_running"; mode = $mode; url = $url; pid = $pidToUse; procId = $pidToUse; profileDir = $profileDir }
     }
@@ -2677,7 +2689,7 @@ function Start-SessionDisplay($payloadObj) {
     } catch { }
 
     # Route to Session screen and maximize (best effort)
-    try { $null = Safe-RouteProcessWindow -context "SessionDisplay:started" -pid ([int]$pidToRoute) -role $role -payloadObj $payloadObj -Maximize } catch {}
+    try { $null = Safe-RouteProcessWindow -context "SessionDisplay:started" -ProcessId ([int]$pidToRoute) -role $role -payloadObj $payloadObj -Maximize } catch {}
 
     return @{ started = $true; mode = $mode; edgePath = $edgePath; url = $url; pid = $pidToRoute; procId = $pidToRoute; profileDir = $profileDir }
 }
