@@ -319,13 +319,16 @@ try {
     Invoke-Ticks -From 0 -To 600 -Each { param($t) if ($script:FakeProcs.ContainsKey(2004)) { $script:FakeResponding[2004] = $(if (($t / 5) % 2 -eq 0) { $false } else { $null }) } }
     Assert-True ($script:Stopped.Count -eq 0) "(e) not responding every other reading, 'cannot tell' between: never closed"
 
-    # (f) a reading gap restarts the count: unresponsive at t=0, then the next reading at t=40.
+    # (f) a reading gap restarts the count: quiet and unresponsive at t=0, 5 and 10, then the next reading at t=40.
+    # (Mutation M07 survived the first version of this test, which had a single reading before the gap: the quiet
+    # clock restarted at the gap anyway. Three readings first put the quiet clock at t=5, so only the gap rule stops
+    # a close at t=40.)
     Reset-World
     Add-FakeProc -Id 2005 -Responding $false
     Start-SelfHeal
-    Invoke-SelfHealTick -Now $T0
+    Invoke-Ticks -From 0 -To 10
     Invoke-SelfHealTick -Now $T0.AddSeconds(40)
-    Assert-True ($script:Stopped.Count -eq 0) "(f) two unresponsive readings 40 s apart (nobody watched between) do not make a freeze"
+    Assert-True ($script:Stopped.Count -eq 0) "(f) unresponsive at 0, 5, 10 and then 40 (nobody watched for 30 s) does not make a freeze at 40"
     Invoke-Ticks -From 45 -To 65
     Assert-True ($script:Stopped.Count -eq 0) "(f) ...the 30 s count starts again at t=40 (not closed by t=65)"
     Invoke-Ticks -From 70 -To 85
