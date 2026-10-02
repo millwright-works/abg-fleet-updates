@@ -345,6 +345,19 @@ try {
     Assert-True ($script:Stopped.Count -eq 0) "(h) CPU and disk counters unreadable: not closed at 170 s (no evidence it is idle)"
     Invoke-Ticks -From 175 -To 190
     Assert-True ($script:Stopped.Count -eq 1) "(h) ...closed at the 180 s bound"
+    # (h2)/(h3) each counter on its own: one unreadable, the other readable and flat. Unknown still counts as busy.
+    Reset-World
+    Add-FakeProc -Id 2008 -Responding $false
+    $script:FakeProcs[2008].CpuSeconds = $null
+    Start-SelfHeal
+    Invoke-Ticks -From 0 -To 170
+    Assert-True ($script:Stopped.Count -eq 0) "(h2) CPU unreadable, disk reads flat: not closed at 170 s"
+    Reset-World
+    Add-FakeProc -Id 2009 -Responding $false
+    $script:FakeProcs[2009].IoReadBytes = $null
+    Start-SelfHeal
+    Invoke-Ticks -From 0 -To 170
+    Assert-True ($script:Stopped.Count -eq 0) "(h3) disk counter unreadable, CPU flat: not closed at 170 s"
 
     # ============================================================ W3 rate limit
     Section "W3 at most 2 restarts per rolling 15 minutes"
