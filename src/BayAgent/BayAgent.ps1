@@ -4005,6 +4005,968 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
     }
 }
 
+# ---------------- A0.327 Phase 2: the bay heals itself (frozen-program watchdog + health self-reports) ----------------
+# Kevin, A0.327(2), 2026-10-01: a frozen golf program is restarted by the BAY ITSELF, by a local watchdog that nothing
+# outside the bay can trigger. There is NO new bay command; A0.316(4) and the 2026-08-18 safe-controls ruling stand.
+#
+# WHAT THIS SECTION DOES, AND ONLY WHEN agent-config.json SAYS selfHeal.enabled = true (OFF BY DEFAULT)
+#   1. Watchdog. Every few seconds it reads whether each CONFIGURED golf program is responding. A program that has
+#      been unresponsive for 30 seconds or more, outside its launch grace, and not visibly loading, is closed BY ITS
+#      PROCESS ID so the kiosk shell (ABG.LauncherShell.ps1) reopens it. At most 2 restarts per 15 minutes, counted
+#      in a file so an agent restart does not reset the count. It touches no other process.
+#   2. Health self-reports into the EXISTING diagnostic pipe (build_diagnosticlog -> the platform's
+#      EquipDiagIngestRollup port): golf program running and responding, screen count, audio output present.
+#   3. Restart events (restarting, recovered with the lost minutes, gave up) into the same pipe, so the platform can
+#      tell the member "We spotted it. The golf software froze and is restarting." The club decides any make-good BY
+#      HAND (A0.327(4)); the bay only records the minutes.
+#
+# NOTHING OUTSIDE THE BAY CAN STEER IT. Its settings are read from the LOCAL agent-config.json file at startup, never
+# from the platform's BayProfile / ConfigItem overlay (Apply-EffectiveConfigToRuntime rewrites $cfg.launcher.* from
+# Dataverse; the watchdog never reads $cfg). The only platform input it honors is the bay's Maintenance/Offline mode
+# and the emergency-stop latch, and both can only STOP a restart, never cause one.
+#
+# SEVERITY. Every row this section writes is Info by default, so the ingest opens NO issue and sends NO email:
+# A0.327(3) alerts a person only after the automatic fix AND the member's steps fail, and the member's steps live in
+# the platform's fix flow, not here. selfHeal.watchdog.giveUpSeverity = "warning" makes the gave-up row open an issue.
+#
+# OPEN QUESTION (bench Test 4): whether the Uneekor Launcher and its games report "not responding" to Windows when
+# frozen is UNVERIFIED. Detection is therefore PLUGGABLE: selfHeal.watchdog.detector names an entry in
+# $script:SelfHealDetectors. A reading of $null ("cannot tell") never counts toward a restart.
+
+$SelfHealDenyNames = @(
+    "powershell", "pwsh", "powershell_ise", "cmd", "conhost", "explorer", "msedge", "msedgewebview2", "winlogon",
+    "csrss", "lsass", "services", "svchost", "smss", "wininit", "dwm", "system", "idle", "registry", "taskmgr",
+    "fontdrvhost", "sihost", "ctfmon", "runtimebroker", "searchhost", "searchapp", "startmenuexperiencehost",
+    "textinputhost", "userinit", "logonui", "audiodg", "spoolsv", "wmiprvse", "dllhost", "taskhostw", "mmc",
+    "regedit", "schtasks", "msiexec", "rundll32", "wscript", "cscript", "mshta", "bayagent"
+)
+
+# Check ids. The ingest derives the issue type from the LAST space-separated token of build_diagnosticname, so each
+# name ends in exactly one of these.
+$SelfHealCheckResponding = "software.golf.responding"
+$SelfHealCheckScreens    = "display.screens"
+$SelfHealCheckAudio      = "pc.audio"
+$SelfHealCheckRestarting = "software.golf.restarting"
+$SelfHealCheckRecovered  = "software.golf.recovered"
+$SelfHealCheckFrozen     = "software.golf.frozen"
+
+# build_diagnosticlog choice values (AceOfClubs Entities/build_DiagnosticLog/Entity.xml).
+$SelfHealCatPC        = 100000000
+$SelfHealCatSoftware  = 100000004
+$SelfHealCatDisplay   = 100000005
+$SelfHealSevInfo      = 100000000
+$SelfHealSevWarning   = 100000001
+$SelfHealStatusPassed       = 1
+$SelfHealStatusFailed       = 271980001
+$SelfHealStatusInconclusive = 271980002
+$SelfHealDiagEntitySet      = "build_diagnosticlogs"
+
+$SelfHealStatePath  = Join-Path $BaseDir "state\selfheal-watchdog.json"
+$SelfHealOutboxPath = Join-Path $BaseDir "state\selfheal-outbox.json"
+$SelfHealOutboxMax  = 200
+
+function ConvertTo-SelfHealUtc($value) {
+    # ISO text (Windows PowerShell 5.1 leaves it as a string) or a DateTime (PowerShell 7 converts it): UTC either way.
+    if ($null -eq $value) { return $null }
+    if ($value -is [DateTime]) { return $value.ToUniversalTime() }
+    $s = [string]$value
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    try {
+        return [DateTime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture,
+            ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal))
+    } catch { return $null }
+}
+
+function Format-SelfHealUtc($value) {
+    if ($null -eq $value) { return $null }
+    return ([DateTime]$value).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+
+function Get-SelfHealSettingInt($obj, [string]$name, [int]$default, [int]$min, [int]$max) {
+    # Out of range CLAMPS toward the safe side; unreadable falls back to the default.
+    $v = Get-PropValue $obj $name $null
+    if ($null -eq $v) { return $default }
+    $n = 0
+    try { $n = [int]$v } catch { return $default }
+    if ($n -lt $min) { return $min }
+    if ($n -gt $max) { return $max }
+    return $n
+}
+
+function Test-SelfHealFlag($obj, [string]$name) {
+    # Only a JSON true turns a flag on. "true" as text, 1, or anything else is OFF.
+    $v = Get-PropValue $obj $name $null
+    return (($v -is [bool]) -and $v)
+}
+
+function ConvertTo-SelfHealTargetName([string]$raw) {
+    # A target is an exact process name: no path, no wildcard, no deny-listed system or agent process.
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    $n = $raw.Trim()
+    if ($n.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) { $n = $n.Substring(0, $n.Length - 4) }
+    if ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$') { return $null }
+    foreach ($d in $SelfHealDenyNames) { if ($n -ieq $d) { return $null } }
+    return $n
+}
+
+function Read-SelfHealSettings {
+    # Reads the LOCAL agent-config.json from disk. Never $cfg: by the time the main loop runs, $cfg.launcher has been
+    # rewritten from the platform's BayProfile / ConfigItems, and a platform-side value must never pick what this kills.
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $s = [ordered]@{
+        Enabled = $false; WatchdogEnabled = $false; HealthEnabled = $false
+        Targets = @(); Detector = "hungAppWindow"
+        UnresponsiveSeconds = 30; LaunchGraceSeconds = 120; LoadingMaxSeconds = 180
+        MaxRestarts = 2; WindowMinutes = 15; SampleSeconds = 5; MaxSampleGapSeconds = 15
+        RecoveryWaitSeconds = 120; RelaunchWaitSeconds = 15
+        CpuBusyFraction = 0.10; IoBusyBytes = 1048576
+        GiveUpSeverity = $SelfHealSevInfo
+        HealthIntervalMinutes = 60; HealthMinGapMinutes = 5; HealthSampleSeconds = 60; ExpectedScreens = $null
+        Errors = @()
+    }
+
+    $root = $null
+    try { $root = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json }
+    catch { $s.Errors += "agent-config.json unreadable: $($_.Exception.Message)"; return [pscustomobject]$s }
+
+    $sh = Get-PropValue $root "selfHeal" $null
+    if ($null -eq $sh) { return [pscustomobject]$s }
+
+    $s.Enabled = (Test-SelfHealFlag $sh "enabled")
+    $wd = Get-PropValue $sh "watchdog" $null
+    $hr = Get-PropValue $sh "healthReports" $null
+
+    if ($null -ne $wd) {
+        $s.WatchdogEnabled = (Test-SelfHealFlag $wd "enabled")
+        $det = Get-PropValue $wd "detector" $null
+        if (-not [string]::IsNullOrWhiteSpace([string]$det)) { $s.Detector = ([string]$det).Trim() }
+
+        # Floors are the ruling's numbers: config may make the watchdog MORE patient, never quicker or more often.
+        $s.UnresponsiveSeconds = Get-SelfHealSettingInt $wd "unresponsiveSeconds" 30 30 600
+        $s.LaunchGraceSeconds  = Get-SelfHealSettingInt $wd "launchGraceSeconds" 120 60 1800
+        $s.LoadingMaxSeconds   = Get-SelfHealSettingInt $wd "loadingMaxSeconds" 180 $s.UnresponsiveSeconds 3600
+        $s.MaxRestarts         = Get-SelfHealSettingInt $wd "maxRestarts" 2 0 2
+        $s.WindowMinutes       = Get-SelfHealSettingInt $wd "windowMinutes" 15 15 1440
+        $s.SampleSeconds       = Get-SelfHealSettingInt $wd "sampleSeconds" 5 2 15
+        $s.MaxSampleGapSeconds = [Math]::Max(15, 3 * $s.SampleSeconds)
+        $s.RecoveryWaitSeconds = Get-SelfHealSettingInt $wd "recoveryWaitSeconds" 120 30 900
+        $s.RelaunchWaitSeconds = Get-SelfHealSettingInt $wd "relaunchWaitSeconds" 15 5 120
+        $cpuPct = Get-SelfHealSettingInt $wd "cpuBusyPercent" 10 1 100
+        $s.CpuBusyFraction = $cpuPct / 100.0
+        $s.IoBusyBytes = [double](Get-SelfHealSettingInt $wd "ioBusyKilobytes" 1024 64 1048576) * 1024
+        $gus = [string](Get-PropValue $wd "giveUpSeverity" "info")
+        if ($gus -ieq "warning") { $s.GiveUpSeverity = $SelfHealSevWarning }
+
+        $rawTargets = Get-PropValue $wd "targets" $null
+        $targets = @()
+        if ($null -ne $rawTargets) {
+            foreach ($t in @($rawTargets)) {
+                $name = ConvertTo-SelfHealTargetName ([string](Get-PropValue $t "processName" ""))
+                if ($null -eq $name) { $s.Errors += "watchdog target refused: '$([string](Get-PropValue $t 'processName' ''))'"; continue }
+                $relaunch = ([string](Get-PropValue $t "relaunch" "shell")).Trim().ToLowerInvariant()
+                if ($relaunch -notin @("shell", "agent", "none")) { $s.Errors += "watchdog target '$name': relaunch must be shell, agent or none"; continue }
+                $tPath = [string](Get-PropValue $t "path" "")
+                if ($relaunch -eq "agent" -and [string]::IsNullOrWhiteSpace($tPath)) { $s.Errors += "watchdog target '$name': relaunch agent needs a path"; continue }
+                $targets += [pscustomobject]@{ Name = $name; Relaunch = $relaunch; Path = $tPath; ArgLine = [string](Get-PropValue $t "args" "") }
+            }
+        } else {
+            # No explicit list: the golf launcher named in the LOCAL file (not the overlaid $cfg), reopened by the shell.
+            $lname = ConvertTo-SelfHealTargetName ([string](Get-PropValue (Get-PropValue $root "launcher" $null) "processName" ""))
+            if ($null -ne $lname) { $targets += [pscustomobject]@{ Name = $lname; Relaunch = "shell"; Path = ""; ArgLine = "" } }
+        }
+        $s.Targets = $targets
+        if ($s.WatchdogEnabled -and $targets.Count -eq 0) {
+            $s.Errors += "watchdog has no valid target; it stays off"
+            $s.WatchdogEnabled = $false
+        }
+    }
+
+    if ($null -ne $hr) {
+        $s.HealthEnabled = (Test-SelfHealFlag $hr "enabled")
+        $s.HealthIntervalMinutes = Get-SelfHealSettingInt $hr "intervalMinutes" 60 15 1440
+        $s.HealthMinGapMinutes   = Get-SelfHealSettingInt $hr "minGapMinutes" 5 1 60
+        $exp = Get-PropValue $hr "expectedScreens" $null
+        if ($null -ne $exp) { try { $e = [int]$exp; if ($e -ge 1 -and $e -le 16) { $s.ExpectedScreens = $e } } catch {} }
+        if ($s.Targets.Count -eq 0) {
+            $lname2 = ConvertTo-SelfHealTargetName ([string](Get-PropValue (Get-PropValue $root "launcher" $null) "processName" ""))
+            if ($null -ne $lname2) { $s.Targets = @([pscustomobject]@{ Name = $lname2; Relaunch = "shell"; Path = ""; ArgLine = "" }) }
+        }
+    }
+
+    if (-not $s.Enabled) { $s.WatchdogEnabled = $false; $s.HealthEnabled = $false }
+    return [pscustomobject]$s
+}
+
+# ---- native helpers, compiled ONLY when the feature is on (flag off = no Add-Type, no new runtime behavior) ----
+$script:SelfHealNativeState = "unloaded"
+
+function Initialize-SelfHealNative {
+    if ($script:SelfHealNativeState -eq "ok") { return $true }
+    if ($script:SelfHealNativeState -eq "failed") { return $false }
+    try {
+        if (-not ("ABGSelfHealNative" -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class ABGSelfHealNative {
+    [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_COUNTERS {
+        public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount;
+        public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetProcessIoCounters(IntPtr hProcess, out IO_COUNTERS counters);
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] private class MMDeviceEnumeratorCom { }
+
+    [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDeviceEnumerator {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+    }
+    [Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDevice {
+        [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+        [PreserveSig] int OpenPropertyStore(int stgmAccess, out IntPtr properties);
+        [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetState(out int state);
+    }
+    [Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioEndpointVolume {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int GetChannelCount(out int count);
+        [PreserveSig] int SetMasterVolumeLevel(float levelDb, ref Guid ctx);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid ctx);
+        [PreserveSig] int GetMasterVolumeLevel(out float levelDb);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+        [PreserveSig] int SetChannelVolumeLevel(uint channel, float levelDb, ref Guid ctx);
+        [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, ref Guid ctx);
+        [PreserveSig] int GetChannelVolumeLevel(uint channel, out float levelDb);
+        [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float level);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid ctx);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+    }
+
+    public sealed class AudioReading {
+        public bool Present; public int HResult; public string DeviceId; public bool? Muted; public float? VolumeScalar;
+    }
+
+    // READ ONLY: the default render endpoint for multimedia (eRender 0, eMultimedia 1). HRESULT 0x80070490 (E_NOTFOUND)
+    // means Windows has no output device at all. Measured 2026-10-02 on a dev PC whose sound CARDS read "OK" in
+    // Win32_SoundDevice while no output endpoint was active: WMI would have said "present", this says "absent".
+    public static AudioReading ReadDefaultOutput() {
+        var r = new AudioReading();
+        var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorCom());
+        try {
+            IMMDevice dev;
+            int hr = enumerator.GetDefaultAudioEndpoint(0, 1, out dev);
+            r.HResult = hr;
+            if (hr != 0 || dev == null) { r.Present = false; return r; }
+            r.Present = true;
+            try {
+                string id; if (dev.GetId(out id) == 0) { r.DeviceId = id; }
+                Guid iid = typeof(IAudioEndpointVolume).GUID;
+                object o;
+                if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) == 0 && o != null) {
+                    var vol = (IAudioEndpointVolume)o;
+                    bool m; if (vol.GetMute(out m) == 0) { r.Muted = m; }
+                    float s; if (vol.GetMasterVolumeLevelScalar(out s) == 0) { r.VolumeScalar = s; }
+                    Marshal.ReleaseComObject(o);
+                }
+            } finally { Marshal.ReleaseComObject(dev); }
+            return r;
+        } finally { Marshal.ReleaseComObject(enumerator); }
+    }
+}
+"@
+        }
+        $script:SelfHealNativeState = "ok"
+        return $true
+    } catch {
+        $script:SelfHealNativeState = "failed"
+        Write-Log ("[SELFHEAL] native helpers unavailable ({0}); responding and audio read as unknown" -f $_.Exception.Message) "WARN"
+        return $false
+    }
+}
+
+# ---- the process layer: everything that touches a real process goes through these entries (tests swap in a fake) ----
+function ConvertTo-SelfHealProcInfo($proc) {
+    $start = $null; $cpu = $null; $io = $null; $hwnd = [Int64]0; $sess = $null
+    try { $start = $proc.StartTime.ToUniversalTime() } catch {}
+    try { $cpu = [double]$proc.TotalProcessorTime.TotalSeconds } catch {}
+    try { $hwnd = [Int64]$proc.MainWindowHandle } catch {}
+    try { $sess = [int]$proc.SessionId } catch {}
+    try {
+        if (Initialize-SelfHealNative) {
+            $c = New-Object ABGSelfHealNative+IO_COUNTERS
+            if ([ABGSelfHealNative]::GetProcessIoCounters($proc.Handle, [ref]$c)) { $io = [double]$c.ReadTransferCount }
+        }
+    } catch {}
+    return [pscustomobject]@{
+        Id = [int]$proc.Id; Name = [string]$proc.ProcessName; SessionId = $sess; StartTimeUtc = $start
+        MainWindowHandle = $hwnd; CpuSeconds = $cpu; IoReadBytes = $io
+    }
+}
+
+function New-SelfHealProcessLayer {
+    $own = $null
+    try { $own = [int](Get-Process -Id $PID).SessionId } catch {}
+    return @{
+        OwnSessionId = $own
+        List = {
+            param([string]$name)
+            foreach ($p in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+                if ($p.ProcessName -ieq $name) { ConvertTo-SelfHealProcInfo $p }
+            }
+        }
+        GetById = {
+            param([int]$procId)
+            $p = $null
+            try { $p = Get-Process -Id $procId -ErrorAction Stop } catch { return $null }
+            ConvertTo-SelfHealProcInfo $p
+        }
+        Stop = {
+            param([int]$procId)
+            Stop-Process -Id $procId -Force -ErrorAction Stop
+        }
+        Start = {
+            param([string]$path, [string]$argLine)
+            if ([string]::IsNullOrWhiteSpace($argLine)) { Start-Process -FilePath $path | Out-Null }
+            else { Start-Process -FilePath $path -ArgumentList $argLine | Out-Null }
+        }
+        ScreenCount = {
+            # The agent loads WinForms at script level for display routing; load it here too rather than rely on that.
+            try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop } catch {}
+            [int]@([System.Windows.Forms.Screen]::AllScreens).Count
+        }
+        Audio = {
+            if (-not (Initialize-SelfHealNative)) { return $null }
+            $a = [ABGSelfHealNative]::ReadDefaultOutput()
+            [pscustomobject]@{ Present = [bool]$a.Present; HResult = [int]$a.HResult; DeviceId = $a.DeviceId; Muted = $a.Muted; VolumeScalar = $a.VolumeScalar }
+        }
+    }
+}
+
+# ---- detectors: THE PLUG-IN POINT. Each answers Responding = $true, $false, or $null (cannot tell). ----
+# hungAppWindow     user32 IsHungAppWindow on the main window: the "Not Responding" signal Windows itself uses to
+#                   ghost a window (no message pumped for about 5 seconds). Non-blocking. The default.
+# processResponding .NET Process.Responding (SendMessageTimeout, blocks up to 5 seconds on a hung window).
+# Adding one after the bench: add an entry here and set selfHeal.watchdog.detector to its name.
+$script:SelfHealDetectors = @{
+    hungAppWindow = {
+        param($procInfo, $layer)
+        $h = [Int64]$procInfo.MainWindowHandle
+        if ($h -eq 0) { return @{ Responding = $null; Detail = "no_main_window" } }
+        if (-not (Initialize-SelfHealNative)) { return @{ Responding = $null; Detail = "native_unavailable" } }
+        $hw = [IntPtr]$h
+        if (-not [ABGSelfHealNative]::IsWindow($hw)) { return @{ Responding = $null; Detail = "window_gone" } }
+        $hung = [bool][ABGSelfHealNative]::IsHungAppWindow($hw)
+        return @{ Responding = (-not $hung); Detail = $(if ($hung) { "hung_app_window" } else { "window_ok" }) }
+    }
+    processResponding = {
+        param($procInfo, $layer)
+        try {
+            $p = Get-Process -Id ([int]$procInfo.Id) -ErrorAction Stop
+            $p.Refresh()
+            if ($p.MainWindowHandle -eq [IntPtr]::Zero) { return @{ Responding = $null; Detail = "no_main_window" } }
+            return @{ Responding = [bool]$p.Responding; Detail = "process_responding" }
+        } catch { return @{ Responding = $null; Detail = "probe_failed" } }
+    }
+}
+
+function Get-SelfHealReading($procInfo, $layer, [string]$detectorName) {
+    $det = $null
+    if ($script:SelfHealDetectors.ContainsKey($detectorName)) { $det = $script:SelfHealDetectors[$detectorName] }
+    if ($null -eq $det) { return @{ Responding = $null; Detail = "unknown_detector" } }
+    try {
+        $r = & $det $procInfo $layer
+        $resp = Get-PropValue $r "Responding" $null
+        if ($null -ne $resp -and -not ($resp -is [bool])) { $resp = $null }
+        return @{ Responding = $resp; Detail = [string](Get-PropValue $r "Detail" "") }
+    } catch { return @{ Responding = $null; Detail = "detector_threw" } }
+}
+
+# ---- pure decisions (no I/O): what one reading of one process instance means ----
+function Get-SelfHealInstanceVerdict {
+    # Verdicts: grace | ok | unknown | unresponsive | loading | frozen.
+    # FROZEN needs, outside the launch grace, an unbroken run of "not responding" readings no further apart than
+    # MaxSampleGapSeconds, and EITHER no sign of work (CPU and disk reads both quiet) for UnresponsiveSeconds, OR
+    # LoadingMaxSeconds of not responding whatever the work signs say. A loading game is busy, so it gets the long
+    # bound; a deadlocked one is quiet, so it gets the short one. A $null reading ("cannot tell") breaks the run.
+    param(
+        $PriorState,
+        [Parameter(Mandatory=$true)]$Sample,
+        [Parameter(Mandatory=$true)][DateTime]$Now,
+        [Parameter(Mandatory=$true)]$Settings
+    )
+    $st = @{ LastAt = $null; LastCpu = $null; LastIo = $null; UnrespSince = $null; QuietSince = $null }
+    if ($null -ne $PriorState) { foreach ($k in @($PriorState.Keys)) { $st[$k] = $PriorState[$k] } }
+
+    $prevAt = $st.LastAt; $prevCpu = $st.LastCpu; $prevIo = $st.LastIo
+    $st.LastAt = $Now; $st.LastCpu = $Sample.CpuSeconds; $st.LastIo = $Sample.IoReadBytes
+
+    $start = $Sample.StartTimeUtc
+    if ($null -eq $start) { $st.UnrespSince = $null; $st.QuietSince = $null; return @{ Verdict = "unknown"; State = $st } }
+    if (($Now - $start).TotalSeconds -lt $Settings.LaunchGraceSeconds) {
+        $st.UnrespSince = $null; $st.QuietSince = $null
+        return @{ Verdict = "grace"; State = $st }
+    }
+    if ($null -eq $Sample.Responding) { $st.UnrespSince = $null; $st.QuietSince = $null; return @{ Verdict = "unknown"; State = $st } }
+    if ($Sample.Responding -eq $true) { $st.UnrespSince = $null; $st.QuietSince = $null; return @{ Verdict = "ok"; State = $st } }
+
+    # Not responding. A long gap since the last reading means we were not watching: start the run again.
+    $gapOk = ($null -ne $prevAt) -and (($Now - $prevAt).TotalSeconds -le $Settings.MaxSampleGapSeconds)
+    if (-not $gapOk -or $null -eq $st.UnrespSince) {
+        $st.UnrespSince = $Now
+        $st.QuietSince = $null
+        return @{ Verdict = "unresponsive"; State = $st }
+    }
+
+    # Work signs over the interval since the last reading. A counter we cannot read counts as BUSY, so an unreadable
+    # counter can only make the watchdog slower (LoadingMaxSeconds), never quicker.
+    $elapsed = [Math]::Max(0.001, ($Now - $prevAt).TotalSeconds)
+    $cpuBusy = $true
+    if ($null -ne $Sample.CpuSeconds -and $null -ne $prevCpu) { $cpuBusy = (([double]$Sample.CpuSeconds - [double]$prevCpu) / $elapsed) -ge $Settings.CpuBusyFraction }
+    $ioBusy = $true
+    if ($null -ne $Sample.IoReadBytes -and $null -ne $prevIo) { $ioBusy = (([double]$Sample.IoReadBytes - [double]$prevIo) -ge $Settings.IoBusyBytes) }
+    $busy = $cpuBusy -or $ioBusy
+
+    if ($busy) { $st.QuietSince = $null }
+    elseif ($null -eq $st.QuietSince) { $st.QuietSince = $Now }
+
+    $unrespFor = ($Now - $st.UnrespSince).TotalSeconds
+    $quietFor = $(if ($null -ne $st.QuietSince) { ($Now - $st.QuietSince).TotalSeconds } else { 0 })
+    if ($unrespFor -ge $Settings.LoadingMaxSeconds) { return @{ Verdict = "frozen"; State = $st } }
+    if ($null -ne $st.QuietSince -and $unrespFor -ge $Settings.UnresponsiveSeconds -and $quietFor -ge $Settings.UnresponsiveSeconds) {
+        return @{ Verdict = "frozen"; State = $st }
+    }
+    return @{ Verdict = $(if ($busy) { "loading" } else { "unresponsive" }); State = $st }
+}
+
+function Get-SelfHealRestartAllowed {
+    # Pure. At most MaxRestarts restarts in any rolling WindowMinutes, counting every ATTEMPT (a failed close counts).
+    param([DateTime[]]$History, [Parameter(Mandatory=$true)][DateTime]$Now, [int]$MaxRestarts, [int]$WindowMinutes)
+    $cut = $Now.AddMinutes(-$WindowMinutes)
+    $inWindow = @(@($History) | Where-Object { $null -ne $_ -and $_ -gt $cut } | Sort-Object)
+    $allowed = ($inWindow.Count -lt $MaxRestarts)
+    $next = $null
+    if (-not $allowed -and $MaxRestarts -ge 1 -and $inWindow.Count -ge $MaxRestarts) { $next = $inWindow[$inWindow.Count - $MaxRestarts].AddMinutes($WindowMinutes) }
+    return @{ Allowed = $allowed; CountInWindow = $inWindow.Count; NextAllowedUtc = $next }
+}
+
+function Test-SelfHealNameAllowed([string]$name, $targets) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+    foreach ($d in $SelfHealDenyNames) { if ($name -ieq $d) { return $false } }
+    foreach ($t in @($targets)) { if ($null -ne $t -and $name -ieq [string]$t.Name) { return $true } }
+    return $false
+}
+
+function Invoke-SelfHealRestart {
+    # Closes ONE process, by Id, only after re-reading it and finding the SAME process (name, start time, session)
+    # that was judged frozen. Never by name. Never this agent. Never another session's copy.
+    param([Parameter(Mandatory=$true)]$Layer, [Parameter(Mandatory=$true)]$ProcInfo, $Targets)
+    if ($null -eq $ProcInfo.StartTimeUtc) { return @{ Stopped = $false; Reason = "no_start_time" } }
+    if ([int]$ProcInfo.Id -eq $PID) { return @{ Stopped = $false; Reason = "self" } }
+    if (-not (Test-SelfHealNameAllowed ([string]$ProcInfo.Name) $Targets)) { return @{ Stopped = $false; Reason = "not_a_target" } }
+    if ($null -eq $Layer.OwnSessionId -or $ProcInfo.SessionId -ne $Layer.OwnSessionId) { return @{ Stopped = $false; Reason = "other_session" } }
+    $fresh = $null
+    try { $fresh = & $Layer.GetById ([int]$ProcInfo.Id) } catch {}
+    if ($null -eq $fresh) { return @{ Stopped = $false; Reason = "gone" } }
+    if ([string]$fresh.Name -ine [string]$ProcInfo.Name) { return @{ Stopped = $false; Reason = "pid_reused" } }
+    if ($null -eq $fresh.StartTimeUtc -or $fresh.StartTimeUtc -ne $ProcInfo.StartTimeUtc) { return @{ Stopped = $false; Reason = "pid_reused" } }
+    if ($fresh.SessionId -ne $Layer.OwnSessionId) { return @{ Stopped = $false; Reason = "other_session" } }
+    try {
+        & $Layer.Stop ([int]$ProcInfo.Id)
+        return @{ Stopped = $true; Reason = "stopped" }
+    } catch {
+        return @{ Stopped = $false; Reason = ("stop_failed: " + $_.Exception.Message) }
+    }
+}
+
+# ---- rows into the existing diagnostic pipe ----
+function New-SelfHealDiagRow {
+    param(
+        [Parameter(Mandatory=$true)][string]$CheckId,
+        [Parameter(Mandatory=$true)][int]$Category,
+        [Parameter(Mandatory=$true)][int]$Severity,
+        [Parameter(Mandatory=$true)][int]$Status,
+        $MetricValue,
+        $Metric,
+        [string]$Details,
+        [Parameter(Mandatory=$true)][string]$RunId,
+        [Parameter(Mandatory=$true)][DateTime]$AtUtc
+    )
+    $metricJson = $null
+    if ($null -ne $Metric) {
+        $metricJson = ($Metric | ConvertTo-Json -Depth 6 -Compress)
+        if ($metricJson.Length -gt 4000) { $metricJson = ($metricJson.Substring(0, 3980) + "...[truncated]") }
+    }
+    if ($null -ne $Details -and $Details.Length -gt 2000) { $Details = $Details.Substring(0, 1985) + "...[truncated]" }
+    if ($RunId.Length -gt 100) { $RunId = $RunId.Substring(0, 100) }
+    $label = Get-BayLabel
+    $row = [ordered]@{
+        build_diagnosticlogid = ([guid]::NewGuid().ToString("D"))
+        build_diagnosticname  = ("{0} | {1}" -f $label, $CheckId)
+        build_checkcategory   = $Category
+        build_severity        = $Severity
+        statuscode            = $Status
+        build_details         = $Details
+        build_diagnosticrunid = $RunId
+        build_timestamp       = (Format-SelfHealUtc $AtUtc)
+        "build_Bay@odata.bind" = ("/{0}({1})" -f $BayEntitySet, ($BayId.ToString().Trim("{}")))
+    }
+    if ($null -ne $MetricValue) { $row["build_metricvalue"] = [double]$MetricValue }
+    if ($null -ne $metricJson) { $row["build_metricjson"] = $metricJson }
+    return $row
+}
+
+function Read-SelfHealOutbox {
+    if (-not (Test-Path -LiteralPath $SelfHealOutboxPath)) { return @() }
+    try {
+        $o = Get-Content -LiteralPath $SelfHealOutboxPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        return @(@($o) | Where-Object { $null -ne $_ })
+    } catch {
+        Write-Log ("[SELFHEAL] outbox unreadable ({0}); starting a new one" -f $_.Exception.Message) "WARN"
+        return @()
+    }
+}
+
+function Save-SelfHealOutbox {
+    try { Write-TextAtomic -path $SelfHealOutboxPath -text (ConvertTo-Json -InputObject @($script:SelfHealOutbox) -Depth 8) }
+    catch { Write-Log ("[SELFHEAL] could not save the outbox: {0}" -f $_.Exception.Message) "WARN" }
+}
+
+function Add-SelfHealOutbox($row) {
+    $script:SelfHealOutbox = @($script:SelfHealOutbox) + @([pscustomobject]@{ row = $row; queuedUtc = $row.build_timestamp; attempts = 0 })
+    if ($script:SelfHealOutbox.Count -gt $SelfHealOutboxMax) {
+        $drop = $script:SelfHealOutbox.Count - $SelfHealOutboxMax
+        $script:SelfHealOutbox = @($script:SelfHealOutbox | Select-Object -Skip $drop)
+        Write-Log ("[SELFHEAL] outbox full: dropped the {0} oldest unsent report(s)" -f $drop) "WARN"
+    }
+    Save-SelfHealOutbox
+    Write-Log ("[SELFHEAL] queued {0} severity={1} status={2}" -f $row.build_diagnosticname, $row.build_severity, $row.statuscode) "INFO"
+}
+
+function Invoke-SelfHealDvPost {
+    param([Parameter(Mandatory=$true)][string]$token, [Parameter(Mandatory=$true)][string]$entitySet, [Parameter(Mandatory=$true)]$bodyObj)
+    $uri = "$OrgUrl/api/data/v9.2/$entitySet"
+    $json = ($bodyObj | ConvertTo-Json -Depth 8 -Compress)
+    try {
+        Invoke-RestMethod -Method Post -Uri $uri -Headers (New-DvHeaders $token) -ContentType "application/json; charset=utf-8" `
+            -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ErrorAction Stop | Out-Null
+        return @{ Ok = $true; Duplicate = $false; Status = 204; Detail = $null }
+    } catch {
+        $postErr = $_
+        $ex = $postErr.Exception
+        $status = $null
+        try { $status = [int]$ex.Response.StatusCode } catch {}
+        # Windows PowerShell's Invoke-RestMethod has already READ the error body into ErrorDetails by the time it
+        # throws, so the response stream is empty. MEASURED in BayAgent.SelfHeal.Tests.ps1 W7: reading only the
+        # stream lost Dataverse's error code, and a duplicate-key answer was retried forever.
+        $body = $null
+        try { if ($postErr.ErrorDetails -and $postErr.ErrorDetails.Message) { $body = [string]$postErr.ErrorDetails.Message } } catch {}
+        if ([string]::IsNullOrEmpty($body)) { $body = Read-WebExceptionBody -WebException $ex }
+        if ($null -eq $body) { $body = "" }
+        # Each row carries its own build_diagnosticlogid, so a retry of a POST that landed (response lost) is refused
+        # as a duplicate key instead of writing the event twice. UNVERIFIED wire shape (no Dev write was allowed for
+        # this build): DuplicateRecord is 0x80040237 in the error body.
+        $dup = ($body -match '0x80040237') -or (($status -eq 412) -and ($body -match 'already exists'))
+        $detail = $ex.Message
+        if ($body.Length -gt 0) { $detail = $detail + " :: " + $body.Substring(0, [Math]::Min(300, $body.Length)) }
+        return @{ Ok = $false; Duplicate = $dup; Status = $status; Detail = $detail }
+    }
+}
+
+function Send-SelfHealOutboxIfDue {
+    param([Parameter(Mandatory=$true)][string]$token, [Parameter(Mandatory=$true)][DateTime]$Now, [int]$MaxPerPass = 10)
+    if ($null -eq $script:SelfHealSettings -or -not $script:SelfHealSettings.Enabled) { return }
+    if (@($script:SelfHealOutbox).Count -eq 0) { return }
+    if ($null -ne $script:SelfHealNextSendUtc -and $Now -lt $script:SelfHealNextSendUtc) { return }
+
+    $sent = 0
+    $remaining = @()
+    $failed = $false
+    foreach ($item in @($script:SelfHealOutbox)) {
+        if ($failed -or $sent -ge $MaxPerPass) { $remaining += $item; continue }
+        $r = Invoke-SelfHealDvPost -token $token -entitySet $SelfHealDiagEntitySet -bodyObj $item.row
+        if ($r.Ok -or $r.Duplicate) {
+            $sent++
+            if ($r.Duplicate) { Write-Log ("[SELFHEAL] {0} was already delivered (duplicate key); dropped from the outbox" -f $item.row.build_diagnosticlogid) "INFO" }
+            continue
+        }
+        $item.attempts = [int]$item.attempts + 1
+        $remaining += $item
+        $failed = $true
+        Write-Log ("[SELFHEAL] report not delivered (status={0}); will retry: {1}" -f $r.Status, $r.Detail) "WARN"
+    }
+    $script:SelfHealOutbox = @($remaining)
+    Save-SelfHealOutbox
+    if ($failed) {
+        $script:SelfHealSendBackoffSeconds = [Math]::Min(900, [Math]::Max(60, 2 * [int]$script:SelfHealSendBackoffSeconds))
+        $script:SelfHealNextSendUtc = $Now.AddSeconds($script:SelfHealSendBackoffSeconds)
+    } else {
+        $script:SelfHealSendBackoffSeconds = 30
+        $script:SelfHealNextSendUtc = $null
+    }
+    if ($sent -gt 0) { Write-Log ("[SELFHEAL] delivered {0} report(s); {1} waiting" -f $sent, @($script:SelfHealOutbox).Count) "INFO" }
+}
+
+# ---- persisted watchdog state: the restart count must survive an agent restart ----
+function Read-SelfHealState {
+    param([Parameter(Mandatory=$true)][DateTime]$Now, [int]$MaxRestarts)
+    $hist = @()
+    if (Test-Path -LiteralPath $SelfHealStatePath) {
+        try {
+            $o = Get-Content -LiteralPath $SelfHealStatePath -Raw -ErrorAction Stop | ConvertFrom-Json
+            foreach ($h in @(Get-PropValue $o "restartHistoryUtc" @())) {
+                $t = ConvertTo-SelfHealUtc $h
+                if ($null -ne $t -and $t -gt $Now.AddDays(-1)) { $hist += $t }
+            }
+        } catch {
+            # An unreadable count is not a zero count: assume the limit is used up for one window.
+            Write-Log ("[SELFHEAL] watchdog state unreadable ({0}); restarts are held for one window" -f $_.Exception.Message) "WARN"
+            $hist = @(); for ($i = 0; $i -lt [Math]::Max(1, $MaxRestarts); $i++) { $hist += $Now }
+        }
+    }
+    return ,([DateTime[]]$hist)
+}
+
+function Save-SelfHealState {
+    $o = [ordered]@{ restartHistoryUtc = @(@($script:SelfHealRuntime.History) | ForEach-Object { Format-SelfHealUtc $_ }) }
+    try { Write-TextAtomic -path $SelfHealStatePath -text (ConvertTo-Json -InputObject $o -Depth 4) }
+    catch { Write-Log ("[SELFHEAL] could not save the restart count: {0}" -f $_.Exception.Message) "WARN" }
+}
+
+function Initialize-SelfHeal {
+    param([Parameter(Mandatory=$true)][string]$ConfigPath, [Parameter(Mandatory=$true)][DateTime]$Now, $Layer = $null)
+    $script:SelfHealSettings = Read-SelfHealSettings -Path $ConfigPath
+    $script:SelfHealRuntime = @{
+        Instances = @{}; Episodes = @{}; History = [DateTime[]]@()
+        NextWatchUtc = [DateTime]::MinValue; NextHealthSampleUtc = [DateTime]::MinValue
+        NextHealthDueUtc = [DateTime]::MinValue; LastHealthSentUtc = $null; LastHealthSignature = $null
+        SuppressLogged = $false
+    }
+    $script:SelfHealOutbox = @()
+    $script:SelfHealNextSendUtc = $null
+    $script:SelfHealSendBackoffSeconds = 30
+    foreach ($e in @($script:SelfHealSettings.Errors)) { Write-Log "[SELFHEAL] config: $e" "WARN" }
+    if (-not $script:SelfHealSettings.Enabled) {
+        Write-Log "[SELFHEAL] off (selfHeal.enabled is not true in agent-config.json)" "DEBUG"
+        return
+    }
+    $script:SelfHealLayer = $(if ($null -ne $Layer) { $Layer } else { New-SelfHealProcessLayer })
+    $script:SelfHealRuntime.History = Read-SelfHealState -Now $Now -MaxRestarts $script:SelfHealSettings.MaxRestarts
+    $script:SelfHealOutbox = @(Read-SelfHealOutbox)
+    Write-Log ("[SELFHEAL] on: watchdog={0} health={1} detector={2} targets={3} unresponsive={4}s grace={5}s loadingMax={6}s limit={7}/{8}min" -f `
+        $script:SelfHealSettings.WatchdogEnabled, $script:SelfHealSettings.HealthEnabled, $script:SelfHealSettings.Detector,
+        ((@($script:SelfHealSettings.Targets) | ForEach-Object { "$($_.Name)($($_.Relaunch))" }) -join ","),
+        $script:SelfHealSettings.UnresponsiveSeconds, $script:SelfHealSettings.LaunchGraceSeconds, $script:SelfHealSettings.LoadingMaxSeconds,
+        $script:SelfHealSettings.MaxRestarts, $script:SelfHealSettings.WindowMinutes) "INFO"
+    if ($script:SelfHealSettings.WatchdogEnabled -and -not $script:SelfHealDetectors.ContainsKey($script:SelfHealSettings.Detector)) {
+        Write-Log ("[SELFHEAL] detector '{0}' is not known; every reading is 'cannot tell', so nothing is ever restarted" -f $script:SelfHealSettings.Detector) "ERROR"
+    }
+}
+
+function Get-SelfHealRestartsBlockedReason {
+    # Platform-side inputs may only HOLD a restart. Maintenance/Offline (a technician may be at the bay) and the
+    # emergency-stop latch hold; nothing here can start one.
+    if ($Global:EmergencyStopEngaged) { return "emergency_stop" }
+    try {
+        $effNow = $(if ($Global:EffectiveConfig) { $Global:EffectiveConfig } else { @{} })
+        $op = Get-AgentOperationalState -eff $effNow
+        if ($op.Blocked) { return ("bay_" + $op.ModeLabel.ToLowerInvariant()) }
+    } catch {}
+    return $null
+}
+
+function New-SelfHealEpisodeRow {
+    param([string]$Kind, $Episode, [DateTime]$Now, [string]$Reason = "")
+    $s = $script:SelfHealSettings
+    $frozenFor = [int][Math]::Round(($Now - $Episode.FrozenSinceUtc).TotalSeconds)
+    $metric = [ordered]@{
+        event = $Kind; episodeId = $Episode.Id; target = $Episode.Target
+        frozenSinceUtc = (Format-SelfHealUtc $Episode.FrozenSinceUtc); atUtc = (Format-SelfHealUtc $Now)
+        restarts = $Episode.Restarts; detector = $s.Detector
+    }
+    switch ($Kind) {
+        "restarting" {
+            $metric["restartNumber"] = $Episode.Restarts
+            $metric["unresponsiveSeconds"] = $frozenFor
+            return New-SelfHealDiagRow -CheckId $SelfHealCheckRestarting -Category $SelfHealCatSoftware -Severity $SelfHealSevInfo `
+                -Status $SelfHealStatusFailed -MetricValue $Episode.Restarts -Metric $metric -RunId $Episode.Id -AtUtc $Now `
+                -Details ("The golf software ({0}) stopped responding for {1} seconds. The bay closed it so it restarts by itself (restart {2})." -f $Episode.Target, $frozenFor, $Episode.Restarts)
+        }
+        "recovered" {
+            # Lost minutes: from the first unresponsive reading to the first healthy one. Recorded, not acted on: the
+            # club decides any make-good by hand (A0.327(4)).
+            $faultMinutes = [int][Math]::Ceiling([Math]::Max(0, $frozenFor) / 60.0)
+            $metric["recoveredAtUtc"] = (Format-SelfHealUtc $Now)
+            $metric["faultSeconds"] = $frozenFor
+            $metric["faultMinutes"] = $faultMinutes
+            return New-SelfHealDiagRow -CheckId $SelfHealCheckRecovered -Category $SelfHealCatSoftware -Severity $SelfHealSevInfo `
+                -Status $SelfHealStatusPassed -MetricValue $faultMinutes -Metric $metric -RunId $Episode.Id -AtUtc $Now `
+                -Details ("The golf software ({0}) is responding again after {1} seconds ({2} minutes lost, {3} automatic restarts)." -f $Episode.Target, $frozenFor, $faultMinutes, $Episode.Restarts)
+        }
+        default {
+            $metric["reason"] = $Reason
+            $metric["faultSecondsSoFar"] = $frozenFor
+            return New-SelfHealDiagRow -CheckId $SelfHealCheckFrozen -Category $SelfHealCatSoftware -Severity $s.GiveUpSeverity `
+                -Status $SelfHealStatusFailed -MetricValue $Episode.Restarts -Metric $metric -RunId $Episode.Id -AtUtc $Now `
+                -Details ("The golf software ({0}) is still not responding after {1} automatic restarts; the bay has stopped trying ({2})." -f $Episode.Target, $Episode.Restarts, $Reason)
+        }
+    }
+}
+
+function Invoke-SelfHealWatchdogTick {
+    param([Parameter(Mandatory=$true)][DateTime]$Now)
+    $s = $script:SelfHealSettings
+    $rt = $script:SelfHealRuntime
+    if (-not $s.WatchdogEnabled) { return }
+    if ($Now -lt $rt.NextWatchUtc) { return }
+    $rt.NextWatchUtc = $Now.AddSeconds($s.SampleSeconds)
+    $layer = $script:SelfHealLayer
+
+    $seenKeys = @{}
+    foreach ($target in @($s.Targets)) {
+        $instances = @()
+        foreach ($pi in @(& $layer.List $target.Name)) {
+            if ($null -eq $pi) { continue }
+            if ([string]$pi.Name -ine $target.Name) { continue }
+            if ([int]$pi.Id -eq $PID) { continue }
+            if ($null -eq $layer.OwnSessionId -or $pi.SessionId -ne $layer.OwnSessionId) { continue }
+            $instances += $pi
+        }
+
+        $judged = @()
+        foreach ($pi in $instances) {
+            $key = "{0}|{1}" -f $pi.Id, $(if ($null -ne $pi.StartTimeUtc) { $pi.StartTimeUtc.Ticks } else { "nostart" })
+            $seenKeys[$key] = $true
+            $reading = Get-SelfHealReading $pi $layer $s.Detector
+            $sample = @{ Responding = $reading.Responding; CpuSeconds = $pi.CpuSeconds; IoReadBytes = $pi.IoReadBytes; StartTimeUtc = $pi.StartTimeUtc }
+            $prior = $null
+            if ($rt.Instances.ContainsKey($key)) { $prior = $rt.Instances[$key] }
+            $v = Get-SelfHealInstanceVerdict -PriorState $prior -Sample $sample -Now $Now -Settings $s
+            $rt.Instances[$key] = $v.State
+            $judged += [pscustomobject]@{ Proc = $pi; Verdict = $v.Verdict; Responding = $reading.Responding; Detail = $reading.Detail; UnrespSince = $v.State.UnrespSince }
+            if ($v.Verdict -in @("unresponsive", "loading", "frozen")) {
+                Write-Log ("[SELFHEAL] {0} pid={1} {2} ({3})" -f $target.Name, $pi.Id, $v.Verdict, $reading.Detail) "DEBUG"
+            }
+        }
+
+        $ep = $null
+        if ($rt.Episodes.ContainsKey($target.Name)) { $ep = $rt.Episodes[$target.Name] }
+        $frozen = @($judged | Where-Object { $_.Verdict -eq "frozen" } | Sort-Object { $_.UnrespSince })
+
+        if ($frozen.Count -gt 0) {
+            if ($null -eq $ep) {
+                $ep = @{ Id = ([guid]::NewGuid().ToString("D")); Target = $target.Name; FrozenSinceUtc = $frozen[0].UnrespSince
+                         Restarts = 0; RestartedAtUtc = $null; DetectedAtUtc = $Now; GaveUp = $false; RelaunchDueUtc = $null }
+                $rt.Episodes[$target.Name] = $ep
+                Write-Log ("[SELFHEAL] {0} pid={1} FROZEN: not responding since {2} ({3})" -f $target.Name, $frozen[0].Proc.Id, (Format-SelfHealUtc $ep.FrozenSinceUtc), $frozen[0].Detail) "WARN"
+            }
+            $blocked = Get-SelfHealRestartsBlockedReason
+            if ($null -ne $blocked) {
+                if (-not $rt.SuppressLogged) { Write-Log "[SELFHEAL] restart held: $blocked" "WARN"; $rt.SuppressLogged = $true }
+                continue
+            }
+            $rt.SuppressLogged = $false
+            $gate = Get-SelfHealRestartAllowed -History $rt.History -Now $Now -MaxRestarts $s.MaxRestarts -WindowMinutes $s.WindowMinutes
+            if (-not $gate.Allowed) {
+                if (-not $ep.GaveUp) {
+                    $ep.GaveUp = $true
+                    Write-Log ("[SELFHEAL] {0} still frozen; restart limit reached ({1} in {2} min); next allowed {3}" -f $target.Name, $gate.CountInWindow, $s.WindowMinutes, (Format-SelfHealUtc $gate.NextAllowedUtc)) "WARN"
+                    Add-SelfHealOutbox (New-SelfHealEpisodeRow -Kind "frozen" -Episode $ep -Now $Now -Reason "rate_limit")
+                }
+                continue
+            }
+            # One restart per tick: the oldest frozen instance.
+            $victim = $frozen[0].Proc
+            $rt.History = [DateTime[]](@($rt.History) + @($Now))
+            Save-SelfHealState
+            $res = Invoke-SelfHealRestart -Layer $layer -ProcInfo $victim -Targets $s.Targets
+            if ($res.Stopped) {
+                $ep.Restarts = [int]$ep.Restarts + 1
+                $ep.RestartedAtUtc = $Now
+                $ep.GaveUp = $false
+                if ($target.Relaunch -eq "agent") { $ep.RelaunchDueUtc = $Now.AddSeconds($s.RelaunchWaitSeconds) }
+                foreach ($k in @($rt.Instances.Keys)) { if ($k.StartsWith("$($victim.Id)|")) { $rt.Instances.Remove($k) } }
+                Write-Log ("[SELFHEAL] {0} pid={1} closed to restart it (restart {2} of this episode)" -f $target.Name, $victim.Id, $ep.Restarts) "WARN"
+                Add-SelfHealOutbox (New-SelfHealEpisodeRow -Kind "restarting" -Episode $ep -Now $Now)
+            } else {
+                Write-Log ("[SELFHEAL] {0} pid={1} NOT closed: {2}" -f $target.Name, $victim.Id, $res.Reason) "ERROR"
+                if (-not $ep.GaveUp) {
+                    $ep.GaveUp = $true
+                    Add-SelfHealOutbox (New-SelfHealEpisodeRow -Kind "frozen" -Episode $ep -Now $Now -Reason ("restart_failed: " + $res.Reason))
+                }
+            }
+            continue
+        }
+
+        if ($null -eq $ep) { continue }
+
+        # An episode is open and nothing is frozen right now. Agent relaunch first, if this target asks for it.
+        if ($target.Relaunch -eq "agent" -and $null -ne $ep.RelaunchDueUtc -and $Now -ge $ep.RelaunchDueUtc) {
+            $ep.RelaunchDueUtc = $null
+            if ($instances.Count -eq 0) {
+                try { & $layer.Start $target.Path $target.ArgLine; Write-Log ("[SELFHEAL] {0} started again by the agent" -f $target.Name) "INFO" }
+                catch { Write-Log ("[SELFHEAL] {0} could not be started again: {1}" -f $target.Name, $_.Exception.Message) "ERROR" }
+            }
+        }
+
+        # Recovered: for a program the shell or agent reopens, a copy is back and responding with none still stuck; for
+        # relaunch "none", the frozen copy is gone and nothing left is stuck.
+        $stuck = @($judged | Where-Object { $_.Verdict -in @("unresponsive", "loading", "frozen") }).Count
+        $healthy = @($judged | Where-Object { $_.Responding -eq $true -and $_.Verdict -in @("ok", "grace") }).Count
+        $recovered = $false
+        if ($target.Relaunch -eq "none") { $recovered = ($stuck -eq 0 -and ($instances.Count -eq 0 -or $healthy -gt 0)) }
+        else { $recovered = ($stuck -eq 0 -and $healthy -gt 0) }
+
+        if ($recovered) {
+            Write-Log ("[SELFHEAL] {0} recovered after {1}s ({2} restarts)" -f $target.Name, [int]($Now - $ep.FrozenSinceUtc).TotalSeconds, $ep.Restarts) "INFO"
+            Add-SelfHealOutbox (New-SelfHealEpisodeRow -Kind "recovered" -Episode $ep -Now $Now)
+            $rt.Episodes.Remove($target.Name)
+            continue
+        }
+
+        $waitFrom = $(if ($null -ne $ep.RestartedAtUtc) { $ep.RestartedAtUtc } else { $ep.DetectedAtUtc })
+        if (-not $ep.GaveUp -and ($Now - $waitFrom).TotalSeconds -ge $s.RecoveryWaitSeconds) {
+            $ep.GaveUp = $true
+            Write-Log ("[SELFHEAL] {0} has not come back {1}s after the restart" -f $target.Name, $s.RecoveryWaitSeconds) "WARN"
+            Add-SelfHealOutbox (New-SelfHealEpisodeRow -Kind "frozen" -Episode $ep -Now $Now -Reason "not_recovered")
+        }
+    }
+
+    foreach ($k in @($rt.Instances.Keys)) { if (-not $seenKeys.ContainsKey($k)) { $rt.Instances.Remove($k) } }
+}
+
+# ---- health self-reports ----
+function Get-SelfHealHealthSnapshot {
+    param([Parameter(Mandatory=$true)][DateTime]$Now)
+    $s = $script:SelfHealSettings
+    $layer = $script:SelfHealLayer
+    $progs = @()
+    foreach ($target in @($s.Targets)) {
+        $inst = @(@(& $layer.List $target.Name) | Where-Object { $null -ne $_ -and [string]$_.Name -ieq $target.Name -and $null -ne $layer.OwnSessionId -and $_.SessionId -eq $layer.OwnSessionId })
+        $resp = @()
+        foreach ($pi in $inst) { $resp += (Get-SelfHealReading $pi $layer $s.Detector).Responding }
+        $responding = $null
+        if ($inst.Count -gt 0) {
+            if (@($resp | Where-Object { $_ -eq $false }).Count -gt 0) { $responding = $false }
+            elseif (@($resp | Where-Object { $_ -eq $true }).Count -eq $inst.Count) { $responding = $true }
+        }
+        $progs += [pscustomobject]@{ Name = $target.Name; Running = ($inst.Count -gt 0); Instances = $inst.Count; Responding = $responding
+                                    FrozenEpisodeOpen = ($null -ne $script:SelfHealRuntime -and $script:SelfHealRuntime.Episodes.ContainsKey($target.Name)) }
+    }
+    $screens = $null
+    try { $screens = [int](& $layer.ScreenCount) } catch {}
+    $audio = $null
+    try { $audio = & $layer.Audio } catch {}
+    return [pscustomobject]@{ AtUtc = $Now; Programs = $progs; Screens = $screens; Audio = $audio }
+}
+
+function Get-SelfHealHealthSignature($snap) {
+    $parts = @()
+    foreach ($p in @($snap.Programs)) {
+        $r = $(if ($script:SelfHealSettings.WatchdogEnabled) { if ($p.FrozenEpisodeOpen) { "frozen" } else { "ok" } } else { [string]$p.Responding })
+        $parts += ("{0}:{1}:{2}" -f $p.Name, $p.Running, $r)
+    }
+    $parts += ("screens:{0}" -f $snap.Screens)
+    if ($null -eq $snap.Audio) { $parts += "audio:unknown" } else { $parts += ("audio:{0}:{1}" -f $snap.Audio.Present, $snap.Audio.Muted) }
+    return ($parts -join "|")
+}
+
+function New-SelfHealHealthRows($snap) {
+    $s = $script:SelfHealSettings
+    $runId = ("health-{0}-{1}" -f $snap.AtUtc.ToString("yyyyMMddTHHmmssZ"), ($BayId.ToString().Trim("{}").Substring(0, 8)))
+    $rows = @()
+
+    # Golf program: running and responding.
+    $progs = @($snap.Programs)
+    $allRunning = ($progs.Count -gt 0) -and (@($progs | Where-Object { -not $_.Running }).Count -eq 0)
+    $anyFalse = (@($progs | Where-Object { $_.Responding -eq $false }).Count -gt 0)
+    $allTrue = ($progs.Count -gt 0) -and (@($progs | Where-Object { $_.Responding -ne $true }).Count -eq 0)
+    $status = $SelfHealStatusInconclusive
+    if (-not $allRunning -or $anyFalse) { $status = $SelfHealStatusFailed } elseif ($allTrue) { $status = $SelfHealStatusPassed }
+    $progMetric = @($progs | ForEach-Object { [ordered]@{ name = $_.Name; running = $_.Running; instances = $_.Instances; responding = $_.Responding; frozenEpisodeOpen = $_.FrozenEpisodeOpen } })
+    $progText = (($progs | ForEach-Object { "{0}: {1}" -f $_.Name, $(if (-not $_.Running) { "not running" } elseif ($_.Responding -eq $true) { "running and responding" } elseif ($_.Responding -eq $false) { "running, NOT responding" } else { "running, responding unknown" }) }) -join "; ")
+    $rows += New-SelfHealDiagRow -CheckId $SelfHealCheckResponding -Category $SelfHealCatSoftware -Severity $SelfHealSevInfo -Status $status `
+        -MetricValue $(if ($status -eq $SelfHealStatusPassed) { 1 } else { 0 }) -Metric ([ordered]@{ programs = $progMetric; detector = $s.Detector }) `
+        -Details ("Golf software: " + $progText) -RunId $runId -AtUtc $snap.AtUtc
+
+    # Screens Windows can see.
+    $scrStatus = $SelfHealStatusInconclusive
+    if ($null -ne $snap.Screens) {
+        if ($snap.Screens -lt 1) { $scrStatus = $SelfHealStatusFailed }
+        elseif ($null -ne $s.ExpectedScreens -and $snap.Screens -lt $s.ExpectedScreens) { $scrStatus = $SelfHealStatusFailed }
+        else { $scrStatus = $SelfHealStatusPassed }
+    }
+    $rows += New-SelfHealDiagRow -CheckId $SelfHealCheckScreens -Category $SelfHealCatDisplay -Severity $SelfHealSevInfo -Status $scrStatus `
+        -MetricValue $snap.Screens -Metric ([ordered]@{ screens = $snap.Screens; expected = $s.ExpectedScreens }) `
+        -Details $(if ($null -eq $snap.Screens) { "Screens: could not be read" } elseif ($null -ne $s.ExpectedScreens) { "Screens: Windows sees {0} of {1} expected" -f $snap.Screens, $s.ExpectedScreens } else { "Screens: Windows sees {0}" -f $snap.Screens }) `
+        -RunId $runId -AtUtc $snap.AtUtc
+
+    # Audio output.
+    $au = $snap.Audio
+    $auStatus = $SelfHealStatusInconclusive
+    $auText = "Sound: could not be read"
+    $auMetric = [ordered]@{ present = $null }
+    if ($null -ne $au) {
+        $auMetric = [ordered]@{ present = [bool]$au.Present; muted = $au.Muted; volume = $au.VolumeScalar; hresult = ("0x{0:X8}" -f [int]$au.HResult) }
+        if (-not $au.Present) { $auStatus = $SelfHealStatusFailed; $auText = "Sound: Windows has no audio output device" }
+        elseif ($au.Muted -eq $true) { $auStatus = $SelfHealStatusFailed; $auText = "Sound: the output is muted" }
+        else { $auStatus = $SelfHealStatusPassed; $auText = "Sound: an output device is present" + $(if ($null -ne $au.VolumeScalar) { (", volume {0}%" -f [int][Math]::Round(100 * [double]$au.VolumeScalar)) } else { "" }) }
+    }
+    $rows += New-SelfHealDiagRow -CheckId $SelfHealCheckAudio -Category $SelfHealCatPC -Severity $SelfHealSevInfo -Status $auStatus `
+        -MetricValue $(if ($null -ne $au -and $au.Present) { 1 } elseif ($null -ne $au) { 0 } else { $null }) -Metric $auMetric `
+        -Details $auText -RunId $runId -AtUtc $snap.AtUtc
+
+    return $rows
+}
+
+function Invoke-SelfHealHealthTick {
+    param([Parameter(Mandatory=$true)][DateTime]$Now)
+    $s = $script:SelfHealSettings
+    $rt = $script:SelfHealRuntime
+    if (-not $s.HealthEnabled) { return }
+    if ($Now -lt $rt.NextHealthSampleUtc) { return }
+    $rt.NextHealthSampleUtc = $Now.AddSeconds($s.HealthSampleSeconds)
+
+    $snap = Get-SelfHealHealthSnapshot -Now $Now
+    $sig = Get-SelfHealHealthSignature $snap
+    $scheduled = ($Now -ge $rt.NextHealthDueUtc)
+    $changed = ($null -ne $rt.LastHealthSignature -and $sig -ne $rt.LastHealthSignature)
+    $gapOk = ($null -eq $rt.LastHealthSentUtc) -or (($Now - $rt.LastHealthSentUtc).TotalMinutes -ge $s.HealthMinGapMinutes)
+    if (-not ($scheduled -or ($changed -and $gapOk))) { return }
+
+    $healthRows = New-SelfHealHealthRows $snap
+    foreach ($row in @($healthRows)) { Add-SelfHealOutbox $row }
+    $rt.LastHealthSignature = $sig
+    $rt.LastHealthSentUtc = $Now
+    $rt.NextHealthDueUtc = $Now.AddMinutes($s.HealthIntervalMinutes)
+}
+
+function Invoke-SelfHealTick {
+    # Called from the main loop BEFORE the token: the watchdog works with the internet down. Never throws.
+    param([Parameter(Mandatory=$true)][DateTime]$Now)
+    if ($null -eq $script:SelfHealSettings -or -not $script:SelfHealSettings.Enabled) { return }
+    try { Invoke-SelfHealWatchdogTick -Now $Now } catch { Write-Log ("[SELFHEAL] watchdog tick failed: {0}" -f $_.Exception.Message) "ERROR" }
+    try { Invoke-SelfHealHealthTick -Now $Now } catch { Write-Log ("[SELFHEAL] health tick failed: {0}" -f $_.Exception.Message) "ERROR" }
+}
+
+$script:SelfHealSettings = $null
+$script:SelfHealRuntime = $null
+$script:SelfHealOutbox = @()
+$script:SelfHealLayer = $null
+$script:SelfHealNextSendUtc = $null
+$script:SelfHealSendBackoffSeconds = 30
+try { Initialize-SelfHeal -ConfigPath $CfgPath -Now ((Get-Date).ToUniversalTime()) }
+catch { Write-Log ("[SELFHEAL] could not start; it stays off: {0}" -f $_.Exception.Message) "ERROR"; $script:SelfHealSettings = $null }
+
 # ---------------- -EnrollCert: hands-on / Day-0 enrollment (no credential needed) ----------------
 if ($EnrollCert) {
     $enrollPayload = New-EnrollCertPayload -ValidityDays $EnrollValidityDays -Store $EnrollStore -Force:$EnrollForce
@@ -4028,6 +4990,12 @@ if ($EnrollCert) {
 $didWhoAmI = $false
 
 while ($true) {
+    # A0.327 Phase 2: the self-heal watchdog runs BEFORE the token, so a frozen golf program is still restarted
+    # with the club's internet down. Off unless agent-config.json says selfHeal.enabled = true. Never throws.
+    if (-not $TokenOnly) {
+        try { Invoke-SelfHealTick -Now ((Get-Date).ToUniversalTime()) } catch { }
+    }
+
     try {
         $token = Get-AccessToken
 
@@ -4050,6 +5018,10 @@ while ($true) {
 
         # Update heartbeat on a timer, even if there are no commands
         Send-HeartbeatIfDue $token
+
+        # A0.327 Phase 2: deliver queued self-heal reports into the diagnostic pipe (no-op when self-heal is off)
+        try { Send-SelfHealOutboxIfDue -token $token -Now ((Get-Date).ToUniversalTime()) }
+        catch { Write-Log ("[SELFHEAL] report delivery failed: {0}" -f $_.Exception.Message) "WARN" }
 
         $cmd = Get-NextPendingCommand $token
         if ($cmd) {
