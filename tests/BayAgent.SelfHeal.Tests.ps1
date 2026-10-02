@@ -103,6 +103,9 @@ function Add-FakeProc {
     $script:FakeProcs[$Id] = @{ Id = $Id; Name = $Name; SessionId = $Session; StartTimeUtc = $Start; MainWindowHandle = [Int64](1000 + $Id); CpuSeconds = 10.0; IoReadBytes = 1000000.0 }
     $script:FakeResponding[$Id] = $Responding
 }
+function Set-FakeCounter([int]$Id, [string]$Prop, $Value) {
+    if ($script:FakeProcs.ContainsKey($Id)) { $script:FakeProcs[$Id][$Prop] = $Value }
+}
 function New-FakeLayer {
     return @{
         OwnSessionId = 1
@@ -291,10 +294,10 @@ try {
     Reset-World
     Add-FakeProc -Id 2002 -Responding $false
     Start-SelfHeal
-    Invoke-Ticks -From 0 -To 170 -Each { param($t) $script:FakeProcs[2002].CpuSeconds = 10.0 + 0.4 * $t }
+    Invoke-Ticks -From 0 -To 170 -Each { param($t) Set-FakeCounter 2002 "CpuSeconds" (10.0 + 0.4 * $t) }
     Assert-True ($script:Stopped.Count -eq 0) "(b) not responding for 170 s but working the CPU: not closed"
-    $script:FakeResponding[2002] = $true
-    Invoke-Ticks -From 175 -To 400 -Each { param($t) $script:FakeProcs[2002].CpuSeconds = 10.0 + 0.4 * $t }
+    if ($script:FakeProcs.ContainsKey(2002)) { $script:FakeResponding[2002] = $true }
+    Invoke-Ticks -From 175 -To 400 -Each { param($t) Set-FakeCounter 2002 "CpuSeconds" (10.0 + 0.4 * $t) }
     Assert-True ($script:Stopped.Count -eq 0) "(b) ...it finishes loading and responds: never closed"
     Assert-True (@($script:SelfHealOutbox).Count -eq 0) "(b) ...and nothing is reported"
 
@@ -302,18 +305,18 @@ try {
     Reset-World
     Add-FakeProc -Id 2003 -Responding $false
     Start-SelfHeal
-    Invoke-Ticks -From 0 -To 170 -Each { param($t) $script:FakeProcs[2003].IoReadBytes = 1000000.0 + 5000000.0 * $t }
+    Invoke-Ticks -From 0 -To 170 -Each { param($t) Set-FakeCounter 2003 "IoReadBytes" (1000000.0 + 5000000.0 * $t) }
     Assert-True ($script:Stopped.Count -eq 0) "(c) not responding for 170 s but reading from disk: not closed"
 
     # (d) a load that never ends is bounded: 180 s of not responding is frozen whatever the work signs say.
-    Invoke-Ticks -From 175 -To 200 -Each { param($t) if ($script:FakeProcs.ContainsKey(2003)) { $script:FakeProcs[2003].IoReadBytes = 1000000.0 + 5000000.0 * $t } }
+    Invoke-Ticks -From 175 -To 200 -Each { param($t) Set-FakeCounter 2003 "IoReadBytes" (1000000.0 + 5000000.0 * $t) }
     Assert-True ($script:Stopped.Count -eq 1) "(d) ...but not responding for 180 s even while busy is frozen (a busy hang is still a hang)"
 
     # (e) "cannot tell" breaks the run: alternating not-responding and unknown readings never add up.
     Reset-World
     Add-FakeProc -Id 2004 -Responding $false
     Start-SelfHeal
-    Invoke-Ticks -From 0 -To 600 -Each { param($t) $script:FakeResponding[2004] = $(if (($t / 5) % 2 -eq 0) { $false } else { $null }) }
+    Invoke-Ticks -From 0 -To 600 -Each { param($t) if ($script:FakeProcs.ContainsKey(2004)) { $script:FakeResponding[2004] = $(if (($t / 5) % 2 -eq 0) { $false } else { $null }) } }
     Assert-True ($script:Stopped.Count -eq 0) "(e) not responding every other reading, 'cannot tell' between: never closed"
 
     # (f) a reading gap restarts the count: unresponsive at t=0, then the next reading at t=40.
@@ -545,7 +548,7 @@ try {
 
     $script:FakeAudio = [pscustomobject]@{ Present = $true; HResult = 0; DeviceId = "dev"; Muted = $true; VolumeScalar = 0.5 }
     $script:FakeScreens = 2
-    $script:FakeResponding[6001] = $false
+    if ($script:FakeProcs.ContainsKey(6001)) { $script:FakeResponding[6001] = $false }
     Invoke-SelfHealTick -Now $T0.AddSeconds(660)
     $ha3 = @(Get-OutboxRows "pc.audio"); $hs3 = @(Get-OutboxRows "display.screens"); $hp3 = @(Get-OutboxRows "software.golf.responding")
     Assert-True ($ha3[$ha3.Count - 1].statuscode -eq 271980001) "muted output is Failed"
