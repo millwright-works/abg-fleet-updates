@@ -131,8 +131,13 @@ function Start-MockTokenEndpoint([hashtable]$Sync) {
                         $all = $ms.ToArray()
                     }
                     $body = [Text.Encoding]::UTF8.GetString($all, $bodyStart, [Math]::Min($contentLength, $all.Length - $bodyStart))
-                    [void]$sync["Requests"].Add(@{ requestLine = (($headText -split "`r`n")[0]); body = $body })
-                    $bytes = [Text.Encoding]::UTF8.GetBytes('{"token_type":"Bearer","expires_in":3599,"access_token":"mock-launch-token"}')
+                    $reqLine = (($headText -split "`r`n")[0])
+                    [void]$sync["Requests"].Add(@{ requestLine = $reqLine; body = $body })
+                    $respJson = '{"token_type":"Bearer","expires_in":3599,"access_token":"mock-launch-token"}'
+                    if ($reqLine -match ' /api/data/') {
+                        $respJson = '{"UserId":"44444444-4444-4444-4444-444444444444","OrganizationId":"55555555-5555-5555-5555-555555555555","BusinessUnitId":"66666666-6666-6666-6666-666666666666","value":[]}'
+                    }
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($respJson)
                     $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
                     $hb = [Text.Encoding]::ASCII.GetBytes($head)
                     $stream.Write($hb, 0, $hb.Length); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
@@ -160,7 +165,9 @@ function New-BayInstall {
         [switch]$WithSecretFile,
         [string]$CredentialStateJson = "",
         [string]$CertThumbprintCfg = "",
-        [switch]$WithoutConfig
+        [switch]$WithoutConfig,
+        [string]$EnvironmentUrl = "https://mock-org.crm.dynamics.com",
+        $ExtraConfig = $null
     )
 
     $root = Join-Path $SandboxRoot $Name
@@ -192,7 +199,7 @@ function New-BayInstall {
     }
 
     $cfg = [ordered]@{
-        environmentUrl        = "https://mock-org.crm.dynamics.com"
+        environmentUrl        = $EnvironmentUrl
         tenantId              = $TenantId
         clientId              = $ClientId
         clientSecretDpapiPath = (Join-Path $root "secrets\clientsecret.dpapi")
@@ -203,6 +210,7 @@ function New-BayInstall {
         tokenAuthorityHost    = ("http://127.0.0.1:{0}" -f $TokenPort)
         logLevel              = "DEBUG"
     }
+    if ($null -ne $ExtraConfig) { foreach ($k in $ExtraConfig.Keys) { $cfg[$k] = $ExtraConfig[$k] } }
     if (-not $WithoutConfig) {
         [IO.File]::WriteAllText((Join-Path $root "agent-config.json"),
             ($cfg | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
@@ -419,6 +427,40 @@ try {
         "the trap SAYS SOMETHING for a failure that happens before logging is set up (1.2.0 said nothing)"
     Assert-True ($r5.StdOut -match "Config file not found") "...and it names the missing config file"
     Assert-True ($r5.StdOut -match "\[ERROR\]") "...in the same format Write-Log would have produced"
+
+    # ============================================================ L6 self-heal ON (A0.327 Phase 2)
+    Section "L6 selfHeal.enabled = true: the real agent starts, ticks once, and posts its health rows"
+    # The watchdog's target is a process name that cannot exist on this machine, so nothing real is ever judged or
+    # closed; the health reports read this machine's real screens and Core Audio (read only). environmentUrl points at
+    # the MOCK, so the rows go to 127.0.0.1, never to Dataverse.
+    Assert-True ($r1.Log -match "\[SELFHEAL\] off") "L1 (no selfHeal block) logged that self-heal is off"
+    Assert-True ($r1.Log -notmatch "\[SELFHEAL\] on:") "...and never turned it on"
+    $shCfg = [ordered]@{
+        selfHeal = [ordered]@{
+            enabled = $true
+            watchdog = [ordered]@{ enabled = $true; targets = @([ordered]@{ processName = "AbgNoSuchGolfProgram"; relaunch = "shell" }) }
+            healthReports = [ordered]@{ enabled = $true }
+        }
+    }
+    $before6 = $sync["Requests"].Count
+    $l6 = New-BayInstall -Name "selfheal-on" -TokenPort $port -WithSecretFile -EnvironmentUrl ("http://127.0.0.1:{0}" -f $port) -ExtraConfig $shCfg
+    $r6 = Start-BayAgentLikeAgentHost -Install $l6 -BoundingSwitch "-Once"
+    Show-Evidence $r6 "L6"
+    foreach ($ln in @($r6.Log -split "`r?`n" | Where-Object { $_ -match "SELFHEAL" } | Select-Object -First 8)) { Write-Host ("            $ln") -ForegroundColor DarkGray }
+    Assert-True (-not $r6.TimedOut) "the process exited rather than hanging"
+    Assert-True ($r6.ExitCode -eq 0) "exit code 0 (got $($r6.ExitCode))"
+    Assert-True ($r6.Log -notmatch "FATAL") "no FATAL in the log"
+    Assert-True ($r6.Log -notmatch "is not recognized as the name of a cmdlet") "no 'is not recognized' in the log"
+    Assert-True ($r6.Log -match "\[SELFHEAL\] on: watchdog=True health=True detector=hungAppWindow targets=AbgNoSuchGolfProgram\(shell\)") "the startup line shows what is on, with the default detector"
+    Assert-True ($r6.Log -notmatch "\[SELFHEAL\].*(tick failed|could not start)") "no self-heal tick failed"
+    $posts = @($sync["Requests"] | Select-Object -Skip $before6 | Where-Object { $_.requestLine -match '^POST /api/data/v9\.2/build_diagnosticlogs ' })
+    Assert-True ($posts.Count -eq 3) "three rows POSTed to build_diagnosticlogs (got $($posts.Count))"
+    $postBodies = ($posts | ForEach-Object { $_.body }) -join "`n"
+    Assert-True ($postBodies -match '"build_diagnosticname":"Bay \| software\.golf\.responding"' -and $postBodies -match 'display\.screens' -and $postBodies -match 'pc\.audio') "...the golf program, screens and audio rows"
+    Assert-True ($postBodies -match ('"build_Bay@odata.bind":"/build_baies\({0}\)"' -f $BayId)) "...each bound to this bay"
+    Assert-True ($r6.Log -match "\[SELFHEAL\] delivered 3 report") "the agent logged the delivery"
+    $outboxFile = Join-Path $l6.Root "state\selfheal-outbox.json"
+    Assert-True ((Test-Path -LiteralPath $outboxFile) -and ((Get-Content -LiteralPath $outboxFile -Raw) -match '^\s*\[\s*\]\s*$')) "the outbox file exists in the install's state folder and is empty after delivery"
 }
 finally {
     $sync["Stop"] = $true
