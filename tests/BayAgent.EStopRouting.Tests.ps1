@@ -64,24 +64,156 @@ function Start-Tracked([string]$exe, [string[]]$argList) {
 
 try {
     # ============================================================ E1 census: who writes the latch
-    Section "E1 census: only the stop, the explicit clear and the startup initializer write the latch globals"
-    $latchNames = @("global:emergencystopengaged", "global:emergencystopreason")
-    $writers = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-            $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
-            ($latchNames -contains $n.Left.VariablePath.UserPath.ToLowerInvariant()) }, $true))
-    $badWriters = @()
-    foreach ($w in $writers) {
-        $fn = $null; $parent = $w.Parent
-        while ($null -ne $parent) {
-            if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $fn = $parent.Name; break }
-            $parent = $parent.Parent
-        }
-        if ($null -ne $fn -and @("Invoke-EmergencyStopInternal", "Clear-EmergencyStopInternal") -notcontains $fn) {
-            $badWriters += ("{0} line {1}" -f $fn, $w.Extent.StartLineNumber)
-        }
+    Section "E1 census: the EXACT set of writers of the two latch globals (by name, every shape)"
+    # R3 (verifier, fix/bayagent-estop-latch): the first census allowed any top-level writer, did not see
+    # Set-Variable or a multi-assignment, and exempted a function by NAME. Now: every writer is found by the VARIABLE
+    # NAME (any scope prefix), whatever the shape, and the whole set is pinned as an exact list with each right-hand side.
+    $latchRx = '^(?:\w+:)?(emergencystopengaged|emergencystopreason)$'
+    function Get-LatchVarName($v) {
+        $m = [regex]::Match($v.VariablePath.UserPath.ToLowerInvariant(), $latchRx)
+        if ($m.Success) { return $m.Groups[1].Value }
+        return $null
     }
-    Assert-True ($writers.Count -ge 6) "the census sees the real writers (found $($writers.Count): 2 initializer, 2 stop, 2 clear)"
-    Assert-True ($badWriters.Count -eq 0) "no other function assigns the emergency-stop latch (found: $($badWriters -join '; '))"
+    function Get-LatchVarsUnder($node) {
+        $found = @()
+        $all = @($node.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
+        foreach ($v in $all) { $nm = Get-LatchVarName $v; if ($null -ne $nm) { $found += $nm } }
+        return $found
+    }
+    function Get-EnclosingFunctions($node) {
+        $list = @(); $p = $node.Parent
+        while ($null -ne $p) {
+            if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $list += $p }
+            $p = $p.Parent
+        }
+        return $list
+    }
+    function Get-WriterRecords($rootAst) {
+        $recs = @()
+        $assigns = @($rootAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+        foreach ($a in $assigns) {
+            foreach ($nm in @(Get-LatchVarsUnder $a.Left)) { $recs += [pscustomobject]@{ Node = $a; Var = $nm; Kind = "assign"; Rhs = $a.Right.Extent.Text.Trim(); Line = $a.Extent.StartLineNumber } }
+        }
+        $unary = @($rootAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.UnaryExpressionAst] -and
+                (@("PlusPlus", "MinusMinus", "PostfixPlusPlus", "PostfixMinusMinus") -contains [string]$n.TokenKind) }, $true))
+        foreach ($u in $unary) { foreach ($nm in @(Get-LatchVarsUnder $u.Child)) { $recs += [pscustomobject]@{ Node = $u; Var = $nm; Kind = "incdec"; Rhs = ""; Line = $u.Extent.StartLineNumber } } }
+        $fes = @($rootAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] }, $true))
+        foreach ($fe in $fes) { foreach ($nm in @(Get-LatchVarsUnder $fe.Variable)) { $recs += [pscustomobject]@{ Node = $fe; Var = $nm; Kind = "foreach"; Rhs = ""; Line = $fe.Extent.StartLineNumber } } }
+        $refs = @($rootAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.ConvertExpressionAst] -and $n.Type.TypeName.Name -ieq "ref" }, $true))
+        foreach ($rf in $refs) { foreach ($nm in @(Get-LatchVarsUnder $rf.Child)) { $recs += [pscustomobject]@{ Node = $rf; Var = $nm; Kind = "ref"; Rhs = ""; Line = $rf.Extent.StartLineNumber } } }
+        $cmds = @($rootAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+        foreach ($c in $cmds) {
+            $cn = [string]$c.GetCommandName()
+            $isVarCmd = ($cn -match '^(set|new|remove|clear)-variable$') -or (@("sv", "set", "nv", "rv", "clv") -contains $cn.ToLowerInvariant()) -or ($c.Extent.Text -match '(?i)variable:')
+            if ($c.Extent.Text -match '(?i)emergencystop(engaged|reason)') {
+                if ($c.Extent.Text -notmatch '^(?i)(write-log)\b' -and ($isVarCmd -or $c.Extent.Text -match '(?i)(set|new|remove|clear)-(variable|item)|\bsv\b|\bnv\b|\brv\b|\bclv\b')) {
+                    $recs += [pscustomobject]@{ Node = $c; Var = "(by command)"; Kind = "variable-cmdlet"; Rhs = $c.Extent.Text; Line = $c.Extent.StartLineNumber }
+                }
+            } elseif ($isVarCmd) {
+                # a *-Variable command whose name argument is not a plain string constant could name the latch dynamically
+                $dyn = @($c.CommandElements | Select-Object -Skip 1 | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -or $_ -is [System.Management.Automation.Language.SubExpressionAst] -or $_ -is [System.Management.Automation.Language.ExpandableStringExpressionAst] })
+                if ($dyn.Count -gt 0 -and $cn -notmatch '^(?i)get-') { $recs += [pscustomobject]@{ Node = $c; Var = "(dynamic)"; Kind = "variable-cmdlet-dynamic"; Rhs = $c.Extent.Text; Line = $c.Extent.StartLineNumber } }
+            }
+        }
+        # the name inside a plain string (Set-Variable -Name "EmergencyStopEngaged", a split or joined name, a hashtable key)
+        $strs = @($rootAst.FindAll({ param($n) ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and ([string]$n.Value) -match '(?i)emergencystop(engaged|reason)' }, $true))
+        foreach ($s in $strs) { $recs += [pscustomobject]@{ Node = $s; Var = "(string)"; Kind = "string-mention"; Rhs = [string]$s.Value; Line = $s.Extent.StartLineNumber } }
+        return $recs
+    }
+    function Get-WriterSignature($w, $rootAst) {
+        $fns = @(Get-EnclosingFunctions $w.Node)
+        $where = "top"
+        if ($fns.Count -eq 1) {
+            $f = $fns[0]
+            $topLevel = ($f.Parent -is [System.Management.Automation.Language.NamedBlockAst]) -and ($f.Parent.Parent -eq $rootAst)
+            $where = $(if ($topLevel) { "fn:" + $f.Name } else { "NESTED-FN:" + $f.Name })
+        } elseif ($fns.Count -gt 1) { $where = "NESTED-FN:" + (($fns | ForEach-Object { $_.Name }) -join ">") }
+        else {
+            $ctx = "init"; $p = $w.Node.Parent
+            while ($null -ne $p) {
+                if ($p -is [System.Management.Automation.Language.CatchClauseAst]) {
+                    if ($p.Parent.Body.Extent.Text -match 'Restore-EmergencyStopLatch') { $ctx = "restore-catch" } else { $ctx = "OTHER-CATCH" }
+                    break
+                }
+                if ($p -is [System.Management.Automation.Language.TryStatementAst] -or $p -is [System.Management.Automation.Language.IfStatementAst] -or
+                    $p -is [System.Management.Automation.Language.LoopStatementAst] -or $p -is [System.Management.Automation.Language.SwitchStatementAst]) { $ctx = "OTHER-BLOCK"; break }
+                $p = $p.Parent
+            }
+            $where = "top:" + $ctx
+        }
+        $rhs = $w.Rhs
+        if ($rhs -like '"Emergency-stop restore failed*') { $rhs = "RESTORE_FAILED_TEXT" }
+        return ("{0}|{1}|{2}|{3}" -f $where, $w.Var, $w.Kind, $rhs)
+    }
+
+    $writers = @(Get-WriterRecords $ast)
+    $actual = @($writers | ForEach-Object { Get-WriterSignature $_ $ast } | Sort-Object)
+    $expected = @(
+        'top:init|emergencystopengaged|assign|$false', 'top:init|emergencystopreason|assign|$null',
+        'top:restore-catch|emergencystopengaged|assign|$true', 'top:restore-catch|emergencystopreason|assign|RESTORE_FAILED_TEXT',
+        'fn:Restore-EmergencyStopLatch|emergencystopengaged|assign|$engaged', 'fn:Restore-EmergencyStopLatch|emergencystopreason|assign|$reason',
+        'fn:Invoke-EmergencyStopInternal|emergencystopengaged|assign|$true', 'fn:Invoke-EmergencyStopInternal|emergencystopreason|assign|$reason',
+        'fn:Clear-EmergencyStopInternal|emergencystopengaged|assign|$false', 'fn:Clear-EmergencyStopInternal|emergencystopreason|assign|$null'
+    ) | Sort-Object
+    Assert-True ($actual.Count -eq 10) "exactly 10 writers of the latch (found $($actual.Count): 2 startup initializer, 2 startup restore-failure, 2 restore, 2 stop, 2 clear)"
+    $unexpected = @($actual | Where-Object { $expected -cnotcontains $_ })
+    $missing = @($expected | Where-Object { $actual -cnotcontains $_ })
+    Assert-True ($unexpected.Count -eq 0) "no writer outside the pinned list (unexpected: $($unexpected -join ' ;; '))"
+    Assert-True ($missing.Count -eq 0) "every pinned writer is present with its right-hand side (missing: $($missing -join ' ;; '))"
+
+    # the three writer functions exist exactly once, at the top level (a later duplicate would silently win)
+    foreach ($fnName in @("Invoke-EmergencyStopInternal", "Clear-EmergencyStopInternal", "Restore-EmergencyStopLatch")) {
+        $defs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ieq $fnName }, $true))
+        $isTop = ($defs.Count -eq 1) -and ($defs[0].Parent -is [System.Management.Automation.Language.NamedBlockAst]) -and ($defs[0].Parent.Parent -eq $ast)
+        Assert-True $isTop "$fnName is defined exactly once, at the top level (definitions found: $($defs.Count))"
+    }
+
+    # the behavior tests below replace these functions with stand-ins; a writer hidden in the REAL body would never run there
+    foreach ($standIn in @("Write-Log", "Read-SessionModelFromDisk", "Write-SessionFiles", "Start-SessionDisplay")) {
+        $defs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ieq $standIn }, $true))
+        $mentions = 0
+        foreach ($d in $defs) { $mentions += @(Get-WriterRecords $d).Count }
+        Assert-True ($defs.Count -ge 1 -and $mentions -eq 0) "the shipped $standIn (stubbed below) carries no latch writer ($($defs.Count) definition(s), $mentions writer shapes)"
+    }
+    # the census itself must see every shape: plant one writer per shape in a scratch script and require each to be found
+    $shapes = [ordered]@{
+        "plain assign"      = '$Global:EmergencyStopEngaged = $false'
+        "script scope"      = '$script:EmergencyStopReason = $null'
+        "no scope"          = '$EmergencyStopEngaged = $false'
+        "multi-assign"      = '$Global:EmergencyStopEngaged, $Global:EmergencyStopReason = $false, $null'
+        "typed assign"      = '[bool]$Global:EmergencyStopEngaged = $false'
+        "plus-equals"       = '$Global:EmergencyStopReason += "x"'
+        "Set-Variable"      = 'Set-Variable -Name EmergencyStopEngaged -Value $false -Scope Global'
+        "Set-Variable str"  = 'Set-Variable -Name "EmergencyStopEngaged" -Value $false -Scope Global'
+        "Remove-Variable"   = 'Remove-Variable -Name EmergencyStopReason -Scope Global'
+        "Clear-Variable"    = 'Clear-Variable EmergencyStopReason -Scope Global'
+        "New-Variable"      = 'New-Variable -Name EmergencyStopEngaged -Value $false -Force -Scope Global'
+        "sv alias"          = 'sv EmergencyStopEngaged $false -Scope Global'
+        "dynamic name"      = 'Set-Variable -Name $someName -Value $false -Scope Global'
+        "ref"               = 'Set-Foo -Target ([ref]$Global:EmergencyStopEngaged)'
+        "foreach var"       = 'foreach ($Global:EmergencyStopEngaged in 1,2) { }'
+        "increment"         = '$Global:EmergencyStopReason++'
+        "variable provider" = 'Set-Item -Path variable:EmergencyStopEngaged -Value $false'
+    }
+    foreach ($sn in $shapes.Keys) {
+        $planted = [System.Management.Automation.Language.Parser]::ParseInput("function Start-Planted { " + $shapes[$sn] + " }", [ref]$null, [ref]$null)
+        $pw = @(Get-WriterRecords $planted)
+        Assert-True ($pw.Count -ge 1) "the census sees a planted writer: $sn ($($pw.Count) found)"
+    }
+    # and a writer planted inside a function named like an allowed one, nested in another function, is not exempt
+    $nestedSrc = "function Stop-Thing { function Clear-EmergencyStopInternal { `$Global:EmergencyStopEngaged = `$false } }"
+    $nestedAst = [System.Management.Automation.Language.Parser]::ParseInput($nestedSrc, [ref]$null, [ref]$null)
+    $nw = @(Get-WriterRecords $nestedAst)
+    $nsig = if ($nw.Count -eq 1) { Get-WriterSignature $nw[0] $nestedAst } else { "" }
+    Assert-True ($nsig -like "NESTED-FN:*") "a writer in a nested function named like an allowed writer is reported as NESTED, not exempt ($nsig)"
+    # a top-level writer outside the startup lines (a clear in the main loop) does not match the pinned initializer
+    $loopAst = [System.Management.Automation.Language.Parser]::ParseInput('while ($true) { $Global:EmergencyStopEngaged = $false }', [ref]$null, [ref]$null)
+    $lw = @(Get-WriterRecords $loopAst)
+    $lsig = if ($lw.Count -eq 1) { Get-WriterSignature $lw[0] $loopAst } else { "" }
+    Assert-True ($lsig -like "top:OTHER-BLOCK*" -and ($expected -cnotcontains $lsig)) "a clear planted in the main loop is not a pinned startup writer ($lsig)"
+    $loopAst2 = [System.Management.Automation.Language.Parser]::ParseInput('$Global:EmergencyStopEngaged = $false', [ref]$null, [ref]$null)
+    $lw2 = @(Get-WriterRecords $loopAst2)
+    Assert-True ($lw2.Count -eq 1) "(sanity) a bare top-level initializer-shaped statement is itself one writer, so the pinned count of exactly 2 initializer lines catches a third"
 
     # ============================================================ E1 behavior with the shipped handlers
     Section "E1 behavior: EndSession / Reset never clear the latch; only the explicit clear does"
@@ -104,6 +236,10 @@ try {
         Microsoft.PowerShell.Management\Get-Process @PSBoundParameters
     }
     $cfg = [pscustomobject]@{}
+    # the latch is persisted: point it at a scratch file (the persistence behavior has its own suite, BayAgent.EStopPersist.Tests.ps1)
+    $Global:EmergencyStopStatePath = Join-Path $tmp "state\emergency-stop.json"
+    $Global:EmergencyStopPersistOk = $true
+    $Global:NextCapabilitiesUtc = [DateTime]::MaxValue
     $BayId = "00000000-0000-0000-0000-000000000000"; $AgentVersion = "test"
     $Global:SessionDisplayUrl = "file:///C:/bayagent-estop-test-$([Guid]::NewGuid().ToString('N'))/index.html"
     $Global:SessionDisplayProfileDir = Join-Path $tmp "edge-profile-unique"

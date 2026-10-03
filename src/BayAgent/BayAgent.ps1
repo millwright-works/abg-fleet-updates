@@ -425,7 +425,11 @@ $CMD_CREDENTIAL_ROTATE = 100000030
 # Tracks the process started for Session Display so EndSession/Reset can close the right window
 $Global:SessionDisplayProcId = $null
 
-# Emergency stop latch (cleared only by explicit command)
+# Emergency stop latch (cleared only by explicit command). It is also PERSISTED in the state file below, so a restart
+# (crash relaunch, RestartBayAgent, Update-BayAgent, reboot, power loss) cannot release it: Restore-EmergencyStopLatch
+# reads it at startup and treats a present-but-unreadable file as ENGAGED.
+$Global:EmergencyStopStatePath = Join-Path $BaseDir "state\emergency-stop.json"
+$Global:EmergencyStopPersistOk = $true
 $Global:EmergencyStopEngaged = $false
 $Global:EmergencyStopReason = $null
 
@@ -1391,6 +1395,14 @@ function Refresh-EffectiveConfigIfDue {
     }
 }
 
+function Get-EmergencyStopCapability {
+    return @{
+        engaged   = [bool]$Global:EmergencyStopEngaged
+        reason    = $Global:EmergencyStopReason
+        persisted = [bool]$Global:EmergencyStopPersistOk
+    }
+}
+
 function Build-AgentCapabilitiesJson {
     param(
         [Parameter(Mandatory=$true)][hashtable]$eff
@@ -1433,6 +1445,10 @@ function Build-AgentCapabilitiesJson {
         # Credential health (no secrets, no keys): which credential is configured, which one actually minted
         # the last token, when the active certificate expires. Read by operators and the expiry monitor.
         credential = (Get-CredentialTelemetry)
+
+        # The emergency-stop latch, so the platform can see an engaged stop (and one restored after a restart).
+        # persisted=false means the last save did not read back; the latch itself is still held in memory.
+        emergencyStop = (Get-EmergencyStopCapability)
 
         # The durable outcome of the last fleet update. StartProcess reports Succeeded when the updater
         # LAUNCHES, so this is the only signal that says whether it then installed anything.
@@ -1487,6 +1503,12 @@ function Send-HeartbeatIfDue {
                 # Never let capabilities block heartbeat; just retry soon
                 Write-Log ("Capabilities update failed: {0}" -f $_.Exception.Message) "WARN"
                 $Global:NextCapabilitiesUtc = $now.AddSeconds(30)
+                # The emergency-stop state must still reach the platform when the full capabilities cannot be built
+                # (a missing config section is enough): send the small document that carries it.
+                try {
+                    $patch["build_agentcapabilitiesjson"] = (ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{
+                        agentVersion = $AgentVersion; lastUpdatedUtc = $nowUtcStr; partial = $true; emergencyStop = (Get-EmergencyStopCapability) }))
+                } catch { }
             }
         }
 
@@ -1737,7 +1759,22 @@ function Get-SessionJsPath {
     return ([System.IO.Path]::ChangeExtension($jsonPath, "js"))
 }
 
+function Set-EmergencyStopBanner($modelObj) {
+    # While the emergency stop is engaged the display must keep saying so. Every writer of the session files
+    # (UpdateSessionDisplay, EndSession, Reset, ...) goes through Write-SessionFiles, so the banner is forced here,
+    # at the one place nothing can bypass, and never anywhere that could clear the latch.
+    if (-not $Global:EmergencyStopEngaged) { return $modelObj }
+    $ht = To-Hashtable $modelObj
+    $out = @{}
+    foreach ($k in @($ht.Keys)) { $out[$k] = $ht[$k] }
+    $out.bannerText = "EMERGENCY STOP"
+    $out.statusDetail = [string]$Global:EmergencyStopReason
+    $out.status = "STOP"
+    return $out
+}
+
 function Write-SessionFiles($modelObj) {
+    $modelObj = Set-EmergencyStopBanner $modelObj
     $jsonPath = Get-SessionJsonPath
     $jsPath   = Get-SessionJsPath
 
@@ -2445,6 +2482,93 @@ function Invoke-AudioVolume {
     }
 }
 
+# ---- persisted emergency-stop latch: a restart must not release it ----
+function ConvertFrom-EmergencyStopStateText {
+    # STRICT, same pattern as ConvertFrom-SelfHealStateText. The file is valid only as an OBJECT with exactly one
+    # boolean "engaged" and exactly one "reason" that is a string (engaged) or null (cleared). Anything else is
+    # UNREADABLE, never "not engaged": 0 bytes, whitespace, a BOM only, NUL bytes (power loss), null, {}, [], a
+    # missing key, a wrong type, or one bad field. The caller reads UNREADABLE as ENGAGED.
+    param([string]$Text)
+    $fail = @{ Ok = $false; Engaged = $false; Reason = $null; Why = "" }
+    if ($null -ne $Text) { $Text = $Text.TrimStart([char]0xFEFF) }
+    if ([string]::IsNullOrWhiteSpace($Text)) { $fail.Why = "empty"; return $fail }
+    if ($Text.IndexOf([char]0) -ge 0) { $fail.Why = "NUL bytes"; return $fail }
+    $o = $null
+    try { $o = ConvertFrom-Json -InputObject $Text -ErrorAction Stop } catch { $fail.Why = "not JSON"; return $fail }
+    if ($null -eq $o -or -not ($o -is [System.Management.Automation.PSCustomObject])) { $fail.Why = "not an object"; return $fail }
+    $pe = @($o.PSObject.Properties | Where-Object { $_.Name -ceq "engaged" })
+    $pr = @($o.PSObject.Properties | Where-Object { $_.Name -ceq "reason" })
+    if ($pe.Count -ne 1) { $fail.Why = "no engaged"; return $fail }
+    if ($pr.Count -ne 1) { $fail.Why = "no reason"; return $fail }
+    $engaged = $pe[0].Value
+    $reason = $pr[0].Value
+    if ($null -eq $engaged -or -not ($engaged -is [bool])) { $fail.Why = "engaged is not a boolean"; return $fail }
+    if ($engaged) {
+        if (-not ($reason -is [string]) -or [string]::IsNullOrWhiteSpace($reason)) { $fail.Why = "reason is not a non-empty string"; return $fail }
+    } else {
+        if ($null -ne $reason) { $fail.Why = "a cleared state carries a reason"; return $fail }
+    }
+    return @{ Ok = $true; Engaged = [bool]$engaged; Reason = $(if ($engaged) { [string]$reason } else { $null }); Why = "" }
+}
+
+function Save-EmergencyStopState {
+    # Writes the latch to disk and reads it back through the strict reader. Returns @{ Ok; Detail }. Never throws.
+    # The file is never deleted (a missing file reads as "first install, not engaged"): the replace path overwrites.
+    param([bool]$Engaged, [string]$Reason)
+    $ok = $false; $detail = ""
+    try {
+        $path = $Global:EmergencyStopStatePath
+        $dir = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $o = [ordered]@{ engaged = $Engaged; reason = $(if ($Engaged) { $Reason } else { $null }) }
+        $text = ConvertTo-Json -InputObject $o -Depth 3
+        $tmp = "$path.tmp"
+        [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        try {
+            if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, $null, $true) }
+            else { [IO.File]::Move($tmp, $path) }
+        } catch {
+            # Overwrite in place; never remove the file, so a crash here still leaves a file (zero bytes reads ENGAGED).
+            [IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+        }
+        $back = ConvertFrom-EmergencyStopStateText -Text ([IO.File]::ReadAllText($path))
+        if (-not $back.Ok) { $detail = "read back unreadable ($($back.Why))" }
+        elseif ($back.Engaged -ne $Engaged) { $detail = "read back engaged=$($back.Engaged), wrote engaged=$Engaged" }
+        elseif ($Engaged -and $back.Reason -ne $Reason) { $detail = "read back a different reason" }
+        else { $ok = $true }
+    } catch {
+        $detail = $_.Exception.Message
+    }
+    $Global:EmergencyStopPersistOk = $ok
+    if (-not $ok) {
+        try { Write-Log ("[ESTOP] the emergency-stop state was not saved ({0}); the latch stays as it is in memory" -f $detail) "ERROR" } catch {}
+    }
+    return @{ Ok = $ok; Detail = $detail }
+}
+
+function Restore-EmergencyStopLatch {
+    # Startup. A missing file is a first install (not engaged). A present file that cannot be read back exactly is
+    # ENGAGED: an unreadable latch is never a released one.
+    $path = $Global:EmergencyStopStatePath
+    $engaged = $false; $reason = $null
+    if (Test-Path -LiteralPath $path) {
+        $parsed = @{ Ok = $false; Engaged = $false; Reason = $null; Why = "unreadable" }
+        try { $parsed = ConvertFrom-EmergencyStopStateText -Text ([IO.File]::ReadAllText($path)) }
+        catch { $parsed = @{ Ok = $false; Engaged = $false; Reason = $null; Why = $_.Exception.Message } }
+        if ($parsed.Ok) {
+            $engaged = $parsed.Engaged; $reason = $parsed.Reason
+        } else {
+            $engaged = $true
+            $reason = "Emergency-stop state file unreadable ($($parsed.Why)); the stop is held until an explicit clear"
+            try { Write-Log ("[ESTOP] {0}" -f $reason) "ERROR" } catch {}
+        }
+        if ($engaged) { try { Write-Log ("[ESTOP] restored ENGAGED after a restart: {0}" -f $reason) "WARN" } catch {} }
+    }
+    $Global:EmergencyStopEngaged = $engaged
+    $Global:EmergencyStopReason = $reason
+    $Global:NextCapabilitiesUtc = [DateTime]::MinValue
+}
+
 function Invoke-EmergencyStopInternal {
     param($payloadObj)
 
@@ -2452,8 +2576,12 @@ function Invoke-EmergencyStopInternal {
     try { $reason = (Get-PropValue $payloadObj "reason" $null) } catch {}
     if ([string]::IsNullOrWhiteSpace([string]$reason)) { $reason = "Emergency stop requested" }
 
+    # Engage in memory first (the safe direction), then persist and confirm. A failed save is logged and reported
+    # but never un-engages the stop.
     $Global:EmergencyStopEngaged = $true
     $Global:EmergencyStopReason = $reason
+    $persist = Save-EmergencyStopState -Engaged $true -Reason ([string]$reason)
+    $Global:NextCapabilitiesUtc = [DateTime]::MinValue
 
     # Put the bay into a safe scene and show a clear message.
     $facility = Invoke-FacilitySetMode -Mode "Cleanup" -payloadObj $payloadObj
@@ -2474,13 +2602,22 @@ function Invoke-EmergencyStopInternal {
         ok = $true
         engaged = $true
         reason = $reason
+        persisted = [bool]$persist.Ok
         facility = $facility
     }
 }
 
 function Clear-EmergencyStopInternal {
+    # Persist the release FIRST and confirm it by reading it back. A clear that cannot be made durable is refused:
+    # acting as cleared now would let the next restart read the old ENGAGED file (harmless) or, worse, leave the
+    # platform believing the bay is released while the file says otherwise.
+    $persist = Save-EmergencyStopState -Engaged $false -Reason $null
+    if (-not $persist.Ok) {
+        return @{ ok=$false; engaged=$true; note="emergency_stop_clear_not_persisted"; detail=$persist.Detail; reason=$Global:EmergencyStopReason }
+    }
     $Global:EmergencyStopEngaged = $false
     $Global:EmergencyStopReason = $null
+    $Global:NextCapabilitiesUtc = [DateTime]::MinValue
     return @{ ok=$true; engaged=$false }
 }
 
@@ -5056,6 +5193,13 @@ $script:SelfHealOutbox = @()
 $script:SelfHealLayer = $null
 $script:SelfHealNextSendUtc = $null
 $script:SelfHealSendBackoffSeconds = 30
+# Restore the emergency-stop latch before any command can run (a restart must not release it).
+try { Restore-EmergencyStopLatch }
+catch {
+    $Global:EmergencyStopEngaged = $true
+    $Global:EmergencyStopReason = "Emergency-stop restore failed; the stop is held until an explicit clear"
+    Write-Log ("[ESTOP] restore failed: {0}" -f $_.Exception.Message) "ERROR"
+}
 try { Initialize-SelfHeal -ConfigPath $CfgPath -Now ((Get-Date).ToUniversalTime()) }
 catch { Write-Log ("[SELFHEAL] could not start; it stays off: {0}" -f $_.Exception.Message) "ERROR"; $script:SelfHealSettings = $null }
 
