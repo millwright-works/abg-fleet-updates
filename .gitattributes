@@ -19,3 +19,9 @@
 *.ps1  text eol=crlf
 *.psm1 text eol=crlf
 *.psd1 text eol=crlf
+
+# The two JSON files inside the BayAgent package (2026-10-07, 1.3.1). They were unpinned, so their bytes in the zip
+# followed the building machine's core.autocrlf: every package so far was built with autocrlf=true and shipped them
+# CRLF (manifest.json 68 bytes, 65 in git). A build on a machine without autocrlf would ship different bytes and a
+# different package hash from the same commit. Pinned to what has always shipped.
+src/BayAgent/*.json text eol=crlf

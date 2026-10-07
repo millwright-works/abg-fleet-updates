@@ -22,6 +22,7 @@ WHAT IT PRODUCES
       tools/Update-SessionDisplay.ps1
       tools/Update-PromosPack.ps1
       tools/Publish-Current.ps1
+      tools/Watch-BayAgentUpdate.ps1     (1.3.1: the update rollback guard)
 
 SIGNING -- READ THIS BEFORE ADDING A SIGNING STEP HERE
   The package ships UNSIGNED, and that is correct, not an omission. MEASURED 2026-09-14
@@ -78,7 +79,8 @@ $Entries = @(
     @{ Zip = "tools/Update-BayAgent.ps1";       Src = "tools\Update-BayAgent.ps1" },
     @{ Zip = "tools/Update-SessionDisplay.ps1"; Src = "tools\Update-SessionDisplay.ps1" },
     @{ Zip = "tools/Update-PromosPack.ps1";     Src = "tools\Update-PromosPack.ps1" },
-    @{ Zip = "tools/Publish-Current.ps1";       Src = "tools\Publish-Current.ps1" }
+    @{ Zip = "tools/Publish-Current.ps1";       Src = "tools\Publish-Current.ps1" },
+    @{ Zip = "tools/Watch-BayAgentUpdate.ps1";  Src = "tools\Watch-BayAgentUpdate.ps1" }
 )
 
 # See the header note: JavaScript misfiled as .ps1, never executed on a bay.
@@ -103,6 +105,24 @@ if ($manifest.version -ne $Version) {
     Fail ("manifest.json says version '{0}' but -Version is '{1}'. The agent reports the manifest's value in its heartbeat, so a mismatch ships a package that lies about what it is." -f $manifest.version, $Version)
 }
 Write-Host ("  OK  manifest.json version = {0}" -f $manifest.version)
+
+# ---------------------------------------------------------------- gate 1b: the code's own version agrees (1.3.1)
+# Since 1.3.1 the agent reports the version constant in BayAgent.ps1, not the manifest (F1, 2026-10-07: 1.3.0 ran on
+# Bay 1 and reported 1.2.1 because the updater skipped an equal-sized manifest.json). Both must say -Version.
+$agentText = [IO.File]::ReadAllText((Join-Path $srcBay "BayAgent.ps1"))
+$cv = [regex]::Matches($agentText, '(?m)^\$AgentCodeVersion = "([^"]+)"\r?$')
+if ($cv.Count -ne 1) { Fail ("BayAgent.ps1 must carry exactly one line `$AgentCodeVersion = `"<version>`" (found {0})" -f $cv.Count) }
+if ($cv[0].Groups[1].Value -ne $Version) { Fail ("BayAgent.ps1 says `$AgentCodeVersion = '{0}' but -Version is '{1}'" -f $cv[0].Groups[1].Value, $Version) }
+Write-Host ("  OK  BayAgent.ps1 AgentCodeVersion = {0}" -f $Version)
+
+# ---------------------------------------------------------------- gate 1c: the manifest will actually be copied
+# The updater ALREADY on a bay does the install, and through 1.3.0 it skipped a file whose size and time matched
+# (every entry carries one fixed time, below). Every manifest from 1.2.0 to 1.3.0 was 68 bytes as shipped (65 in
+# git, CRLF in the package). A new manifest of either length would be skipped by those updaters. The 1.3.1 updater
+# copies every file and verifies by hash, so this gate only protects installs run by an older updater.
+$manifestLen = (Get-Item -LiteralPath $manifestPath).Length
+if ($manifestLen -in @(65, 68)) { Fail ("manifest.json is {0} bytes, the length of every shipped manifest from 1.2.0 to 1.3.0; an updater from before 1.3.1 would skip copying it. Change its length (add or remove a field)." -f $manifestLen) }
+Write-Host ("  OK  manifest.json is {0} bytes (differs from the 65/68 of every earlier manifest)" -f $manifestLen)
 
 # ---------------------------------------------------------------- gate 2: parse + ASCII
 foreach ($e in $Entries) {

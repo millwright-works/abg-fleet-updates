@@ -313,6 +313,11 @@ try {
         $win32If = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match 'class ABGWin32' } | Select-Object -First 1
         if (-not $win32If) { throw "ABGWin32 block not found in the agent" }
         . ([scriptblock]::Create($win32If.Extent.Text))
+        # 1.3.1: routing reads the screens through Get-CurrentScreens (fresh EnumDisplayMonitors), which needs the
+        # ABGDisplayInfo type; lift it verbatim too, or the routing would silently use its cached-WinForms fallback.
+        $dispIf = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match 'class ABGDisplayInfo' } | Select-Object -First 1
+        if (-not $dispIf) { throw "ABGDisplayInfo block not found in the agent" }
+        . ([scriptblock]::Create($dispIf.Extent.Text))
 
         # compile a console-free WinForms exe with Windows PowerShell 5.1 (Add-Type -OutputAssembly is not in pwsh 7)
         $simExe = Join-Path $tmp "AbgEsrForm.exe"
@@ -352,7 +357,7 @@ Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms,System.
 
         foreach ($n in @("Get-PropValue", "Get-DisplayDeviceString", "Resolve-RoleSelectorToScreen", "Get-ScreenForRole",
                          "Get-DisplayRoutingConfigFromPayloadOrConfig", "Get-FirstVisibleWindowHandleForPid",
-                         "Move-ProcessWindowToRole", "Safe-RouteProcessWindow")) {
+                         "Move-ProcessWindowToRole", "Safe-RouteProcessWindow", "Get-CurrentScreens", "Save-LastDisplayRouting")) {
             $d = $topFns | Where-Object { $_.Name -eq $n } | Select-Object -First 1
             if (-not $d) { throw "Function '$n' not found in $AgentScript" }
             . ([scriptblock]::Create($d.Extent.Text))
@@ -375,6 +380,11 @@ Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms,System.
         }
 
         $screens = @([System.Windows.Forms.Screen]::AllScreens)
+        # 1.3.1: routing must read the screens FRESH (Get-CurrentScreens), not from this process's WinForms cache,
+        # which is how Bay 1's 1.2.1 and 1.3.0 processes disagreed about how many screens there were (2026-10-07).
+        $freshScreens = @(Get-CurrentScreens)
+        $freshCount = @($freshScreens | Where-Object { $_.PSObject.Properties.Name -contains "Fresh" -and $_.Fresh -eq $true }).Count
+        Assert-True ($freshScreens.Count -ge 1 -and $freshCount -eq $freshScreens.Count -and $freshScreens.Count -eq $screens.Count) "routing reads fresh monitors ($freshCount fresh of $($freshScreens.Count); WinForms cache $($screens.Count))"
         $primary = $screens | Where-Object { $_.Primary } | Select-Object -First 1
         $pb = $primary.Bounds
 

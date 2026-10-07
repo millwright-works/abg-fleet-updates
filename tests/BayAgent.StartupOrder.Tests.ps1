@@ -82,6 +82,7 @@ $ShippedScripts = @(
     "src\BayAgent\tools\Update-BayAgent.ps1"
     "src\BayAgent\tools\Update-SessionDisplay.ps1"
     "src\BayAgent\tools\Update-PromosPack.ps1"
+    "src\BayAgent\tools\Watch-BayAgentUpdate.ps1"
     "src\BayAgent\tools\Setup-BayPC.ps1"
     "src\BayAgent\bootstrap\ABG.AgentHost.ps1"
     "src\BayAgent\bootstrap\ABG.HostWatchdog.ps1"

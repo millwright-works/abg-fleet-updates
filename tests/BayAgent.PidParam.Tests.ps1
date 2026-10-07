@@ -82,12 +82,17 @@ try {
         $win32If = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match 'class ABGWin32' } | Select-Object -First 1
         if (-not $win32If) { throw "ABGWin32 block not found in the agent" }
         . ([scriptblock]::Create($win32If.Extent.Text))
+        # 1.3.1: routing reads the screens through Get-CurrentScreens (fresh EnumDisplayMonitors), which needs the
+        # ABGDisplayInfo type; lift it verbatim too, or the routing would silently use its cached-WinForms fallback.
+        $dispIf = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match 'class ABGDisplayInfo' } | Select-Object -First 1
+        if (-not $dispIf) { throw "ABGDisplayInfo block not found in the agent" }
+        . ([scriptblock]::Create($dispIf.Extent.Text))
         $script:logged = New-Object System.Collections.Generic.List[string]
         function Write-Log { param([string]$Message, [string]$Level = "INFO") $script:logged.Add("[$Level] $Message") }
         $cfg = [pscustomobject]@{}
         foreach ($n in @("Get-PropValue", "Get-DisplayDeviceString", "Resolve-RoleSelectorToScreen", "Get-ScreenForRole",
                          "Get-DisplayRoutingConfigFromPayloadOrConfig", "Get-FirstVisibleWindowHandleForPid",
-                         "Move-ProcessWindowToRole", "Safe-RouteProcessWindow")) {
+                         "Move-ProcessWindowToRole", "Safe-RouteProcessWindow", "Get-CurrentScreens", "Save-LastDisplayRouting")) {
             $d = $defs | Where-Object { $_.Name -eq $n } | Select-Object -First 1
             if (-not $d) { throw "Function '$n' not found in $AgentScript" }
             . ([scriptblock]::Create($d.Extent.Text))
@@ -199,7 +204,21 @@ try {
     $iAst = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
     $roboCalls = @($iAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Invoke-Robo" }, $true))
     $dests = @($roboCalls | ForEach-Object { $_.CommandElements[2].Extent.Text })
-    Assert-True ($roboCalls.Count -ge 3 -and @($dests | Where-Object { $_ -notin @('$relDir', '$CurrentDir', '$destTools') }).Count -eq 0) "every installer copy lands in releases\<v>, current\ or tools\ (destinations: $($dests -join ', '))"
+    # 1.3.1 (A0.437) adds the rollback snapshot (rollback\current, rollback\tools), the restore of that snapshot into
+    # current\ and tools\ ($ToolsDir), and the link-to-folder rebuild of current\ ($linkPath). Still an EXACT set: a new
+    # destination fails here until someone decides it is safe, and Convert-LinkToFolder is pinned to current\ below.
+    # Since 1.3.1 every tree copy but the staging one goes through Sync-TreeExact (robocopy, then an explicit copy of any
+    # file whose bytes still differ), whose own robocopy writes to its -dst parameter. So: robocopy writes only to
+    # releases\<v> or to Sync-TreeExact's $dst, and every Sync-TreeExact -dst is in the exact set.
+    $allowedDests = @('$CurrentDir', '$destTools', '$ToolsDir', '$SnapCurrent', '$SnapTools', '$linkPath')
+    Assert-True ($roboCalls.Count -eq 2 -and @($dests | Where-Object { $_ -notin @('$relDir', '$dst') }).Count -eq 0) "robocopy writes only to releases\<v> (staging) or inside Sync-TreeExact (destinations: $($dests -join ', '))"
+    $syncCalls = @($iAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Sync-TreeExact" }, $true))
+    $syncDests = @($syncCalls | ForEach-Object { $m = [regex]::Match($_.Extent.Text, '-dst\s+(\$\w+)'); if ($m.Success) { $m.Groups[1].Value } else { "(no -dst)" } })
+    Assert-True ($syncCalls.Count -ge 6 -and @($syncDests | Where-Object { $_ -notin $allowedDests }).Count -eq 0) "every installer tree copy lands in current\, tools\ or the rollback snapshot (Sync-TreeExact destinations: $($syncDests -join ', '))"
+    $linkCalls = @($iAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Convert-LinkToFolder" }, $true))
+    Assert-True ($linkCalls.Count -ge 1 -and @($linkCalls | Where-Object { $_.Extent.Text -notmatch '-linkPath \$CurrentDir\b' }).Count -eq 0) "Convert-LinkToFolder is only ever pointed at current\ ($($linkCalls.Count) call(s))"
+    $snapAssign = [regex]::Matches([IO.File]::ReadAllText($installer), '(?m)^\$(SnapCurrent|SnapTools)\s*=\s*Join-Path \$RollbackDir "(current|tools)"\s*$').Count
+    Assert-True ($snapAssign -eq 2 -and [IO.File]::ReadAllText($installer) -match '(?m)^\$RollbackDir\s*=\s*Join-Path \$BaseDir "rollback"\s*$') "the snapshot folders are rollback\current and rollback\tools under the bay root"
     $iText = [IO.File]::ReadAllText($installer)
     Assert-True ($iText -match '(?m)^\$CurrentDir\s*=\s*Join-Path \$BaseDir "current"' -and $iText -notmatch '(?i)agent-config') "the installer never names agent-config.json and current\ is a subfolder of the bay root"
 

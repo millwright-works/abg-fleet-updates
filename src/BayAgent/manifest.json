@@ -1,4 +1,5 @@
 {
-  "version": "1.2.1",
-  "releasedUtc": "2026-09-21T00:00:00Z"
+  "version": "1.3.1",
+  "releasedUtc": "2026-10-07T00:00:00Z",
+  "rollbackGuard": true
 }
