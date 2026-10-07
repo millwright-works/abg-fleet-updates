@@ -603,7 +603,9 @@ try {
         $sleeper = New-Ps51Process '-NoProfile -Command "Start-Sleep -Seconds 120 # Watch-BayAgentUpdate.ps1 stand-in"'
         Write-Json (Join-Path $e5bay "state\update-guard.json") ([ordered]@{ installId = $busyId; state = "watching"; pid = $sleeper.Id })
         $curBefore5 = Get-Tree (Join-Path $e5bay "current")
-        $e5 = Invoke-Update $uCopy $e5bay @("-RequestRestart", "-GuardTaskName", "AoC-ba131-test-unused")
+        # A unique, recorded task name: should the refusal ever fail (a mutation run), the install would register it.
+        $tn5 = "AoC-ba131-test-" + [guid]::NewGuid().ToString("N").Substring(0, 8); $tasks.Add($tn5)
+        $e5 = Invoke-Update $uCopy $e5bay @("-RequestRestart", "-GuardTaskName", $tn5)
         $r5 = Read-Json (Join-Path $e5bay "state\last-update-result.json")
         Assert-True ($e5.Exit -ne 0 -and $null -ne $r5 -and [string]$r5.stage -eq "guard-busy" -and (Test-TreeEqual $curBefore5 (Get-Tree (Join-Path $e5bay "current")))) "E5 an install while the previous install's guard is still watching is refused (guard-busy) and touches nothing ($([string]$r5.stage))"
         Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
