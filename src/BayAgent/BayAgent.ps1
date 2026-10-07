@@ -299,7 +299,17 @@ try {
 # by the bytes that ran, never by a version label.
 $AgentCodeSha256 = $null
 $AgentScriptPath = $PSCommandPath
-try { if ($AgentScriptPath) { $AgentCodeSha256 = (Get-FileHash -LiteralPath $AgentScriptPath -Algorithm SHA256).Hash.ToLowerInvariant() } } catch { }
+try {
+    # .NET directly, not Get-FileHash: a missing hash means no alive record, and no alive record means the update guard
+    # rolls back a healthy agent, so this must not depend on a module loading (MEASURED 2026-10-07: a 5.1 child started
+    # from PowerShell 7 inherits a PSModulePath on which Get-FileHash does not resolve).
+    if ($AgentScriptPath) {
+        $shaAlg = [System.Security.Cryptography.SHA256]::Create()
+        $shaFs = [System.IO.File]::OpenRead($AgentScriptPath)
+        try { $AgentCodeSha256 = ([BitConverter]::ToString($shaAlg.ComputeHash($shaFs)) -replace "-", "").ToLowerInvariant() }
+        finally { $shaFs.Dispose(); $shaAlg.Dispose() }
+    }
+} catch { }
 $AgentProcessStartUtc = (Get-Date).ToUniversalTime()
 
 Write-Log "BayAgent starting. pid=$PID. OrgUrl=$OrgUrl BayId=$BayId PollSec=$PollSec HeartbeatSec=$HeartbeatSec LogLevel=$Global:LogLevel Version=$AgentVersion ManifestVersion=$AgentManifestVersion TokenOnly=$TokenOnly Once=$Once" "INFO"
@@ -2015,8 +2025,9 @@ function Write-TextAtomic([string]$path, [string]$text) {
 
     try {
         if (Test-Path $path) {
-            # Atomic replace when the destination exists
-            [System.IO.File]::Replace($tmp, $path, $null, $true)
+            # Atomic replace when the destination exists. [NullString]::Value, not $null (1.3.1): $null reaches File.Replace
+            # as "" and it threw on every call, so this always took the non-atomic fallback below.
+            [System.IO.File]::Replace($tmp, $path, [NullString]::Value, $true)
         } else {
             Move-Item -Path $tmp -Destination $path -Force
         }
@@ -2553,7 +2564,9 @@ function Get-DisplayAdapterReport {
         for ($i = 0; $i -lt 16; $i++) {
             $ad = New-Object ABGWin32+DISPLAY_DEVICE
             $ad.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($ad)
-            if (-not [ABGWin32]::EnumDisplayDevices($null, [uint32]$i, [ref]$ad, 0)) { break }
+            # [NullString]::Value, not $null: PowerShell passes $null to a .NET string parameter as "", and
+            # EnumDisplayDevices("") enumerates nothing (MEASURED 2026-10-07: every call returned false).
+            if (-not [ABGWin32]::EnumDisplayDevices([NullString]::Value, [uint32]$i, [ref]$ad, 0)) { break }
             $mons = @()
             for ($j = 0; $j -lt 8; $j++) {
                 $md = New-Object ABGWin32+DISPLAY_DEVICE
@@ -3082,7 +3095,7 @@ function Save-EmergencyStopState {
         $tmp = "$path.tmp"
         [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
         try {
-            if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, $null, $true) }
+            if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, [NullString]::Value, $true) }
             else { [IO.File]::Move($tmp, $path) }
         } catch {
             # Overwrite in place; never remove the file, so a crash here still leaves a file (zero bytes reads ENGAGED).

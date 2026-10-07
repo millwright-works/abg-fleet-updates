@@ -77,7 +77,10 @@ function Write-GuardJson([string]$path, $obj) {
   if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   $tmp = "$path.tmp"
   [IO.File]::WriteAllText($tmp, ($obj | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
-  if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, $null, $true) }
+  # [NullString]::Value, not $null: PowerShell passes $null to a .NET string parameter as "", and File.Replace then
+  # throws "The path is not of a legal form" on every call (MEASURED 2026-10-07; the agent's own copies of this line had
+  # silently fallen back to a non-atomic overwrite since they were written).
+  if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, [NullString]::Value, $true) }
   else { [IO.File]::Move($tmp, $path) }
 }
 
@@ -112,9 +115,33 @@ function Compare-GuardTrees($expected, [hashtable]$actual, [switch]$AllowExtra) 
   return $diffs
 }
 
+function Sync-GuardTreeExact([string]$src, [string]$dst, [switch]$Mirror) {
+  # Every file of $src into $dst with the SAME BYTES: robocopy for the bulk (and, with -Mirror, removal of files $src
+  # lacks), then an explicit copy of any file whose hash still differs. robocopy keys "same" on size and time, and /IS
+  # was MEASURED (2026-10-07, Windows 11 26300) not to copy a same-size, same-time file: the 1.3.0 manifest defect.
+  try {
+    if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null }
+    $mode = $(if ($Mirror) { "/MIR" } else { "/E" })
+    $p = Start-Process -FilePath "robocopy.exe" -ArgumentList (@($src, $dst, $mode, "/IS", "/IT", "/IM", "/R:5", "/W:2", "/NP", "/NJH", "/NJS")) -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -ge 8) { return @{ ok = $false; detail = ("robocopy exit code {0}" -f $p.ExitCode) } }
+    $srcFull = (Get-Item -LiteralPath $src -Force).FullName.TrimEnd('\')
+    $dstFull = (Get-Item -LiteralPath $dst -Force).FullName.TrimEnd('\')
+    foreach ($f in @(Get-ChildItem -LiteralPath $src -Recurse -File -Force)) {
+      $target = Join-Path $dstFull ($f.FullName.Substring($srcFull.Length).TrimStart('\'))
+      if ((Test-Path -LiteralPath $target) -and ((Get-GuardSha $target) -eq (Get-GuardSha $f.FullName))) { continue }
+      $tdir = Split-Path -Parent $target
+      if (-not (Test-Path -LiteralPath $tdir)) { New-Item -ItemType Directory -Force -Path $tdir | Out-Null }
+      [IO.File]::Copy($f.FullName, $target, $true)
+    }
+    return @{ ok = $true; detail = "" }
+  } catch { return @{ ok = $false; detail = $_.Exception.Message } }
+}
+
 function Test-AgentAliveConfirmed([string]$expectedSha, [DateTime]$sinceUtc, [int]$soakSeconds) {
   # The proof that the code we put in place came back: an alive record for exactly those bytes, first written after
   # $sinceUtc, refreshed at least $soakSeconds later by the same process. Anything unreadable is "not yet".
+  # Compared at whole seconds: the record's times are written to the second.
+  $sinceUtc = $sinceUtc.AddTicks(-($sinceUtc.Ticks % [TimeSpan]::TicksPerSecond))
   $rec = Read-GuardJson (Join-Path $BaseDir "state\agent-alive.json")
   if ($null -eq $rec) { return $false }
   try {
@@ -197,14 +224,12 @@ function Invoke-GuardRollback([string]$why) {
     $it = Get-Item -LiteralPath $cur -Force
     if (($it.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [IO.Directory]::Delete($cur, $false) }
   }
-  $robo = @("/MIR", "/IS", "/IT", "/R:5", "/W:2", "/NP", "/NJH", "/NJS")
-  $p = Start-Process -FilePath "robocopy.exe" -ArgumentList (@($snapCur, $cur) + $robo) -Wait -PassThru -NoNewWindow
-  if ($p.ExitCode -ge 8) { return @{ ok = $false; detail = ("robocopy of current\ failed with exit code {0}" -f $p.ExitCode) } }
+  $s1 = Sync-GuardTreeExact -src $snapCur -dst $cur -Mirror
+  if (-not $s1.ok) { return @{ ok = $false; detail = ("restoring current\ failed: " + $s1.detail) } }
   $tools = Join-Path $BaseDir "tools"
   if (Test-Path -LiteralPath $snapTools) {
-    $robo2 = @("/E", "/IS", "/IT", "/R:5", "/W:2", "/NP", "/NJH", "/NJS")
-    $p2 = Start-Process -FilePath "robocopy.exe" -ArgumentList (@($snapTools, $tools) + $robo2) -Wait -PassThru -NoNewWindow
-    if ($p2.ExitCode -ge 8) { return @{ ok = $false; detail = ("robocopy of tools\ failed with exit code {0}" -f $p2.ExitCode) } }
+    $s2 = Sync-GuardTreeExact -src $snapTools -dst $tools
+    if (-not $s2.ok) { return @{ ok = $false; detail = ("restoring tools\ failed: " + $s2.detail) } }
   }
   $d1 = @(Compare-GuardTrees $snap.current (Get-GuardTreeHashes $cur))
   $d1 += @(Compare-GuardTrees $snap.tools (Get-GuardTreeHashes $tools) -AllowExtra)
@@ -339,6 +364,9 @@ try {
   }
 
   $why = $(if ($outcome -eq "confirmed") { "rollback drill: the new agent confirmed, rolled back on purpose" } else { "the new agent did not prove itself back within {0} s of reachable time" -f $timeout })
+  # Taken BEFORE the restore and its restart request: the restored agent can only start after this instant, and an
+  # alive record from before it (the old code running before the install) must not count.
+  $rbSince = Get-GuardUtcNow
   Write-GuardState "rolling-back" $why
   $rb = Invoke-GuardRollback $why
   if (-not $rb.ok) { Complete-Guard "rollback-failed" ("{0}; {1}" -f $why, $rb.detail); exit 0 }
@@ -348,7 +376,6 @@ try {
   # means "cannot tell", not "failed"; nothing more is attempted either way.
   $snapSha = [string]$script:Pending.snapshotAgentSha256
   $script:ReachableSeconds = 0.0
-  $rbSince = Get-GuardUtcNow
   if ($snapSha -match '^[0-9a-fA-F]{64}$') {
     $o2 = Wait-ForConfirmation -expectedSha $snapSha -sinceUtc $rbSince -timeoutReachable $timeout -soak $soak -maxWait $maxWait -label "restored agent"
     if ($o2 -eq "confirmed") { Complete-Guard "rollback-confirmed" ("{0}; the restored agent ({1}) came back" -f $why, $snapSha) }

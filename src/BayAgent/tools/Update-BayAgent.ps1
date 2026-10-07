@@ -50,16 +50,18 @@ REMOTE INSTALL WITH NOBODY ON SITE (1.3.1, A0.437)
   1. EVERY FILE IS COPIED, AND current\ IS VERIFIED BY HASH. Through 1.3.0 promotion used robocopy /MIR, which
      skips a file whose size and time match. The reproducible build gives every zip entry one fixed time and
      two releases' manifest.json were both 68 bytes, so 1.3.0 installed on Bay 1 and kept REPORTING 1.2.1.
-     Promotion now copies unconditionally (/IS /IT) and the run is ok only if every file in current\ (and
-     every shipped tools\ file) hashes equal to releases\<version>.
+     Promotion now copies every file whose bytes differ (robocopy, then an explicit copy of anything it left: /IS
+     alone was MEASURED not to copy a same-size, same-time file) and the run is ok only if every file in current\
+     (and every shipped tools\ file) hashes equal to releases\<version>.
   2. A SNAPSHOT OF WHAT IS RUNNING IS TAKEN FIRST (rollback\current, rollback\tools, rollback\snapshot.json,
      hash-verified). It is local and already signed, so a rollback needs no download and no live agent.
   3. current\ IS NEVER A LINK WHEN IT IS WRITTEN. ABG.ReleaseFinalize.ps1 can make current\ a junction to
      releases\<v>; a /MIR into it would overwrite that release, the very copy a rollback needs. The link is
      removed NON-recursively (the target is never touched) and replaced by a real folder first.
   4. A ROLLBACK GUARD WATCHES THE NEW AGENT (tools\Watch-BayAgentUpdate.ps1, launched from the snapshot so the
-     package being installed cannot change it). It runs OUTSIDE the agent's scheduled task (its own per-user
-     task, falling back to WMI), because restarting the agent ends that task and everything in it. It must
+     package being installed cannot change it). It runs OUTSIDE the agent's process tree and scheduled task (its
+     own per-user task, falling back to WMI): the restart that brings the new agent up ends \ABG Bay Agent and
+     stops processes by command line, and the guard's at-logon trigger re-arms it if the bay reboots. It must
      confirm it is armed before anything is promoted; if it cannot arm, nothing is promoted and the run fails
      with stage "guard". If the new code does not prove itself back (an alive record carrying the hash of the
      script that ran, see BayAgent.ps1 Update-AgentAliveRecord) within -ConfirmTimeoutSeconds of time in which
@@ -351,7 +353,10 @@ function Write-JsonFileAtomic([string]$path, $obj) {
   Ensure-Dir (Split-Path -Parent $path)
   $tmp = "$path.tmp"
   [IO.File]::WriteAllText($tmp, ($obj | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
-  if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, $null, $true) }
+  # [NullString]::Value, not $null: PowerShell passes $null to a .NET string parameter as "", and File.Replace then
+  # throws "The path is not of a legal form" on every call (MEASURED 2026-10-07; the agent's own copies of this line had
+  # silently fallen back to a non-atomic overwrite since they were written).
+  if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, [NullString]::Value, $true) }
   else { [IO.File]::Move($tmp, $path) }
 }
 
@@ -381,6 +386,30 @@ function Compare-TreeHashes([hashtable]$expected, [hashtable]$actual, [switch]$A
   return $diffs
 }
 
+function Sync-TreeExact([string]$src, [string]$dst, [switch]$Mirror) {
+  # Make every file of $src present in $dst with the SAME BYTES. robocopy does the bulk (and, with -Mirror, removes
+  # files $src does not have); then any file whose hash still differs is copied explicitly.
+  # WHY THE SECOND STEP: robocopy decides "same" from size and time, and /IS ("include same files") does NOT make it
+  # copy such a file. MEASURED 2026-10-07 on Windows 11 (26300): a same-size, same-time file with different bytes
+  # stayed as it was under /MIR /IS /IT and /E /IS /IT (it copied only with /IM, which keys on the NTFS change time).
+  # That is F1 exactly, so the fix cannot rest on a robocopy flag; the callers verify by hash afterwards as well.
+  $mode = $(if ($Mirror) { "/MIR" } else { "/E" })
+  Invoke-Robo $src $dst @($mode, "/IS", "/IT", "/IM", "/R:5", "/W:2", "/NP") | Out-Null
+  $srcFull = (Get-Item -LiteralPath $src -Force).FullName.TrimEnd('\')
+  $dstFull = (Get-Item -LiteralPath $dst -Force).FullName.TrimEnd('\')
+  $fixed = 0
+  foreach ($f in @(Get-ChildItem -LiteralPath $src -Recurse -File -Force)) {
+    $rel = $f.FullName.Substring($srcFull.Length).TrimStart('\')
+    $target = Join-Path $dstFull $rel
+    if ((Test-Path -LiteralPath $target) -and ((Get-Sha $target) -eq (Get-Sha $f.FullName))) { continue }
+    Ensure-Dir (Split-Path -Parent $target)
+    [IO.File]::Copy($f.FullName, $target, $true)
+    $fixed++
+  }
+  if ($fixed -gt 0) { Write-Log ("Copied {0} file(s) robocopy left unchanged into {1}" -f $fixed, $dst) }
+  return $fixed
+}
+
 function Test-IsLink([string]$path) {
   if (-not (Test-Path -LiteralPath $path)) { return $false }
   $it = Get-Item -LiteralPath $path -Force
@@ -398,7 +427,7 @@ function Convert-LinkToFolder([string]$linkPath, [string]$fillFrom) {
   [IO.Directory]::Delete($linkPath, $false)
   if (Test-Path -LiteralPath $linkPath) { throw "could not remove the link at $linkPath" }
   Ensure-Dir $linkPath
-  Invoke-Robo $fillFrom $linkPath @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+  [void](Sync-TreeExact -src $fillFrom -dst $linkPath -Mirror)
   $d = @(Compare-TreeHashes (Get-TreeHashes $fillFrom) (Get-TreeHashes $linkPath))
   if ($d.Count -gt 0) { throw ("current\ rebuilt from the snapshot does not match it: " + ($d -join "; ")) }
   return $true
@@ -428,9 +457,10 @@ function Get-UpdateGuardArguments([string]$guardScript, [string]$installId, [str
 
 function Start-UpdateGuard([string]$guardScript, [string]$installId) {
   # Launch the guard OUTSIDE this process tree. The agent is restarted by HostWatchdog ending the \ABG Bay Agent
-  # scheduled task, and ending a task ends every process in it -- this updater, and anything it starts the plain
-  # way. First choice: a per-user scheduled task (its own job; an at-logon trigger re-arms it after a reboot).
-  # Fallback: WMI Win32_Process.Create (the process belongs to the WMI host, not to our job).
+  # scheduled task and stopping processes by command line, so the guard must belong to neither. MEASURED 2026-10-07
+  # (Windows 11 26300, tests\BayAgent.UpdateGuard.Tests.ps1 K): ending a task did NOT stop a plain child it had
+  # started, but nothing here relies on that either way. First choice: a per-user scheduled task (its own task; an
+  # at-logon trigger re-arms it after a reboot). Fallback: WMI Win32_Process.Create (a child of the WMI host).
   $psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
   $argLine = Get-UpdateGuardArguments $guardScript $installId $GuardTaskName
   $errors = @()
@@ -468,10 +498,10 @@ function Wait-GuardArmed([string]$installId, [int]$timeoutSec) {
 function Restore-FromSnapshot([string]$snapCurrent, [string]$snapTools) {
   # Put back exactly what was running before this run touched current\. Returns the differences left (empty = ok).
   if (Test-IsLink $CurrentDir) { [IO.Directory]::Delete($CurrentDir, $false) }
-  Invoke-Robo $snapCurrent $CurrentDir @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+  [void](Sync-TreeExact -src $snapCurrent -dst $CurrentDir -Mirror)
   $d = @(Compare-TreeHashes (Get-TreeHashes $snapCurrent) (Get-TreeHashes $CurrentDir))
   if (Test-Path -LiteralPath $snapTools) {
-    Invoke-Robo $snapTools $ToolsDir @("/E", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+    [void](Sync-TreeExact -src $snapTools -dst $ToolsDir)
     $d += @(Compare-TreeHashes (Get-TreeHashes $snapTools) (Get-TreeHashes $ToolsDir) -AllowExtra)
   }
   return $d
@@ -566,14 +596,14 @@ if (Test-Path -LiteralPath (Join-Path $CurrentDir "BayAgent.ps1")) {
   Write-Log "Snapshotting current\ and tools\ into $RollbackDir"
   if (Test-IsLink $RollbackDir) { [IO.Directory]::Delete($RollbackDir, $false) }
   Ensure-Dir $RollbackDir
-  Invoke-Robo $CurrentDir $SnapCurrent @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+  [void](Sync-TreeExact -src $CurrentDir -dst $SnapCurrent -Mirror)
   $curMapBefore = Get-TreeHashes $CurrentDir
   $snapCurMap = Get-TreeHashes $SnapCurrent
   $d1 = @(Compare-TreeHashes $curMapBefore $snapCurMap)
   if ($d1.Count -gt 0) { throw ("the snapshot of current\ does not match it: " + ($d1 -join "; ")) }
   $snapToolsMap = @{}
   if (Test-Path -LiteralPath $ToolsDir) {
-    Invoke-Robo $ToolsDir $SnapTools @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+    [void](Sync-TreeExact -src $ToolsDir -dst $SnapTools -Mirror)
     $snapToolsMap = Get-TreeHashes $SnapTools
     $d2 = @(Compare-TreeHashes (Get-TreeHashes $ToolsDir) $snapToolsMap)
     if ($d2.Count -gt 0) { throw ("the snapshot of tools\ does not match it: " + ($d2 -join "; ")) }
@@ -701,14 +731,14 @@ function Set-PendingPhase([string]$phase) {
 }
 
 # ---- Promote release -> current only after signing succeeded ----
-# Every file is copied (/IS /IT): /MIR alone skips a file whose size and time match, which is how 1.3.0 kept a
-# 1.2.1 manifest.json (F1). Then current\ must hash equal to the release, file for file, or the run is not ok.
+# Every file is made byte-equal (Sync-TreeExact): /MIR alone skips a file whose size and time match, which is how 1.3.0
+# kept a 1.2.1 manifest.json (F1). Then current\ must hash equal to the release, file for file, or the run is not ok.
 $script:Stage = "promote"
 Set-PendingPhase "promoting"
 Write-Log "Promoting SIGNED release -> current ($CurrentDir)"
 $promoteError = $null
 try {
-  Invoke-Robo $relDir $CurrentDir @("/MIR", "/IS", "/IT", "/R:5", "/W:2", "/NP") | Out-Null
+  [void](Sync-TreeExact -src $relDir -dst $CurrentDir -Mirror)
   $curDiff = @(Compare-TreeHashes $relMap (Get-TreeHashes $CurrentDir))
   if ($curDiff.Count -gt 0) { $promoteError = ("current\ does not match releases\{0} after promotion: {1}" -f $Version, ($curDiff -join "; ")) }
 } catch { $promoteError = ("promotion failed: " + $_.Exception.Message) }
@@ -742,9 +772,8 @@ if (Test-Path -LiteralPath $pkgTools) {
   $destTools = Join-Path $BaseDir "tools"
   Ensure-Dir $destTools
   Write-Log "Package includes tools/ -- merging into $destTools"
-  # /E = copy subdirs including empty; no /MIR to avoid deleting scripts not in the package.
-  # /IS /IT = copy every shipped file even when size and time match (the same skip that kept the old manifest).
-  Invoke-Robo $pkgTools $destTools @("/E", "/IS", "/IT", "/R:5", "/W:2", "/NP") | Out-Null
+  # /E (no -Mirror) so scripts not in the package are not deleted; every shipped file made byte-equal (Sync-TreeExact).
+  [void](Sync-TreeExact -src $pkgTools -dst $destTools)
   $toolDiff = @(Compare-TreeHashes (Get-TreeHashes $pkgTools) (Get-TreeHashes $destTools) -AllowExtra)
   if ($toolDiff.Count -gt 0) { throw ("tools\ does not match the package after the merge: " + ($toolDiff -join "; ")) }
   Write-Log "Tools merge complete and verified."

@@ -207,8 +207,14 @@ try {
     # 1.3.1 (A0.437) adds the rollback snapshot (rollback\current, rollback\tools), the restore of that snapshot into
     # current\ and tools\ ($ToolsDir), and the link-to-folder rebuild of current\ ($linkPath). Still an EXACT set: a new
     # destination fails here until someone decides it is safe, and Convert-LinkToFolder is pinned to current\ below.
-    $allowedDests = @('$relDir', '$CurrentDir', '$destTools', '$ToolsDir', '$SnapCurrent', '$SnapTools', '$linkPath')
-    Assert-True ($roboCalls.Count -ge 3 -and @($dests | Where-Object { $_ -notin $allowedDests }).Count -eq 0) "every installer copy lands in releases\<v>, current\, tools\ or the rollback snapshot (destinations: $($dests -join ', '))"
+    # Since 1.3.1 every tree copy but the staging one goes through Sync-TreeExact (robocopy, then an explicit copy of any
+    # file whose bytes still differ), whose own robocopy writes to its -dst parameter. So: robocopy writes only to
+    # releases\<v> or to Sync-TreeExact's $dst, and every Sync-TreeExact -dst is in the exact set.
+    $allowedDests = @('$CurrentDir', '$destTools', '$ToolsDir', '$SnapCurrent', '$SnapTools', '$linkPath')
+    Assert-True ($roboCalls.Count -eq 2 -and @($dests | Where-Object { $_ -notin @('$relDir', '$dst') }).Count -eq 0) "robocopy writes only to releases\<v> (staging) or inside Sync-TreeExact (destinations: $($dests -join ', '))"
+    $syncCalls = @($iAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Sync-TreeExact" }, $true))
+    $syncDests = @($syncCalls | ForEach-Object { $m = [regex]::Match($_.Extent.Text, '-dst\s+(\$\w+)'); if ($m.Success) { $m.Groups[1].Value } else { "(no -dst)" } })
+    Assert-True ($syncCalls.Count -ge 6 -and @($syncDests | Where-Object { $_ -notin $allowedDests }).Count -eq 0) "every installer tree copy lands in current\, tools\ or the rollback snapshot (Sync-TreeExact destinations: $($syncDests -join ', '))"
     $linkCalls = @($iAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Convert-LinkToFolder" }, $true))
     Assert-True ($linkCalls.Count -ge 1 -and @($linkCalls | Where-Object { $_.Extent.Text -notmatch '-linkPath \$CurrentDir\b' }).Count -eq 0) "Convert-LinkToFolder is only ever pointed at current\ ($($linkCalls.Count) call(s))"
     $snapAssign = [regex]::Matches([IO.File]::ReadAllText($installer), '(?m)^\$(SnapCurrent|SnapTools)\s*=\s*Join-Path \$RollbackDir "(current|tools)"\s*$').Count
