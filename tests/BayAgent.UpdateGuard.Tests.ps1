@@ -39,11 +39,12 @@ WHY THIS EXISTS
 RUN (from the repo root; Windows only)
   powershell -NoProfile -ExecutionPolicy Bypass -File tests\BayAgent.UpdateGuard.Tests.ps1
   -SkipTaskTests skips E and K (they register per-user scheduled tasks named AoC-ba131-test-*; both are removed).
+  -Only G,F,J,N,U,E runs only those sections (E includes K); the setup always runs. For mutation runs.
 
 Exit code 0 = all assertions passed. Hyphens only in comments.
 #>
 [CmdletBinding()]
-param([switch]$SkipTaskTests)
+param([switch]$SkipTaskTests, [string]$Only = "")
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -60,6 +61,7 @@ function Assert-True([bool]$cond, [string]$msg) {
     else { $script:Fail++; $script:Failures += $msg; Write-Host "  FAIL  $msg" -ForegroundColor Red }
 }
 function Section([string]$name) { Write-Host ""; Write-Host "== $name" -ForegroundColor Cyan }
+function Want([string]$s) { return ([string]::IsNullOrWhiteSpace($Only) -or (@($Only -split ',' | ForEach-Object { $_.Trim() }) -contains $s)) }
 
 if (-not $IsWin) {
     Write-Host "SKIP: the updater and the guard are Windows-only (robocopy, Authenticode, scheduled tasks)"
@@ -213,7 +215,12 @@ try {
         return [pscustomobject]@{ Done = $done; Exit = $(if ($done) { $p.ExitCode } else { -1 }); Out = $so.Result; Err = $se.Result }
     }
 
+    $oldUpdater = Join-Path $tmp "Update-BayAgent-1.3.0.ps1"
+    $oldText = (& git -C $RepoRoot show "514ad6d17560cc459af8930440f480373e357dda:src/BayAgent/tools/Update-BayAgent.ps1") -join "`r`n"
+    [IO.File]::WriteAllText($oldUpdater, $oldText + "`r`n", (New-Object Text.UTF8Encoding($false)))
+
     # ============================================================ G static
+    if (Want "G") {
     Section "G static: build gates, package contents, guard command line vs the kill patterns"
     $zipEntries = @()
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -259,11 +266,11 @@ try {
     $gText = [IO.File]::ReadAllText($Guard)
     Assert-True ($gText -notmatch '(?i)clientSecret|Get-ClientSecret|ProtectedData|Cert:\\') "the guard touches no credential"
 
+    }
+
     # ============================================================ F F1 regression
+    if (Want "F") {
     Section "F F1: the stale same-size, same-time manifest"
-    $oldUpdater = Join-Path $tmp "Update-BayAgent-1.3.0.ps1"
-    $oldText = (& git -C $RepoRoot show "514ad6d17560cc459af8930440f480373e357dda:src/BayAgent/tools/Update-BayAgent.ps1") -join "`r`n"
-    [IO.File]::WriteAllText($oldUpdater, $oldText + "`r`n", (New-Object Text.UTF8Encoding($false)))
     $bayF0 = New-Bay "bayF0"
     $f0 = Invoke-Update $oldUpdater $bayF0
     $manAfterOld = Read-Json (Join-Path $bayF0 "current\manifest.json")
@@ -287,7 +294,9 @@ try {
     $uLinesV = [IO.File]::ReadAllLines($Updater)
     $copyLine = "    [IO.File]::Copy(`$f.FullName, `$target, `$true)"
     $roboLine = '  Invoke-Robo $src $dst @($mode, "/IS", "/IT", "/IM", "/R:5", "/W:2", "/NP") | Out-Null'
-    if (@($uLinesV | Where-Object { $_ -eq $copyLine }).Count -ne 1 -or @($uLinesV | Where-Object { $_ -eq $roboLine }).Count -ne 1) { throw "the copy lines were not found exactly once in the updater" }
+    $f2Ok = (@($uLinesV | Where-Object { $_ -eq $copyLine }).Count -eq 1 -and @($uLinesV | Where-Object { $_ -eq $roboLine }).Count -eq 1)
+    Assert-True $f2Ok "(harness) the two copy lines F2 rewrites are each in the updater exactly once"
+    if ($f2Ok) {
     $vLines = @($uLinesV | ForEach-Object { if ($_ -eq $copyLine) { "    # explicit copy disabled for the verify test" } elseif ($_ -eq $roboLine) { $_.Replace(', "/IM"', '') } else { $_ } })
     $vDiff = 0; for ($i = 0; $i -lt $uLinesV.Count; $i++) { if ($uLinesV[$i] -ne $vLines[$i]) { $vDiff++ } }
     Assert-True ($vDiff -eq 2) "(sanity) the verify-test updater differs from the shipped one in exactly two lines"
@@ -299,8 +308,26 @@ try {
     $res2 = Read-Json (Join-Path $bayF2 "state\last-update-result.json")
     Assert-True ($f2.Exit -ne 0 -and $null -ne $res2 -and $res2.ok -eq $false -and [string]$res2.stage -eq "verify" -and [string]$res2.reason -match "different manifest\.json") "F2 a promotion that leaves a stale file fails at 'verify' and names the file ($(if ($res2) { [string]$res2.reason }))"
     Assert-True ($null -ne $res2 -and ($res2.PSObject.Properties.Name -contains "restored") -and $res2.restored -eq $true -and (Test-TreeEqual $curBeforeF2 (Get-Tree (Join-Path $bayF2 "current")))) "F2 ...and current\ is restored, byte for byte, to what was running"
+    }
+
+    # F3: the explicit copy step does the work when robocopy will not. ONE line changed: /IM dropped, so robocopy alone
+    # skips the same-size, same-time manifest exactly as on F1's bay; the install must still succeed byte-exact.
+    $uLinesW = [IO.File]::ReadAllLines($Updater)
+    $roboLine3 = '  Invoke-Robo $src $dst @($mode, "/IS", "/IT", "/IM", "/R:5", "/W:2", "/NP") | Out-Null'
+    if (@($uLinesW | Where-Object { $_ -eq $roboLine3 }).Count -eq 1) {
+        $wLines = @($uLinesW | ForEach-Object { if ($_ -eq $roboLine3) { $_.Replace(', "/IM"', '') } else { $_ } })
+        $uNoIm = Join-Path $tmp "Update-BayAgent.noim.ps1"
+        [IO.File]::WriteAllText($uNoIm, (($wLines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        $bayF3 = New-Bay "bayF3"
+        $f3 = Invoke-Update $uNoIm $bayF3 @("-NoRollbackGuard")
+        $res3 = Read-Json (Join-Path $bayF3 "state\last-update-result.json")
+        $man3 = Read-Json (Join-Path $bayF3 "current\manifest.json")
+        Assert-True ($f3.Exit -eq 0 -and $null -ne $res3 -and $res3.ok -eq $true -and $null -ne $man3 -and [string]$man3.version -eq $Ver -and (Test-TreeEqual (Get-Tree (Join-Path $bayF3 "releases\$Ver")) (Get-Tree (Join-Path $bayF3 "current")))) "F3 with robocopy limited to /IS /IT (which skips the manifest) the explicit copy still makes current\ byte-exact ($(if ($res3) { [string]$res3.stage + ': ' + [string]$res3.reason }))"
+    } else { Assert-True $false "(harness) the robocopy line F3 rewrites is in the updater exactly once" }
+    }
 
     # ============================================================ J R-D junction
+    if (Want "J") {
     Section "J R-D: current\ is a junction into releases\1.2.1"
     $bayJ0 = New-Bay "bayJ0" -Junction
     $relBefore0 = Get-Tree (Join-Path $bayJ0 "releases\1.2.1")
@@ -315,7 +342,10 @@ try {
     Assert-True (Test-TreeEqual $relBefore (Get-Tree (Join-Path $bayJ1 "rollback\current"))) "the snapshot holds what the junction pointed at"
     if ($links.Contains((Join-Path $bayJ1 "current"))) { [void]$links.Remove((Join-Path $bayJ1 "current")) }
 
+    }
+
     # ============================================================ N a guard that never arms
+    if (Want "N") {
     Section "N a guard that never arms: nothing is promoted"
     $bayN = New-Bay "bayN" -GuardStub "# a guard that never says it is armed`r`nexit 0`r`n"
     $curBeforeN = Get-Tree (Join-Path $bayN "current")
@@ -330,7 +360,10 @@ try {
     $tn = $null; try { $tn = Get-ScheduledTask -TaskName $taskN -ErrorAction Stop } catch { }
     Assert-True ($null -eq $tn) "the guard task it registered is removed"
 
+    }
+
     # ============================================================ U guard rules, one at a time (direct runs)
+    if (Want "U") {
     Section "U guard rules (Watch-BayAgentUpdate.ps1 run directly against a sandbox)"
     function New-GuardBay([string]$name, [switch]$CurrentJunction) {
         $bay = New-Bay $name
@@ -462,16 +495,19 @@ try {
     [void]$gp.WaitForExit(90000)
     Assert-True ($null -ne $rolledAt -and $rolledAt -lt 15) "U12 a restarted guard resumes from 28 of 30 reachable seconds instead of starting over (rolled back after $(if ($rolledAt) { [int]$rolledAt } else { 'never' }) s)"
 
+    }
+
     # ============================================================ E + K: the updater and the guard together
-    if ($SkipTaskTests) {
-        Write-Host ""; Write-Host "  SKIP  E and K (-SkipTaskTests)"
+    $eNeedleOk = (@([IO.File]::ReadAllLines($Updater) | Where-Object { $_.Contains("'-NoProfile -NonInteractive -WindowStyle Hidden -File") }).Count -eq 1)
+    if ((Want "E") -and -not $SkipTaskTests -and -not $eNeedleOk) { Assert-True $false "(harness) the guard argument line E rewrites is in the updater exactly once" }
+    if ($SkipTaskTests -or -not (Want "E") -or -not $eNeedleOk) {
+        Write-Host ""; Write-Host "  SKIP  E and K (-SkipTaskTests, -Only, or the harness line is missing)"
     } else {
         Section "E end to end: the updater arms the real guard in its own scheduled task"
         # The ONE-line change: the sandbox guard is unsigned, so its argument line gets -ExecutionPolicy Bypass.
         $uLines = [IO.File]::ReadAllLines($Updater)
         $needle = "'-NoProfile -NonInteractive -WindowStyle Hidden -File"
         $hits = @($uLines | Where-Object { $_.Contains($needle) })
-        if ($hits.Count -ne 1) { throw "the guard argument line was not found exactly once in the updater" }
         $uCopy = Join-Path $tmp "Update-BayAgent.e2e.ps1"
         $cLines = @($uLines | ForEach-Object { $_.Replace($needle, "'-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File") })
         [IO.File]::WriteAllText($uCopy, (($cLines -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
