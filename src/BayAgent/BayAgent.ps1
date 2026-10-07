@@ -273,20 +273,36 @@ if ($cfg.PSObject.Properties.Name -contains "heartbeatSeconds" -and $cfg.heartbe
     if ($script:HeartbeatSec -lt 15) { $script:HeartbeatSec = 15 } # floor to avoid accidental thrash
 }
 
-# Release version (prefer manifest.json next to this script)
-$AgentVersion = "dev"
+# Release version. THE CODE CARRIES ITS OWN VERSION (1.3.1).
+# Through 1.3.0 the reported version was read from manifest.json next to this script. MEASURED on Bay 1,
+# 2026-10-07: 1.3.0 installed, ran (its heartbeat carried emergencyStop, which only 1.3.0 writes) and reported
+# "1.2.1" everywhere, because the updater's robocopy /MIR skipped manifest.json (same size, same fixed zip time).
+# A label read from a side file is only as true as the copy that placed it. So the version is a constant in the
+# file that runs, the build refuses a package whose manifest disagrees with it, and the manifest's own value is
+# reported next to it (manifestVersion) so a stale copy is visible instead of believed.
+$AgentCodeVersion = "1.3.1"
+$AgentVersion = $AgentCodeVersion
+$AgentManifestVersion = $null
 
 try {
     $manifestPath = Join-Path $PSScriptRoot "manifest.json"
     if (Test-Path $manifestPath) {
         $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
-        if ($m -and $m.version) { $AgentVersion = [string]$m.version }
+        if ($m -and $m.version) { $AgentManifestVersion = [string]$m.version }
     }
 } catch {
-    # If manifest read fails, keep "dev" and continue
+    # An unreadable manifest is reported as null; the code version above still stands.
 }
 
-Write-Log "BayAgent starting. pid=$PID. OrgUrl=$OrgUrl BayId=$BayId PollSec=$PollSec HeartbeatSec=$HeartbeatSec LogLevel=$Global:LogLevel Version=$AgentVersion TokenOnly=$TokenOnly Once=$Once" "INFO"
+# The hash of the file this process is running, taken ONCE at startup (a later update rewrites the file under a
+# running process). The rollback guard compares it with the hash it promoted: "the new code came back" is proven
+# by the bytes that ran, never by a version label.
+$AgentCodeSha256 = $null
+$AgentScriptPath = $PSCommandPath
+try { if ($AgentScriptPath) { $AgentCodeSha256 = (Get-FileHash -LiteralPath $AgentScriptPath -Algorithm SHA256).Hash.ToLowerInvariant() } } catch { }
+$AgentProcessStartUtc = (Get-Date).ToUniversalTime()
+
+Write-Log "BayAgent starting. pid=$PID. OrgUrl=$OrgUrl BayId=$BayId PollSec=$PollSec HeartbeatSec=$HeartbeatSec LogLevel=$Global:LogLevel Version=$AgentVersion ManifestVersion=$AgentManifestVersion TokenOnly=$TokenOnly Once=$Once" "INFO"
 
 # ---------------- Dataverse schema (your verified names) ----------------
 $BayCommandEntitySet = "build_baycommands"
@@ -1403,6 +1419,245 @@ function Get-EmergencyStopCapability {
     }
 }
 
+# ---------------- Remote state report (1.3.1, A0.437) ----------------
+# Kevin, 2026-10-07: "I don't like that you need me to be at the Bay PC in order to update the BayAgent." The 1.3.0
+# remote install could only INFER three things: where windows landed, whether self-heal was off (the local config
+# cannot be read remotely) and which code was running (the version label lied, F1). These functions put those facts
+# where the platform already reads: build_agentcapabilitiesjson on the bay row (30000 chars), refreshed on demand by
+# a DisplayTopology command or a HealthCheck with payload {"report":true}.
+
+function Invoke-ReportPart([scriptblock]$Part) {
+    # One failing part of the report must not take the rest down (a failed capabilities build falls back to the
+    # small partial document and loses everything else).
+    try { return (& $Part) } catch { return [ordered]@{ error = $_.Exception.Message } }
+}
+
+function Get-StateJsonSummary([string]$Name, [int]$MaxChars = 1500) {
+    # A small state file under state\, returned parsed; $null when absent, a marker when unreadable or too large.
+    $p = Join-Path $BaseDir ("state\" + $Name)
+    if (-not (Test-Path -LiteralPath $p)) { return $null }
+    try {
+        $t = [IO.File]::ReadAllText($p)
+        if ($t.Length -gt $MaxChars) { return [ordered]@{ unreadable = "larger than $MaxChars chars" } }
+        return ($t | ConvertFrom-Json)
+    } catch { return [ordered]@{ unreadable = $_.Exception.Message } }
+}
+
+function Get-AgentInstallFacts {
+    # Which code is running, and the shape of the install the next update and the rollback guard will act on.
+    $i = [ordered]@{
+        codeVersion         = $AgentCodeVersion
+        manifestVersion     = $AgentManifestVersion
+        manifestMatchesCode = ([string]$AgentManifestVersion -eq [string]$AgentCodeVersion)
+        codeSha256          = $AgentCodeSha256
+        scriptPath          = $AgentScriptPath
+        pid                 = $PID
+        processStartUtc     = $AgentProcessStartUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+    try {
+        $cur = Join-Path $BaseDir "current"
+        $it = Get-Item -LiteralPath $cur -Force -ErrorAction Stop
+        $isLink = (($it.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $i["currentIsLink"] = $isLink
+        if ($isLink) { try { $i["currentLinkTarget"] = (@($it.Target) -join ";") } catch { $i["currentLinkTarget"] = "unreadable" } }
+    } catch { $i["currentError"] = $_.Exception.Message }
+    try {
+        $rel = Join-Path $BaseDir "releases"
+        if (Test-Path -LiteralPath $rel) { $i["releases"] = @(Get-ChildItem -LiteralPath $rel -Directory -ErrorAction Stop | Sort-Object Name | Select-Object -Last 12 | ForEach-Object { $_.Name }) }
+    } catch { }
+    try {
+        $snapPath = Join-Path $BaseDir "rollback\snapshot.json"
+        if (Test-Path -LiteralPath $snapPath) {
+            $snap = [IO.File]::ReadAllText($snapPath) | ConvertFrom-Json
+            $i["rollbackSnapshot"] = [ordered]@{
+                takenUtc        = $snap.takenUtc
+                agentSha256     = $snap.agentSha256
+                manifestVersion = $snap.manifestVersion
+                forInstall      = $snap.forVersion
+            }
+        } else { $i["rollbackSnapshot"] = $null }
+    } catch { $i["rollbackSnapshot"] = [ordered]@{ unreadable = $_.Exception.Message } }
+    $i["updateGuard"] = (Get-StateJsonSummary "update-guard.json")
+    return $i
+}
+
+function Get-LocalConfigFacts {
+    # The effective settings this process runs with, as an ALLOWLIST (no credential, id, secret or path to one).
+    # $cfg is what this process loaded at start, after the platform overlay (Apply-EffectiveConfigToRuntime);
+    # selfHeal is read from the LOCAL file only, exactly as Read-SelfHealSettings decides it.
+    $f = [ordered]@{ source = "effective: agent-config.json read at start plus the platform overlay; selfHeal from the local file" }
+    try {
+        $fi = Get-Item -LiteralPath $CfgPath -ErrorAction Stop
+        $f["fileUtc"] = $fi.LastWriteTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $f["fileBytes"] = [int64]$fi.Length
+        $f["fileChangedSinceStart"] = ($fi.LastWriteTimeUtc -gt $AgentProcessStartUtc)
+    } catch { $f["fileError"] = $_.Exception.Message }
+
+    $sh = [ordered]@{}
+    try {
+        $run = Get-Variable -Name SelfHealSettings -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -ne $run) { $sh["running"] = [ordered]@{ enabled = [bool]$run.Enabled; watchdog = [bool]$run.WatchdogEnabled; health = [bool]$run.HealthEnabled } }
+        else { $sh["running"] = $null }
+    } catch { $sh["runningError"] = $_.Exception.Message }
+    try {
+        $now = Read-SelfHealSettings -Path $CfgPath
+        $sh["file"] = [ordered]@{ enabled = [bool]$now.Enabled; watchdog = [bool]$now.WatchdogEnabled; health = [bool]$now.HealthEnabled; configErrors = @($now.Errors).Count }
+    } catch { $sh["fileError"] = $_.Exception.Message }
+    $f["selfHeal"] = $sh
+
+    try {
+        $dr = Get-DisplayRoutingConfigFromPayloadOrConfig $null
+        $en = $true
+        $ev = Get-PropValue $dr "enabled" $null
+        if ($null -ne $ev) { $en = [bool]$ev }
+        $roleSel = [ordered]@{}
+        $rolesObj = Get-PropValue $dr "roles" $null
+        foreach ($rn in @("play", "control", "session")) {
+            $ro = Get-PropValue $rolesObj $rn $null
+            $sel = Get-PropValue $ro "selector" $null
+            if ($null -eq $sel) { $sel = Get-PropValue $ro "deviceName" $null }
+            if ($null -eq $sel) { $sel = Get-PropValue $ro "index" $null }
+            $roleSel[$rn] = $(if ($null -ne $sel) { [string]$sel } else { $null })
+        }
+        $f["displayRouting"] = [ordered]@{ configured = ($null -ne $dr); enabled = $en; roleSelectors = $roleSel }
+    } catch { $f["displayRouting"] = [ordered]@{ error = $_.Exception.Message } }
+
+    try {
+        $lc = Get-LauncherConfigFromPayloadOrConfig $null
+        $lp = [string](Get-PropValue $lc "path" "")
+        $cl = $null; try { $cl = $cfg.launcher } catch { }
+        $f["launcher"] = [ordered]@{
+            path                 = $lp
+            pathExists           = ((-not [string]::IsNullOrWhiteSpace($lp)) -and (Test-Path -LiteralPath $lp))
+            processName          = (Get-PropValue $lc "processName" $null)
+            configuredDisplayRole = (Get-PropValue $cl "displayRole" $null)
+            startOnPrep          = (Get-PropValue $lc "startOnPrep" $null)
+            startOnStart         = (Get-PropValue $lc "startOnStart" $null)
+        }
+    } catch { $f["launcher"] = [ordered]@{ error = $_.Exception.Message } }
+
+    try {
+        $sd = $null; try { if ($cfg.PSObject.Properties.Name -contains "sessionDisplay") { $sd = $cfg.sessionDisplay } } catch { }
+        $f["sessionDisplay"] = [ordered]@{
+            enabled     = (Get-PropValue $sd "enabled" $true)
+            mode        = (Get-PropValue $sd "mode" $null)
+            displayRole = (Get-PropValue $sd "displayRole" $null)
+            url         = (Get-PropValue $sd "url" $null)
+        }
+    } catch { $f["sessionDisplay"] = [ordered]@{ error = $_.Exception.Message } }
+
+    try {
+        $fac = $null; try { $fac = $cfg.facility } catch { }
+        $f["facility"] = [ordered]@{ enabled = (Get-PropValue $fac "enabled" $null); simulated = (Get-PropValue $fac "simulated" $null) }
+    } catch { }
+
+    $f["pollSeconds"] = $PollSec
+    $f["heartbeatSeconds"] = $HeartbeatSec
+    $f["logLevel"] = $Global:LogLevel
+    $f["resultJsonMaxChars"] = $ResultJsonMaxChars
+    return $f
+}
+
+function Get-HealthCheckFacts {
+    # Small enough for build_resultjson (2000 chars) next to the original HealthCheck fields.
+    $h = [ordered]@{
+        manifestVersion = $AgentManifestVersion
+        codeSha256      = $AgentCodeSha256
+    }
+    try {
+        $run = Get-Variable -Name SelfHealSettings -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        $h["selfHealRunning"] = $(if ($null -ne $run) { [bool]$run.Enabled } else { $null })
+    } catch { $h["selfHealRunning"] = $null }
+    try {
+        $it = Get-Item -LiteralPath (Join-Path $BaseDir "current") -Force -ErrorAction Stop
+        $h["currentIsLink"] = (($it.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+    } catch { $h["currentIsLink"] = $null }
+    try {
+        $g = Get-StateJsonSummary "update-guard.json" 1500
+        if ($null -ne $g) { $h["updateGuard"] = [ordered]@{ state = (Get-PropValue $g "state" $null); version = (Get-PropValue $g "version" $null); utc = (Get-PropValue $g "utc" $null) } }
+    } catch { }
+    try {
+        $u = Read-LastUpdateResult
+        if ($null -ne $u) { $h["lastUpdate"] = [ordered]@{ ok = (Get-PropValue $u "ok" $null); version = (Get-PropValue $u "version" $null); stage = (Get-PropValue $u "stage" $null); utc = (Get-PropValue $u "utc" $null) } }
+    } catch { }
+    return $h
+}
+
+function Get-CompactWindowSummary {
+    # One line per managed window for a command result: device it is on, whether that is the expected one.
+    $out = @()
+    foreach ($w in @(Get-ManagedWindowReport)) {
+        $first = $null
+        if ($w.Contains("windows") -and @($w["windows"]).Count -gt 0) { $first = @($w["windows"])[0] }
+        $out += [ordered]@{
+            name       = $w["name"]
+            running    = $(if ($w.Contains("running")) { $w["running"] } else { $null })
+            expected   = $(if ($w.Contains("expectedDevice")) { $w["expectedDevice"] } else { $null })
+            device     = $(if ($null -ne $first) { $first["device"] } else { $null })
+            onExpected = $(if ($w.Contains("onExpected")) { $w["onExpected"] } else { $null })
+            maximized  = $(if ($null -ne $first) { $first["maximized"] } else { $null })
+            covers     = $(if ($null -ne $first) { $first["coversMonitor"] } else { $null })
+            error      = $(if ($w.Contains("error")) { $w["error"] } else { $null })
+        }
+    }
+    return $out
+}
+
+function Request-CapabilitiesRefresh {
+    # Make the next main-loop pass send the full capabilities document (seconds, not the 10-minute cadence).
+    # Rate-limited so a burst of commands cannot turn into a burst of 30 KB PATCHes.
+    $now = (Get-Date).ToUniversalTime()
+    $last = Get-Variable -Name CapabilitiesRefreshRequestedUtc -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if ($last -is [DateTime] -and ($now - $last).TotalSeconds -lt 30) { return $false }
+    $Global:CapabilitiesRefreshRequestedUtc = $now
+    $Global:NextCapabilitiesUtc = $now
+    $Global:NextHeartbeatUtc = [DateTime]::MinValue
+    return $true
+}
+
+# ---------------- Alive record for the update rollback guard (1.3.1, A0.437) ----------------
+# tools\Watch-BayAgentUpdate.ps1 decides whether a newly installed agent "came back" from this file alone: the SHA256
+# of the script this process runs, and the first and last time in this process that BOTH a heartbeat PATCH and a
+# command poll succeeded. Both, because a bay that polls but cannot heartbeat looks offline to every operator, and a
+# heartbeat alone does not prove commands can run. Written at most every 30 s; never throws.
+$Global:AliveHeartbeatOk = $false
+$Global:AliveRecord = $null
+$Global:AliveLastWriteUtc = [DateTime]::MinValue
+$Global:AliveWriteWarned = $false
+
+function Update-AgentAliveRecord {
+    param([Parameter(Mandatory=$true)][DateTime]$Now)
+    try {
+        if (-not $Global:AliveHeartbeatOk) { return }
+        if ([string]::IsNullOrWhiteSpace([string]$AgentCodeSha256)) { return }
+        $nowStr = $Now.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        if ($null -eq $Global:AliveRecord) {
+            $Global:AliveRecord = [ordered]@{
+                codeSha256      = $AgentCodeSha256
+                codeVersion     = $AgentCodeVersion
+                pid             = $PID
+                processStartUtc = $AgentProcessStartUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                firstOkUtc      = $nowStr
+                lastOkUtc       = $nowStr
+                writes          = 0
+            }
+        } else {
+            if (($Now - $Global:AliveLastWriteUtc).TotalSeconds -lt 30) { return }
+            $Global:AliveRecord["lastOkUtc"] = $nowStr
+        }
+        $Global:AliveRecord["writes"] = [int]$Global:AliveRecord["writes"] + 1
+        $dir = Join-Path $BaseDir "state"
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        Write-JsonAtomic -path (Join-Path $dir "agent-alive.json") -obj $Global:AliveRecord
+        $Global:AliveLastWriteUtc = $Now
+    } catch {
+        if (-not $Global:AliveWriteWarned) {
+            $Global:AliveWriteWarned = $true
+            try { Write-Log ("Alive record could not be written (an update guard cannot confirm this agent): {0}" -f $_.Exception.Message) "WARN" } catch { }
+        }
+    }
+}
+
 function Build-AgentCapabilitiesJson {
     param(
         [Parameter(Mandatory=$true)][hashtable]$eff
@@ -1461,9 +1716,30 @@ function Build-AgentCapabilitiesJson {
             "EndSession",
             "CredentialRotate"
         )
+
+        # 1.3.1 (A0.437): the facts a remote operator needs to install and prove an update with nobody on site.
+        # manifestVersion next to agentVersion (the code's own constant) makes a stale manifest copy visible.
+        manifestVersion = $AgentManifestVersion
+        install         = (Invoke-ReportPart { Get-AgentInstallFacts })
+        localConfig     = (Invoke-ReportPart { Get-LocalConfigFacts })
+        display         = (Invoke-ReportPart { Get-DisplayReport })
     }
 
-    return ($cap | ConvertTo-Json -Depth 6 -Compress)
+    # The column holds 30000 characters (measured in Dev, 2026-10-07). Drop the bulkiest optional parts first, and
+    # say so, rather than let the whole heartbeat PATCH fail.
+    $json = ($cap | ConvertTo-Json -Depth 12 -Compress)
+    $limit = 29000
+    if ($json.Length -gt $limit) {
+        $d = $cap["display"]
+        $cap["display"] = [ordered]@{ trimmed = "display report too large for the column"; roles = $(if ($d -is [System.Collections.IDictionary] -and $d.Contains("roles")) { $d["roles"] } else { $null }) }
+        $json = ($cap | ConvertTo-Json -Depth 12 -Compress)
+    }
+    if ($json.Length -gt $limit) {
+        $cap["localConfig"] = [ordered]@{ trimmed = "too large for the column" }
+        $cap["install"] = [ordered]@{ trimmed = "too large for the column"; codeVersion = $AgentCodeVersion; codeSha256 = $AgentCodeSha256 }
+        $json = ($cap | ConvertTo-Json -Depth 12 -Compress)
+    }
+    return $json
 }
 
 # ---------------- Heartbeat (periodic) ----------------
@@ -1507,12 +1783,15 @@ function Send-HeartbeatIfDue {
                 # (a missing config section is enough): send the small document that carries it.
                 try {
                     $patch["build_agentcapabilitiesjson"] = (ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{
-                        agentVersion = $AgentVersion; lastUpdatedUtc = $nowUtcStr; partial = $true; emergencyStop = (Get-EmergencyStopCapability) }))
+                        agentVersion = $AgentVersion; lastUpdatedUtc = $nowUtcStr; partial = $true; emergencyStop = (Get-EmergencyStopCapability)
+                        manifestVersion = $AgentManifestVersion; codeSha256 = $AgentCodeSha256; lastUpdateResult = (Read-LastUpdateResult) }))
                 } catch { }
             }
         }
 
         Patch-Row $token "${BayEntitySet}" $BayId $patch "*"
+        # A heartbeat the platform accepted: one half of what the update rollback guard needs (Update-AgentAliveRecord).
+        $Global:AliveHeartbeatOk = $true
 
         $Global:NextHeartbeatUtc = $now.AddSeconds($HeartbeatSec)
         Write-Log "Heartbeat updated ($nowUtcStr)" "DEBUG"
@@ -2160,11 +2439,266 @@ function Get-DisplayDeviceString([string]$deviceName) {
     return $null
 }
 
-function Get-DisplayTopology {
-    # Returns a stable-ish view of monitors for config + troubleshooting.
+# Fresh monitor enumeration and window placement (1.3.1, A0.437).
+# WHY: [System.Windows.Forms.Screen]::AllScreens is CACHED per process and is refreshed only by a display-change
+# event that a process with no message pump may never receive. MEASURED on Bay 1, 2026-10-07: the 1.2.1 process
+# reported two screens and the 1.3.0 process, started later, reported one, and nothing remote could say which was
+# true. Routing chose its target from that cache too. Everything below asks Windows afresh on every call
+# (EnumDisplayMonitors, GetMonitorInfo, MonitorFromWindow), and the window report says which monitor each managed
+# window is actually on, so an operator can see placement instead of inferring it.
+if (-not ("ABGDisplayInfo" -as [type])) {
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class ABGDisplayInfo {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct MONITORINFOEX {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string szDevice;
+    }
+
+    public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, IntPtr lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+
+    public sealed class MonitorRow {
+        public string DeviceName;
+        public bool Primary;
+        public int Left; public int Top; public int Width; public int Height;
+    }
+
+    public static MonitorRow Describe(IntPtr hMonitor) {
+        MONITORINFOEX mi = new MONITORINFOEX();
+        mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+        if (!GetMonitorInfo(hMonitor, ref mi)) { return null; }
+        MonitorRow r = new MonitorRow();
+        r.DeviceName = mi.szDevice;
+        r.Primary = (mi.dwFlags & 1) != 0;
+        r.Left = mi.rcMonitor.Left;
+        r.Top = mi.rcMonitor.Top;
+        r.Width = mi.rcMonitor.Right - mi.rcMonitor.Left;
+        r.Height = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
+        return r;
+    }
+
+    public static List<MonitorRow> GetMonitors() {
+        List<MonitorRow> list = new List<MonitorRow>();
+        MonitorEnumProc cb = delegate (IntPtr h, IntPtr hdc, IntPtr rc, IntPtr data) {
+            MonitorRow row = Describe(h);
+            if (row != null) { list.Add(row); }
+            return true;
+        };
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+        GC.KeepAlive(cb);
+        return list;
+    }
+
+    public static MonitorRow MonitorForWindow(IntPtr hwnd) {
+        IntPtr h = MonitorFromWindow(hwnd, 2);
+        if (h == IntPtr.Zero) { return null; }
+        return Describe(h);
+    }
+}
+"@
+}
+
+function Get-CurrentScreens {
+    # The screens as Windows reports them NOW, shaped like System.Windows.Forms.Screen (DeviceName, Primary, Bounds)
+    # so the routing code reads them unchanged. Same enumeration order as Screen.AllScreens (both are
+    # EnumDisplayMonitors), so a numeric role selector keeps its meaning. Falls back to the cached WinForms list only
+    # when the fresh enumeration fails or returns nothing.
     $out = @()
     try {
-        $screens = [System.Windows.Forms.Screen]::AllScreens
+        foreach ($m in @([ABGDisplayInfo]::GetMonitors())) {
+            $out += [pscustomobject]@{
+                DeviceName = [string]$m.DeviceName
+                Primary    = [bool]$m.Primary
+                Bounds     = (New-Object System.Drawing.Rectangle([int]$m.Left, [int]$m.Top, [int]$m.Width, [int]$m.Height))
+                Fresh      = $true
+            }
+        }
+    } catch { $out = @() }
+    if ($out.Count -gt 0) { return $out }
+    try { return @([System.Windows.Forms.Screen]::AllScreens) } catch { return @() }
+}
+
+function Get-CachedScreensSummary {
+    # What THIS process's WinForms cache says, reported next to the fresh view so a stale cache is visible.
+    try {
+        return @(@([System.Windows.Forms.Screen]::AllScreens) | ForEach-Object {
+            "{0}{1} {2},{3} {4}x{5}" -f $_.DeviceName, $(if ($_.Primary) { "*" } else { "" }), $_.Bounds.Left, $_.Bounds.Top, $_.Bounds.Width, $_.Bounds.Height })
+    } catch { return @("error: " + $_.Exception.Message) }
+}
+
+function Get-DisplayAdapterReport {
+    # Every display adapter and the monitors Windows knows on each, with their state flags: a TV that is cabled but
+    # off, or attached but not part of the desktop, shows here (active=false) while the monitor list above omits it.
+    $rows = @()
+    try {
+        for ($i = 0; $i -lt 16; $i++) {
+            $ad = New-Object ABGWin32+DISPLAY_DEVICE
+            $ad.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($ad)
+            if (-not [ABGWin32]::EnumDisplayDevices($null, [uint32]$i, [ref]$ad, 0)) { break }
+            $mons = @()
+            for ($j = 0; $j -lt 8; $j++) {
+                $md = New-Object ABGWin32+DISPLAY_DEVICE
+                $md.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($md)
+                if (-not [ABGWin32]::EnumDisplayDevices([string]$ad.DeviceName, [uint32]$j, [ref]$md, 0)) { break }
+                $mons += [ordered]@{
+                    desc     = [string]$md.DeviceString
+                    active   = (([int]$md.StateFlags -band 1) -ne 0)
+                    attached = (([int]$md.StateFlags -band 2) -ne 0)
+                }
+            }
+            # Skip adapters with no desktop and no monitors (virtual and mirror drivers) to keep the report small.
+            $onDesktop = (([int]$ad.StateFlags -band 1) -ne 0)
+            if (-not $onDesktop -and $mons.Count -eq 0) { continue }
+            $rows += [ordered]@{
+                deviceName = [string]$ad.DeviceName
+                desc       = [string]$ad.DeviceString
+                onDesktop  = $onDesktop
+                primary    = (([int]$ad.StateFlags -band 4) -ne 0)
+                monitors   = @($mons)
+            }
+        }
+    } catch { $rows += [ordered]@{ error = $_.Exception.Message } }
+    return $rows
+}
+
+function Get-WindowPlacement([IntPtr]$hWnd) {
+    # Where one window actually is: its rectangle, the monitor Windows says it is on, and its state.
+    $r = New-Object ABGDisplayInfo+RECT
+    $okRect = [ABGDisplayInfo]::GetWindowRect($hWnd, [ref]$r)
+    $mon = [ABGDisplayInfo]::MonitorForWindow($hWnd)
+    $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
+    $covers = $false
+    if ($okRect -and $null -ne $mon) {
+        $covers = ($r.Left -le $mon.Left -and $r.Top -le $mon.Top -and $r.Right -ge ($mon.Left + $mon.Width) -and $r.Bottom -ge ($mon.Top + $mon.Height))
+    }
+    return [ordered]@{
+        device        = $(if ($null -ne $mon) { [string]$mon.DeviceName } else { $null })
+        left          = $r.Left; top = $r.Top; width = $w; height = $h
+        maximized     = [bool][ABGDisplayInfo]::IsZoomed($hWnd)
+        minimized     = [bool][ABGDisplayInfo]::IsIconic($hWnd)
+        coversMonitor = [bool]$covers
+    }
+}
+
+function Get-SessionDisplayEdgePids([string]$pdir) {
+    # Top-level twin of Start-SessionDisplay's own profile-dir match (read-only use: the placement report).
+    $ids = @()
+    if ([string]::IsNullOrWhiteSpace($pdir)) { return @() }
+    try {
+        $edgeCim = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -OperationTimeoutSec 2 -ErrorAction SilentlyContinue
+        foreach ($p in @($edgeCim)) {
+            $cmd = $p.CommandLine
+            if ($null -ne $cmd -and $cmd -like "*$pdir*") { $ids += [int]$p.ProcessId }
+        }
+    } catch {}
+    return $ids
+}
+
+function Get-ManagedWindowEntry([string]$name, [string]$role, [int[]]$pids, [string]$processLabel) {
+    $expected = $null
+    try { $sc = Get-ScreenForRole $role $null; if ($null -ne $sc) { $expected = [string]$sc.DeviceName } } catch { }
+    $wins = @()
+    foreach ($id in @($pids | Select-Object -First 12)) {
+        try {
+            $hw = Get-FirstVisibleWindowHandleForPid ([int]$id)
+            if ($hw -eq [IntPtr]::Zero) { continue }
+            $pl = Get-WindowPlacement $hw
+            $pl["pid"] = [int]$id
+            $wins += $pl
+        } catch { }
+        if ($wins.Count -ge 4) { break }
+    }
+    $onExpected = $null
+    if ($wins.Count -gt 0 -and $null -ne $expected) { $onExpected = (@($wins | Where-Object { $_.device -ine $expected }).Count -eq 0) }
+    return [ordered]@{
+        name           = $name
+        process        = $processLabel
+        role           = $role
+        expectedDevice = $expected
+        running        = (@($pids).Count -gt 0)
+        windows        = @($wins)
+        onExpected     = $onExpected
+    }
+}
+
+function Get-ManagedWindowReport {
+    # The two windows this agent places: the launcher (role as Start-LauncherIfNeeded computes it) and the wall
+    # display (Edge with the session-display profile).
+    $out = @()
+    try {
+        $lc = Get-LauncherConfigFromPayloadOrConfig $null
+        $lrole = Get-PropValue $lc "displayRole" $null
+        if ([string]::IsNullOrWhiteSpace([string]$lrole)) { $lrole = "control" }
+        $lname = [string](Get-PropValue $lc "processName" "")
+        $lpids = @()
+        if (-not [string]::IsNullOrWhiteSpace($lname)) {
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($lname)
+            $lpids = @(Get-Process -Name $base -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+        }
+        $out += (Get-ManagedWindowEntry "launcher" ([string]$lrole) ([int[]]@($lpids)) $lname)
+    } catch { $out += [ordered]@{ name = "launcher"; error = $_.Exception.Message } }
+    try {
+        $sdCfg = $null
+        try { if ($cfg.PSObject.Properties.Name -contains "sessionDisplay") { $sdCfg = $cfg.sessionDisplay } } catch {}
+        $srole = Get-PropValue $sdCfg "displayRole" $null
+        if ([string]::IsNullOrWhiteSpace([string]$srole)) { $srole = "session" }
+        $pdir = Get-PropValue $sdCfg "profileDir" $Global:SessionDisplayProfileDir
+        if ([string]::IsNullOrWhiteSpace([string]$pdir)) { $pdir = "C:\AllBirdies\SessionDisplay\edge-profile" }
+        $spids = @(Get-SessionDisplayEdgePids ([string]$pdir))
+        $out += (Get-ManagedWindowEntry "sessionDisplay" ([string]$srole) ([int[]]@($spids)) "msedge")
+    } catch { $out += [ordered]@{ name = "sessionDisplay"; error = $_.Exception.Message } }
+    return $out
+}
+
+function Get-DisplayReport {
+    # The remote operator's view of the screens: fresh monitors, adapters, the screen each role resolves to now,
+    # where each managed window is, and the last routing attempt per role. Every part is isolated: one failing part
+    # reports its error and the rest still arrive.
+    $rep = [ordered]@{ utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+    try { $rep["monitorCountSystem"] = [ABGDisplayInfo]::GetSystemMetrics(80) } catch { $rep["monitorCountSystem"] = $null }
+    try { $rep["monitors"] = @(Get-DisplayTopology) } catch { $rep["monitors"] = @([ordered]@{ error = $_.Exception.Message }) }
+    try { $rep["screensCachedByProcess"] = @(Get-CachedScreensSummary) } catch { }
+    try { $rep["adapters"] = @(Get-DisplayAdapterReport) } catch { $rep["adapters"] = @([ordered]@{ error = $_.Exception.Message }) }
+    $roles = [ordered]@{}
+    foreach ($rn in @("play", "control", "session")) {
+        try { $sc = Get-ScreenForRole $rn $null; $roles[$rn] = $(if ($null -ne $sc) { [string]$sc.DeviceName } else { $null }) }
+        catch { $roles[$rn] = "error: " + $_.Exception.Message }
+    }
+    $rep["roles"] = $roles
+    try { $rep["windows"] = @(Get-ManagedWindowReport) } catch { $rep["windows"] = @([ordered]@{ error = $_.Exception.Message }) }
+    try {
+        $lr = [ordered]@{}
+        $store = Get-Variable -Name LastDisplayRouting -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        if ($store -is [hashtable]) { foreach ($k in @($store.Keys | Sort-Object)) { $lr[$k] = $store[$k] } }
+        $rep["lastRouting"] = $lr
+    } catch { }
+    return $rep
+}
+
+function Get-DisplayTopology {
+    # Returns a view of monitors for config + troubleshooting, enumerated fresh on every call (see Get-CurrentScreens).
+    $out = @()
+    try {
+        $screens = @(Get-CurrentScreens)
         for ($i=0; $i -lt $screens.Count; $i++) {
             $s = $screens[$i]
             $b = $s.Bounds
@@ -2204,7 +2738,7 @@ function Get-DisplayRoutingConfigFromPayloadOrConfig($payloadObj) {
 }
 
 function Resolve-RoleSelectorToScreen($selector, $screens) {
-    if ($null -eq $screens) { $screens = [System.Windows.Forms.Screen]::AllScreens }
+    if ($null -eq $screens) { $screens = @(Get-CurrentScreens) }
     if ($null -eq $selector) { return $null }
 
     # Numeric index
@@ -2246,7 +2780,8 @@ function Resolve-RoleSelectorToScreen($selector, $screens) {
 function Get-ScreenForRole([string]$role, $payloadObj) {
     # Roles: play, control, session
     $screens = $null
-    try { $screens = [System.Windows.Forms.Screen]::AllScreens } catch { return $null }
+    try { $screens = @(Get-CurrentScreens) } catch { return $null }
+    if ($null -eq $screens -or @($screens).Count -eq 0) { return $null }
 
     $dr = Get-DisplayRoutingConfigFromPayloadOrConfig $payloadObj
     $enabled = $true
@@ -2388,11 +2923,33 @@ function Safe-RouteProcessWindow {
         } else {
             Write-Log "DisplayRouting: no move pid=$ProcessId role=$role reason=$($res.reason) context=$context" "DEBUG"
         }
+        Save-LastDisplayRouting -role $role -context $context -res $res
         return $res
     } catch {
         Write-Log "DisplayRouting: exception context=$context pid=$ProcessId role=$role :: $($_.Exception.Message)" "WARN"
-        return @{ moved = $false; role = $role; pid = $ProcessId; error = $_.Exception.Message }
+        $err = @{ moved = $false; role = $role; pid = $ProcessId; error = $_.Exception.Message }
+        Save-LastDisplayRouting -role $role -context $context -res $err
+        return $err
     }
+}
+
+function Save-LastDisplayRouting {
+    # Through 1.3.0 every routing result was discarded at its call site ($null = Safe-RouteProcessWindow ...), so no
+    # remote reader could learn where a window was sent. Keep the last attempt per role for the display report.
+    # Never throws: recording a result must not turn a routing success into a failure.
+    param([string]$role, [string]$context, $res)
+    try {
+        $store = Get-Variable -Name LastDisplayRouting -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -eq $store -or -not ($store -is [hashtable])) { $store = @{}; $Global:LastDisplayRouting = $store }
+        $store[[string]$role] = [ordered]@{
+            utc     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            context = $context
+            pid     = $(if ($null -ne $res) { $res.pid } else { $null })
+            moved   = $(if ($null -ne $res) { [bool]$res.moved } else { $false })
+            device  = $(if ($null -ne $res -and $res.ContainsKey("deviceName")) { $res.deviceName } else { $null })
+            reason  = $(if ($null -ne $res -and $res.ContainsKey("reason")) { $res.reason } elseif ($null -ne $res -and $res.ContainsKey("error")) { $res.error } else { $null })
+        }
+    } catch { }
 }
 
 function Get-FacilityConfigFromPayloadOrConfig($payloadObj) {
@@ -3537,21 +4094,38 @@ if ($null -ne $payloadObj) {
     switch ($CommandType) {
         $CMD_HEALTHCHECK {
             $nowHb = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            return @{
+            $hc = [ordered]@{
                 ok = $true
                 agentVersion = $AgentVersion
                 machine = $env:COMPUTERNAME
                 bayId = $BayId
                 utc = $nowHb
             }
+            # 1.3.1: cheap facts always (which code runs, whether self-heal runs, the update guard's last word); the
+            # display placement only on request ({"report":true}), which also sends the full report to
+            # build_agentcapabilitiesjson within one poll.
+            foreach ($kv in (Get-HealthCheckFacts).GetEnumerator()) { $hc[$kv.Key] = $kv.Value }
+            if ([bool](Get-PropValue $payloadObj "report" $false)) {
+                $hc["windows"] = @(Invoke-ReportPart { Get-CompactWindowSummary })
+                $hc["fullReportRequested"] = (Request-CapabilitiesRefresh)
+                $hc["fullReportIn"] = "build_agentcapabilitiesjson"
+            }
+            return $hc
         }
 
-        
+
 $CMD_DISPLAY_TOPOLOGY {
-    return @{
+    # 1.3.1: fresh monitors (not this process's cached view), where each managed window is, and the full report sent
+    # to build_agentcapabilitiesjson within one poll (the result column holds only 2000 characters).
+    $dt = [ordered]@{
         ok = $true
         topology = @((Get-DisplayTopology))
     }
+    try { $dt["monitorCountSystem"] = [ABGDisplayInfo]::GetSystemMetrics(80) } catch { }
+    $dt["windows"] = @(Invoke-ReportPart { Get-CompactWindowSummary })
+    $dt["fullReportRequested"] = (Request-CapabilitiesRefresh)
+    $dt["fullReportIn"] = "build_agentcapabilitiesjson"
+    return $dt
 }
 
 $CMD_FACILITY_SETMODE {
@@ -5260,6 +5834,9 @@ while ($true) {
         catch { Write-Log ("[SELFHEAL] report delivery failed: {0}" -f $_.Exception.Message) "WARN" }
 
         $cmd = Get-NextPendingCommand $token
+        # The poll succeeded (it throws otherwise): with an accepted heartbeat, that is this agent "back" for the
+        # update rollback guard. Never throws.
+        Update-AgentAliveRecord -Now ((Get-Date).ToUniversalTime())
         if ($cmd) {
             Process-Command $token $cmd
         } else {

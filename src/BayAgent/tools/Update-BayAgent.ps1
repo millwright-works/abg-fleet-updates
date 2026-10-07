@@ -43,6 +43,34 @@ INTEGRITY IS UNCHANGED BY THIS MOVE
   serves them, so the expected hash does not change when hosting moves. A tampered or
   truncated download fails the hash and the script throws before anything is staged.
 
+REMOTE INSTALL WITH NOBODY ON SITE (1.3.1, A0.437)
+  Kevin, 2026-10-07: "I don't like that you need me to be at the Bay PC in order to update the BayAgent."
+  Four changes make an update installable AND provable remotely:
+
+  1. EVERY FILE IS COPIED, AND current\ IS VERIFIED BY HASH. Through 1.3.0 promotion used robocopy /MIR, which
+     skips a file whose size and time match. The reproducible build gives every zip entry one fixed time and
+     two releases' manifest.json were both 68 bytes, so 1.3.0 installed on Bay 1 and kept REPORTING 1.2.1.
+     Promotion now copies unconditionally (/IS /IT) and the run is ok only if every file in current\ (and
+     every shipped tools\ file) hashes equal to releases\<version>.
+  2. A SNAPSHOT OF WHAT IS RUNNING IS TAKEN FIRST (rollback\current, rollback\tools, rollback\snapshot.json,
+     hash-verified). It is local and already signed, so a rollback needs no download and no live agent.
+  3. current\ IS NEVER A LINK WHEN IT IS WRITTEN. ABG.ReleaseFinalize.ps1 can make current\ a junction to
+     releases\<v>; a /MIR into it would overwrite that release, the very copy a rollback needs. The link is
+     removed NON-recursively (the target is never touched) and replaced by a real folder first.
+  4. A ROLLBACK GUARD WATCHES THE NEW AGENT (tools\Watch-BayAgentUpdate.ps1, launched from the snapshot so the
+     package being installed cannot change it). It runs OUTSIDE the agent's scheduled task (its own per-user
+     task, falling back to WMI), because restarting the agent ends that task and everything in it. It must
+     confirm it is armed before anything is promoted; if it cannot arm, nothing is promoted and the run fails
+     with stage "guard". If the new code does not prove itself back (an alive record carrying the hash of the
+     script that ran, see BayAgent.ps1 Update-AgentAliveRecord) within -ConfirmTimeoutSeconds of time in which
+     the cloud was reachable, the guard restores the snapshot and restarts the agent. Unreachable time does not
+     count, so a network outage cannot roll back a healthy bay.
+     -NoRollbackGuard installs the 1.3.0 way (no guard); -RollbackDrill rolls back on purpose after the new
+     agent confirms, to prove the path (use it by reinstalling the SAME version).
+  The fix runs on the install AFTER the one that ships it: installing 1.3.1 runs the 1.3.0 updater already on
+  the bay. 1.3.1's manifest.json therefore differs in length from every earlier one, and the agent now reports
+  the version constant in its own code.
+
 #>
 
 [CmdletBinding()]
@@ -82,7 +110,19 @@ param(
   # an untimestamped one does not. Must be HTTP, not HTTPS -- Set-AuthenticodeSignature
   # does not support HTTPS timestamp URLs. Override only if DigiCert's responder
   # endpoint moves or a different CA is used.
-  [string]$TimeStampServer = "http://timestamp.digicert.com"
+  [string]$TimeStampServer = "http://timestamp.digicert.com",
+
+  # Rollback guard (1.3.1). Seconds of REACHABLE time the new agent has to prove itself back before the guard
+  # restores the snapshot; the soak is how long one agent process must stay healthy to count as back.
+  [int]$ConfirmTimeoutSeconds = 900,
+  [int]$ConfirmSoakSeconds = 60,
+  # Wall-clock cap: past this the guard gives up WITHOUT rolling back (the cloud was never reachable long enough
+  # to judge, and rolling back cannot be shown to be better).
+  [int]$GuardMaxWaitSeconds = 21600,
+  [int]$GuardArmTimeoutSeconds = 60,
+  [string]$GuardTaskName = "ABG BayAgent Update Guard",
+  [switch]$NoRollbackGuard,
+  [switch]$RollbackDrill
 )
 
 # NOTHING EXECUTABLE RUNS BEFORE THE TRAP BELOW IS ARMED WITH FUNCTIONS THAT EXIST.
@@ -113,7 +153,7 @@ function Get-Sha([string]$path) {
   return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Write-UpdateResult([bool]$ok, [string]$reason, [string]$stage) {
+function Write-UpdateResult([bool]$ok, [string]$reason, [string]$stage, [hashtable]$extra = $null) {
   # THE DURABLE OUTCOME OF THIS RUN, and the only thing that can contradict a Succeeded BayCommand.
   #
   # A fleet update is triggered by StartProcess, whose result is written the instant powershell.exe launches.
@@ -138,6 +178,7 @@ function Write-UpdateResult([bool]$ok, [string]$reason, [string]$stage) {
       utc       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
       machine   = $env:COMPUTERNAME
     }
+    if ($null -ne $extra) { foreach ($k in @($extra.Keys)) { $obj[[string]$k] = $extra[$k] } }
     $json = $obj | ConvertTo-Json -Depth 4
     [IO.File]::WriteAllText((Join-Path $dir "last-update-result.json"), $json, (New-Object Text.UTF8Encoding($false)))
   } catch {
@@ -146,14 +187,42 @@ function Write-UpdateResult([bool]$ok, [string]$reason, [string]$stage) {
   }
 }
 
+function Get-UpdateRunValue([string]$name, [string]$default) {
+  # Run state the trap reports ($script:Stage, $script:InstallId). The trap is hoisted above the lines that set
+  # them, so it reads them by name and falls back to a default rather than assume they exist yet.
+  $v = Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+  if ($null -eq $v -or [string]::IsNullOrWhiteSpace([string]$v)) { return $default }
+  return [string]$v
+}
+
+function Set-PendingAbortedIfNotPromoting() {
+  # A failure before promotion began must stand the rollback guard down (nothing changed in current\). After
+  # promotion began the guard keeps watching: current\ may hold new code, and it is the guard's call.
+  try {
+    $id = Get-UpdateRunValue "InstallId" ""
+    if ([string]::IsNullOrWhiteSpace($id)) { return }
+    $pp = Join-Path $BaseDir "state\update-pending.json"
+    if (-not (Test-Path -LiteralPath $pp)) { return }
+    $po = [IO.File]::ReadAllText($pp) | ConvertFrom-Json
+    if ([string]$po.installId -ne $id) { return }
+    if ([string]$po.phase -ne "armed") { return }
+    $po.phase = "aborted"
+    [IO.File]::WriteAllText($pp, ($po | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+  } catch { }
+}
+
 # Catches EVERY terminating error in the linear body below -- including the ones thrown before their own
 # stage had logged anything. `break` re-throws after running, so the caller still sees a failure.
 trap {
   $msg = $_.Exception.Message
-  Write-Log ("UPDATE FAILED: " + $msg)
-  Write-UpdateResult -ok $false -reason $msg -stage "unknown"
+  Write-Log ("UPDATE FAILED at stage " + (Get-UpdateRunValue "Stage" "unknown") + ": " + $msg)
+  Set-PendingAbortedIfNotPromoting
+  Write-UpdateResult -ok $false -reason $msg -stage (Get-UpdateRunValue "Stage" "unknown")
   break
 }
+
+$script:Stage = "start"
+$script:InstallId = ""
 
 # The executable prologue, moved below the trap so the trap is armed before anything can fail.
 Set-StrictMode -Version Latest
@@ -275,6 +344,139 @@ function Sign-File([string]$path, $cert, [string]$timeStampServer) {
   return $true
 }
 
+# ------------------ 1.3.1 helpers: hashes, links, snapshot, rollback guard ------------------
+
+function Write-JsonFileAtomic([string]$path, $obj) {
+  # Readers (the guard, the agent) must never see half a file: write beside it, then replace.
+  Ensure-Dir (Split-Path -Parent $path)
+  $tmp = "$path.tmp"
+  [IO.File]::WriteAllText($tmp, ($obj | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+  if (Test-Path -LiteralPath $path) { [IO.File]::Replace($tmp, $path, $null, $true) }
+  else { [IO.File]::Move($tmp, $path) }
+}
+
+function Get-TreeHashes([string]$root) {
+  # Relative path (lower case, backslashes) -> SHA256 of every file under $root. An absent root is an empty tree.
+  $map = @{}
+  if (-not (Test-Path -LiteralPath $root)) { return $map }
+  $full = (Get-Item -LiteralPath $root -Force).FullName.TrimEnd('\')
+  foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force)) {
+    $rel = $f.FullName.Substring($full.Length).TrimStart('\').ToLowerInvariant()
+    $map[$rel] = Get-Sha $f.FullName
+  }
+  return $map
+}
+
+function Compare-TreeHashes([hashtable]$expected, [hashtable]$actual, [switch]$AllowExtra) {
+  # Returns the differences as text; empty means equal. With -AllowExtra, files only in $actual are ignored
+  # (tools\ holds scripts the package does not ship).
+  $diffs = @()
+  foreach ($k in @($expected.Keys | Sort-Object)) {
+    if (-not $actual.ContainsKey($k)) { $diffs += "missing $k" }
+    elseif ($actual[$k] -ne $expected[$k]) { $diffs += "different $k" }
+  }
+  if (-not $AllowExtra) {
+    foreach ($k in @($actual.Keys | Sort-Object)) { if (-not $expected.ContainsKey($k)) { $diffs += "extra $k" } }
+  }
+  return $diffs
+}
+
+function Test-IsLink([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $false }
+  $it = Get-Item -LiteralPath $path -Force
+  return (($it.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Convert-LinkToFolder([string]$linkPath, [string]$fillFrom) {
+  # R-D (1.3.0 attack): current\ may be a junction into releases\<v>. Remove ONLY the link -- Directory.Delete with
+  # recursive=$false removes the reparse point and never follows it -- then make a real folder holding exactly the
+  # snapshot of what was running. A recursive delete here would wipe the release the link pointed at.
+  if (-not (Test-IsLink $linkPath)) { return $false }
+  $target = ""
+  try { $target = (@((Get-Item -LiteralPath $linkPath -Force).Target) -join ";") } catch { }
+  Write-Log "current\ is a link (target: $target). Removing the link only, then making a real folder."
+  [IO.Directory]::Delete($linkPath, $false)
+  if (Test-Path -LiteralPath $linkPath) { throw "could not remove the link at $linkPath" }
+  Ensure-Dir $linkPath
+  Invoke-Robo $fillFrom $linkPath @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+  $d = @(Compare-TreeHashes (Get-TreeHashes $fillFrom) (Get-TreeHashes $linkPath))
+  if ($d.Count -gt 0) { throw ("current\ rebuilt from the snapshot does not match it: " + ($d -join "; ")) }
+  return $true
+}
+
+function Read-JsonFileOrNull([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  try { return ([IO.File]::ReadAllText($path) | ConvertFrom-Json) } catch { return $null }
+}
+
+function Test-GuardProcessAlive($guardState) {
+  # Is the guard named in update-guard.json still running? Matched by pid AND command line, so a reused pid
+  # does not count. Anything unreadable is "not alive": a stale pending file must not block updates forever.
+  try {
+    $gp = [int]$guardState.pid
+    if ($gp -le 0) { return $false }
+    $p = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $gp) -ErrorAction Stop
+    if ($null -eq $p) { return $false }
+    return ([string]$p.CommandLine -match 'Watch-BayAgentUpdate\.ps1')
+  } catch { return $false }
+}
+
+function Get-UpdateGuardArguments([string]$guardScript, [string]$installId, [string]$taskName) {
+  # The guard runs under the bay's AllSigned policy like everything else: no -ExecutionPolicy, -File only.
+  return ('-NoProfile -NonInteractive -WindowStyle Hidden -File "{0}" -InstallId {1} -BaseDir "{2}" -TaskName "{3}"' -f $guardScript, $installId, $BaseDir.TrimEnd('\'), $taskName)
+}
+
+function Start-UpdateGuard([string]$guardScript, [string]$installId) {
+  # Launch the guard OUTSIDE this process tree. The agent is restarted by HostWatchdog ending the \ABG Bay Agent
+  # scheduled task, and ending a task ends every process in it -- this updater, and anything it starts the plain
+  # way. First choice: a per-user scheduled task (its own job; an at-logon trigger re-arms it after a reboot).
+  # Fallback: WMI Win32_Process.Create (the process belongs to the WMI host, not to our job).
+  $psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $argLine = Get-UpdateGuardArguments $guardScript $installId $GuardTaskName
+  $errors = @()
+  try {
+    $userId = "{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME
+    $action = New-ScheduledTaskAction -Execute $psExe -Argument $argLine -WorkingDirectory $BaseDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+      -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 8)
+    Register-ScheduledTask -TaskName $GuardTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    Start-ScheduledTask -TaskName $GuardTaskName -ErrorAction Stop
+    return "scheduledTask"
+  } catch { $errors += ("scheduledTask: " + $_.Exception.Message) }
+  try {
+    $cl = ('"{0}" {1}' -f $psExe, $argLine)
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl; CurrentDirectory = $BaseDir } -ErrorAction Stop
+    if ([int]$r.ReturnValue -ne 0) { throw ("Win32_Process.Create returned {0}" -f $r.ReturnValue) }
+    return "wmi"
+  } catch { $errors += ("wmi: " + $_.Exception.Message) }
+  throw ("the rollback guard could not be launched: " + ($errors -join " | "))
+}
+
+function Wait-GuardArmed([string]$installId, [int]$timeoutSec) {
+  $gpath = Join-Path $BaseDir "state\update-guard.json"
+  $deadline = (Get-Date).AddSeconds($timeoutSec)
+  do {
+    $g = Read-JsonFileOrNull $gpath
+    if ($null -ne $g -and [string]$g.installId -eq $installId -and [string]$g.state -in @("armed", "watching")) { return $g }
+    Start-Sleep -Milliseconds 500
+  } while ((Get-Date) -lt $deadline)
+  return $null
+}
+
+function Restore-FromSnapshot([string]$snapCurrent, [string]$snapTools) {
+  # Put back exactly what was running before this run touched current\. Returns the differences left (empty = ok).
+  if (Test-IsLink $CurrentDir) { [IO.Directory]::Delete($CurrentDir, $false) }
+  Invoke-Robo $snapCurrent $CurrentDir @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+  $d = @(Compare-TreeHashes (Get-TreeHashes $snapCurrent) (Get-TreeHashes $CurrentDir))
+  if (Test-Path -LiteralPath $snapTools) {
+    Invoke-Robo $snapTools $ToolsDir @("/E", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+    $d += @(Compare-TreeHashes (Get-TreeHashes $snapTools) (Get-TreeHashes $ToolsDir) -AllowExtra)
+  }
+  return $d
+}
+
 # ------------------ MAIN ------------------
 
 Write-Log "----"
@@ -333,13 +535,81 @@ if (-not (Test-Path -LiteralPath (Join-Path $contentRoot "manifest.json"))) {
   # We don't hard-fail because you might not be using manifest for versioning yet.
 }
 
+# ---- Snapshot what is running (1.3.1) ----
+# Taken BEFORE releases\<version> is touched: if current\ is a link into releases\<version> (a reinstall of the same
+# version), the staging step below would otherwise delete the very files the agent is running.
+$script:Stage = "snapshot"
+$RollbackDir  = Join-Path $BaseDir "rollback"
+$SnapCurrent  = Join-Path $RollbackDir "current"
+$SnapTools    = Join-Path $RollbackDir "tools"
+$SnapManifest = Join-Path $RollbackDir "snapshot.json"
+$PendingPath  = Join-Path $BaseDir "state\update-pending.json"
+$GuardPath    = Join-Path $BaseDir "state\update-guard.json"
+$ToolsDir     = Join-Path $BaseDir "tools"
+
+# One update at a time: a guard still watching the previous install owns rollback\ (its snapshot is the only copy
+# of the code that last proved itself), so overwriting it now would make "the last good version" whatever was
+# installed a minute ago.
+$prevPending = Read-JsonFileOrNull $PendingPath
+if ($null -ne $prevPending -and [string]$prevPending.phase -in @("armed", "promoting", "promoted")) {
+  $prevGuard = Read-JsonFileOrNull $GuardPath
+  if ($null -ne $prevGuard -and [string]$prevGuard.installId -eq [string]$prevPending.installId -and (Test-GuardProcessAlive $prevGuard)) {
+    $script:Stage = "guard-busy"
+    throw ("the rollback guard for the previous install (version {0}, installId {1}) is still watching; wait for it to finish (state\update-guard.json) and retry" -f $prevPending.version, $prevPending.installId)
+  }
+  Write-Log ("A pending record from install {0} has no live guard; treating it as stale." -f $prevPending.installId)
+}
+
+$haveSnapshot = $false
+$snapAgentSha = $null
+if (Test-Path -LiteralPath (Join-Path $CurrentDir "BayAgent.ps1")) {
+  Write-Log "Snapshotting current\ and tools\ into $RollbackDir"
+  if (Test-IsLink $RollbackDir) { [IO.Directory]::Delete($RollbackDir, $false) }
+  Ensure-Dir $RollbackDir
+  Invoke-Robo $CurrentDir $SnapCurrent @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+  $curMapBefore = Get-TreeHashes $CurrentDir
+  $snapCurMap = Get-TreeHashes $SnapCurrent
+  $d1 = @(Compare-TreeHashes $curMapBefore $snapCurMap)
+  if ($d1.Count -gt 0) { throw ("the snapshot of current\ does not match it: " + ($d1 -join "; ")) }
+  $snapToolsMap = @{}
+  if (Test-Path -LiteralPath $ToolsDir) {
+    Invoke-Robo $ToolsDir $SnapTools @("/MIR", "/IS", "/IT", "/R:2", "/W:2", "/NP") | Out-Null
+    $snapToolsMap = Get-TreeHashes $SnapTools
+    $d2 = @(Compare-TreeHashes (Get-TreeHashes $ToolsDir) $snapToolsMap)
+    if ($d2.Count -gt 0) { throw ("the snapshot of tools\ does not match it: " + ($d2 -join "; ")) }
+  }
+  $snapAgentSha = $snapCurMap["bayagent.ps1"]
+  $snapManifestVersion = $null
+  $sm = Read-JsonFileOrNull (Join-Path $SnapCurrent "manifest.json")
+  if ($null -ne $sm) { $snapManifestVersion = [string]$sm.version }
+  Write-JsonFileAtomic $SnapManifest ([ordered]@{
+    takenUtc        = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    forVersion      = $Version
+    agentSha256     = $snapAgentSha
+    manifestVersion = $snapManifestVersion
+    current         = $snapCurMap
+    tools           = $snapToolsMap
+  })
+  $haveSnapshot = $true
+} else {
+  Write-Log "No current\BayAgent.ps1: a first install, nothing to snapshot (and nothing to roll back to)."
+}
+
+# ---- current\ must be a real folder before anything is written through it (R-D) ----
+$script:Stage = "unlink"
+if ($haveSnapshot -and (Test-IsLink $CurrentDir)) {
+  [void](Convert-LinkToFolder -linkPath $CurrentDir -fillFrom $SnapCurrent)
+}
+
 # Stage into releases\<version>
+$script:Stage = "stage"
 Write-Log "Staging into release folder $relDir"
 if (Test-Path -LiteralPath $relDir) { Remove-Item -LiteralPath $relDir -Recurse -Force }
 Ensure-Dir $relDir
 Invoke-Robo $contentRoot $relDir @("/MIR") | Out-Null
 
 # ---- Sign in release folder first (safe) ----
+$script:Stage = "sign"
 $signCount = 0
 if ($SignAfterInstall) {
   Write-Log "Signing enabled. Locating code-signing certificate..."
@@ -373,29 +643,131 @@ if ($SignAfterInstall) {
   Write-Log "Signing complete in release folder. SignedFiles=$signCount"
 }
 
+# The bytes current\ must hold after promotion (taken after signing: signing rewrites the files).
+$relMap = Get-TreeHashes $relDir
+$newAgentSha = $relMap["bayagent.ps1"]
+
+# ---- Arm the rollback guard BEFORE promotion (1.3.1) ----
+$script:Stage = "guard"
+$guardMode = "off"
+$guardNote = ""
+$script:InstallId = [guid]::NewGuid().ToString()
+if ($NoRollbackGuard) {
+  $guardNote = "-NoRollbackGuard"
+} elseif (-not $haveSnapshot) {
+  $guardNote = "first install: nothing to roll back to"
+} elseif (-not $RequestRestart) {
+  $guardNote = "no -RequestRestart: the new code would not run until a later restart, so there is nothing to watch"
+} else {
+  $guardScript = Join-Path $SnapTools "Watch-BayAgentUpdate.ps1"
+  if (-not (Test-Path -LiteralPath $guardScript)) {
+    throw ("the rollback guard is not installed ({0}); install with -NoRollbackGuard to proceed without automatic rollback" -f $guardScript)
+  }
+  Write-JsonFileAtomic $PendingPath ([ordered]@{
+    installId             = $script:InstallId
+    version               = $Version
+    packageUrl            = $PackageUrl
+    phase                 = "armed"
+    createdUtc            = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    promotingUtc          = $null
+    expectedAgentSha256   = $newAgentSha
+    snapshotAgentSha256   = $snapAgentSha
+    confirmTimeoutSeconds = $ConfirmTimeoutSeconds
+    soakSeconds           = $ConfirmSoakSeconds
+    maxWaitSeconds        = $GuardMaxWaitSeconds
+    drill                 = [bool]$RollbackDrill
+    updaterPid            = $PID
+  })
+  $launcher = Start-UpdateGuard -guardScript $guardScript -installId $script:InstallId
+  Write-Log "Rollback guard launched via $launcher; waiting up to $GuardArmTimeoutSeconds s for it to arm."
+  $armed = Wait-GuardArmed -installId $script:InstallId -timeoutSec $GuardArmTimeoutSeconds
+  if ($null -eq $armed) {
+    # Leave no task behind that could start a guard later for an install that never happened.
+    if ($launcher -eq "scheduledTask") { try { Unregister-ScheduledTask -TaskName $GuardTaskName -Confirm:$false -ErrorAction Stop } catch { } }
+    throw ("the rollback guard did not arm within {0} s (launched via {1}); nothing was promoted. Install with -NoRollbackGuard to proceed without automatic rollback." -f $GuardArmTimeoutSeconds, $launcher)
+  }
+  $guardMode = "armed"
+  $guardNote = ("pid {0} via {1}" -f $armed.pid, $launcher)
+}
+Write-Log "Rollback guard: $guardMode ($guardNote)"
+
+function Set-PendingPhase([string]$phase) {
+  if ($guardMode -ne "armed") { return }
+  $po = Read-JsonFileOrNull $PendingPath
+  if ($null -eq $po -or [string]$po.installId -ne $script:InstallId) { throw "the pending record changed under this run" }
+  $po.phase = $phase
+  if ($phase -eq "promoting") { $po.promotingUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+  Write-JsonFileAtomic $PendingPath $po
+}
+
 # ---- Promote release -> current only after signing succeeded ----
+# Every file is copied (/IS /IT): /MIR alone skips a file whose size and time match, which is how 1.3.0 kept a
+# 1.2.1 manifest.json (F1). Then current\ must hash equal to the release, file for file, or the run is not ok.
+$script:Stage = "promote"
+Set-PendingPhase "promoting"
 Write-Log "Promoting SIGNED release -> current ($CurrentDir)"
-Invoke-Robo $relDir $CurrentDir @("/MIR") | Out-Null
+$promoteError = $null
+try {
+  Invoke-Robo $relDir $CurrentDir @("/MIR", "/IS", "/IT", "/R:5", "/W:2", "/NP") | Out-Null
+  $curDiff = @(Compare-TreeHashes $relMap (Get-TreeHashes $CurrentDir))
+  if ($curDiff.Count -gt 0) { $promoteError = ("current\ does not match releases\{0} after promotion: {1}" -f $Version, ($curDiff -join "; ")) }
+} catch { $promoteError = ("promotion failed: " + $_.Exception.Message) }
+
+if ($null -ne $promoteError) {
+  # Put back what was running, here and now, rather than leave a half-promoted current\ for the next restart.
+  $restored = $false
+  $restoreDetail = "no snapshot"
+  if ($haveSnapshot) {
+    try {
+      $left = @(Restore-FromSnapshot -snapCurrent $SnapCurrent -snapTools $SnapTools)
+      $restored = ($left.Count -eq 0)
+      $restoreDetail = $(if ($restored) { "restored from the snapshot, verified by hash" } else { "restore incomplete: " + ($left -join "; ") })
+    } catch { $restoreDetail = "restore failed: " + $_.Exception.Message }
+  }
+  if ($guardMode -eq "armed") {
+    # Restored: the guard has nothing left to watch. Not restored: leave it watching (it may still put things back).
+    if ($restored) { try { Set-PendingPhase "aborted" } catch { } }
+  }
+  $script:Stage = "verify"
+  Write-Log ("UPDATE FAILED at promotion: {0} ({1})" -f $promoteError, $restoreDetail)
+  Write-UpdateResult -ok $false -reason ("{0}; {1}" -f $promoteError, $restoreDetail) -stage "verify" -extra @{ installId = $script:InstallId; restored = $restored; guard = $guardMode }
+  exit 1
+}
+Write-Log "current\ verified: every file hashes equal to releases\$Version (agent $newAgentSha)."
 
 # ---- If the package ships a tools/ folder, merge into $BaseDir\tools ----
+$script:Stage = "tools"
 $pkgTools = Join-Path $relDir "tools"
 if (Test-Path -LiteralPath $pkgTools) {
   $destTools = Join-Path $BaseDir "tools"
   Ensure-Dir $destTools
   Write-Log "Package includes tools/ -- merging into $destTools"
-  # /E = copy subdirs including empty; no /MIR to avoid deleting scripts not in the package
-  Invoke-Robo $pkgTools $destTools @("/E") | Out-Null
-  Write-Log "Tools merge complete."
+  # /E = copy subdirs including empty; no /MIR to avoid deleting scripts not in the package.
+  # /IS /IT = copy every shipped file even when size and time match (the same skip that kept the old manifest).
+  Invoke-Robo $pkgTools $destTools @("/E", "/IS", "/IT", "/R:5", "/W:2", "/NP") | Out-Null
+  $toolDiff = @(Compare-TreeHashes (Get-TreeHashes $pkgTools) (Get-TreeHashes $destTools) -AllowExtra)
+  if ($toolDiff.Count -gt 0) { throw ("tools\ does not match the package after the merge: " + ($toolDiff -join "; ")) }
+  Write-Log "Tools merge complete and verified."
 }
 
 # Request restart (watchdog/host should honor)
+$script:Stage = "restart"
 if ($RequestRestart) {
+  Set-PendingPhase "promoted"
   $marker = Join-Path $ControlDir "restart.host"
   $msg = "restart requested $(Get-Date).ToUniversalTime().ToString('s')Z version=$Version"
   Set-Content -LiteralPath $marker -Value $msg -Encoding UTF8
   Write-Log "Wrote restart marker: $marker"
 }
 
-Write-UpdateResult -ok $true -reason "" -stage "complete"
-Write-Log "Update complete OK. Version=$Version"
-Write-Output ("OK: Updated BayAgent to {0}. ReleaseDir={1}. CurrentDir={2}. SignedFiles={3}. RestartRequested={4}" -f $Version, $relDir, $CurrentDir, $signCount, [bool]$RequestRestart)
+$script:Stage = "complete"
+Write-UpdateResult -ok $true -reason "" -stage "complete" -extra @{
+  installId     = $script:InstallId
+  verified      = $true
+  agentSha256   = $newAgentSha
+  guard         = $guardMode
+  guardNote     = $guardNote
+  snapshotSha256 = $snapAgentSha
+}
+Write-Log "Update complete OK. Version=$Version Guard=$guardMode"
+Write-Output ("OK: Updated BayAgent to {0}. ReleaseDir={1}. CurrentDir={2}. SignedFiles={3}. RestartRequested={4}. Verified=True. Guard={5}" -f $Version, $relDir, $CurrentDir, $signCount, [bool]$RequestRestart, $guardMode)
