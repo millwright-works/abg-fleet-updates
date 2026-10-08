@@ -273,7 +273,8 @@ try {
     # EndSession writes "closed" and closes the launcher itself; the stand-in, like Uneekor, only minimizes on a close.
     Set-Intent "closed" $null
     $m1 = Start-Process -FilePath $LaunchExe -ArgumentList "noclose" -PassThru
-    Start-Sleep -Seconds 8
+    # 13 s: past the polite-close-plus-8-s an ungraced closer would need (so its absence is visible), inside the 15 s grace.
+    Start-Sleep -Seconds 13
     Assert-True (-not $m1.HasExited) "within the 15 s grace after End (EndSession's own close goes first) the shell has not acted"
     Assert-True (Wait-Until { $m1.Refresh(); $m1.HasExited } 40) "then the relaunched launcher is ended (asked to close, then ended after 8 s: its X only minimizes)"
     $m2 = Start-Process -FilePath $LaunchExe -ArgumentList "noclose" -PassThru
@@ -350,6 +351,9 @@ try {
     Assert-True (Wait-Until { $h = Read-Hb; $null -ne $h -and $h.pid -eq $sh5.Id -and $h.degraded -eq $true } 40) "degraded after repeated failures"
     $h5 = Read-Hb
     Assert-True ($null -ne $h5 -and $h5.supervising -eq $false -and [string]$h5.degradedReason -match "failures") "...supervision stopped, and the heartbeat says why"
+    Start-Sleep -Seconds 20
+    $h5b = Read-Hb
+    Assert-True ($null -ne $h5b -and $h5b.degraded -eq $true -and $h5b.supervising -eq $false) "...and it stays stopped on later ticks (degraded never supervises again)"
     Start-Sleep -Seconds 4
     Assert-True (-not $sh5.HasExited) "...and the shell is still running (the agent does not restart a degraded companion)"
     Assert-True ((Get-LogText) -match "degraded: supervision stops") "the log records it"
