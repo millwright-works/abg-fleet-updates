@@ -195,6 +195,24 @@ try {
     Assert-True (-not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $ip) -NowUtc $UtcNow).Wanted) "absent intent: not wanted"
     $dtObj = [pscustomobject]@{ schema = 1; launcher = "wanted"; untilUtc = [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-08T13:00:00"), [DateTimeKind]::Utc) }
     Assert-True ((Get-KioskLauncherWanted -IntentRead @{ Ok = $true; Obj = $dtObj; Why = "" } -NowUtc $UtcNow).Wanted) "a DateTime value (what PowerShell 7's ConvertFrom-Json produces) is read"
+    # "closed" (no session may play): only an exact "closed" with a readable writtenUtc; anything else is hands off.
+    $ccases = @(
+        @{ T = "{`"schema`":1,`"launcher`":`"closed`",`"writtenUtc`":`"2026-10-08T11:59:00Z`"}"; C = $true; Why = "closed with a writtenUtc" },
+        @{ T = "{`"schema`":1,`"launcher`":`"closed`"}"; C = $false; Why = "closed without a writtenUtc: hands off" },
+        @{ T = "{`"schema`":1,`"launcher`":`"closed`",`"writtenUtc`":`"2026-10-08T11:59:00`"}"; C = $false; Why = "closed whose writtenUtc has no zone: hands off" },
+        @{ T = "{`"schema`":1,`"launcher`":`"Closed`",`"writtenUtc`":`"2026-10-08T11:59:00Z`"}"; C = $false; Why = "Closed in another case: hands off" },
+        @{ T = "{`"launcher`":`"closed`",`"writtenUtc`":`"2026-10-08T11:59:00Z`"}"; C = $false; Why = "closed without a schema: hands off" },
+        @{ T = "{`"schema`":1,`"launcher`":`"unmanaged`",`"writtenUtc`":`"2026-10-08T11:59:00Z`"}"; C = $false; Why = "unmanaged" },
+        @{ T = "{`"schema`":1,`"launcher`":`"not_wanted`",`"writtenUtc`":`"2026-10-08T11:59:00Z`"}"; C = $false; Why = "not_wanted (an older value): hands off" },
+        @{ T = "{`"schema`":1,`"launcher`":[`"closed`"],`"writtenUtc`":`"2026-10-08T11:59:00Z`"}"; C = $false; Why = "closed inside an array: hands off" }
+    )
+    foreach ($c in $ccases) {
+        $w = Get-KioskLauncherWanted -IntentRead (Read-Intent $c.T) -NowUtc $UtcNow
+        Assert-True ([bool]$w.Closed -eq $c.C -and -not $w.Wanted) ("{0}: closed={1} ({2})" -f $c.Why, $w.Closed, $w.Reason)
+    }
+    $wc = Get-KioskLauncherWanted -IntentRead (Read-Intent "{`"schema`":1,`"launcher`":`"closed`",`"writtenUtc`":`"2026-10-08T11:59:00Z`"}") -NowUtc $UtcNow
+    Assert-True ($wc.ClosedSinceUtc -eq (ConvertTo-KioskUtc "2026-10-08T11:59:00Z")) "closed carries when it was written (the shell's grace runs from it)"
+    Remove-Item -LiteralPath $ip -Force
 
     Section "K3 ConvertTo-KioskUtc"
     Assert-True ((ConvertTo-KioskUtc "2026-10-08T13:00:00Z") -eq [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-08T13:00:00"), [DateTimeKind]::Utc)) "Z text"
@@ -218,19 +236,24 @@ try {
     Assert-True ($r.UntilUtc -eq (ConvertTo-KioskUtc "2026-10-08T13:02:00Z")) "Start without playEndUtc falls back to endUtc"
     $payNoEnd = [pscustomobject]@{ mode = "Start"; baySessionId = "s-1" }
     $r = Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload $payNoEnd -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow
-    Assert-True ($r.Launcher -eq "not_wanted") "Start without a readable end: not wanted (the agent starts the launcher itself, nothing restarts it)"
+    Assert-True ($r.Launcher -eq "unmanaged") "Start without a readable end: unmanaged (the agent starts the launcher itself; the shell neither restarts nor closes it)"
     $payNoZone = [pscustomobject]@{ mode = "Start"; baySessionId = "s-1"; playEndUtc = "2026-10-08T12:55:00" }
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload $payNoZone -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "not_wanted") "Start whose end has no zone: not wanted"
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload $payStart -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $true -NowUtc $UtcNow).Launcher -eq "not_wanted") "Start with the emergency stop engaged: not wanted"
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Prep" -Payload $payStart -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "not_wanted") "Prep: not wanted (no early play)"
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "start-disabled" -Payload $payStart -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "not_wanted") "Start with launcher.startOnStart=false: not wanted"
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payStart -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "not_wanted") "EndSession of the current session: not wanted"
-    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payStart -CurrentIntentRead $none -SameSession $false -EmergencyStopEngaged $false -NowUtc $UtcNow)) "a late EndSession for an older session leaves the intent alone"
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload ([pscustomobject]@{}) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "not_wanted") "Reset: not wanted"
-    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "engage" }) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "not_wanted") "emergency stop engage: not wanted"
-    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "clear" }) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "emergency stop clear: no change (clearing never makes the launcher wanted)"
-    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_HEALTHCHECK -Mode "" -Payload ([pscustomobject]@{}) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "HealthCheck: no change"
+    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload $payNoZone -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "unmanaged") "Start whose end has no zone: unmanaged"
+    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload $payStart -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $true -NowUtc $UtcNow).Launcher -eq "unmanaged") "Start with the emergency stop engaged: unmanaged"
     $curWanted = @{ Ok = $true; Why = ""; Obj = [pscustomobject]@{ schema = 1; launcher = "wanted"; untilUtc = "2026-10-08T12:57:00Z"; baySessionId = "s-1" } }
+    $curClosed = @{ Ok = $true; Why = ""; Obj = [pscustomobject]@{ schema = 1; launcher = "closed"; writtenUtc = "2026-10-08T11:00:00Z"; baySessionId = "s-0" } }
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Prep" -Payload ([pscustomobject]@{ mode = "Prep"; baySessionId = "s-2" }) -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "Prep of the NEXT booking while this one plays: no change (it must not close or stop restarting the current game)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Prep" -Payload $payStart -CurrentIntentRead $curClosed -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "Prep after an End: no change (stays closed)"
+    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "start-disabled" -Payload $payStart -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "unmanaged") "Start with launcher.startOnStart=false: unmanaged"
+    $rEnd = Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payStart -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow
+    Assert-True ($rEnd.Launcher -eq "closed") "EndSession of the current session: closed (no free play after the end)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payStart -CurrentIntentRead $curWanted -SameSession $false -EmergencyStopEngaged $false -NowUtc $UtcNow)) "a late EndSession for an older session leaves the intent alone"
+    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload ([pscustomobject]@{}) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "closed") "Reset with nothing wanted: closed"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload ([pscustomobject]@{}) -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "Reset while a session is wanted (a canceled OTHER booking): no change, never closed over a game"
+    Assert-True ((Get-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "engage" }) -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow).Launcher -eq "unmanaged") "emergency stop during a session: unmanaged (no restarts; closes nothing)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "engage" }) -CurrentIntentRead $curClosed -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "emergency stop with no session: no change (stays closed)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "clear" }) -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "emergency stop clear: no change (clearing never makes the launcher wanted)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_HEALTHCHECK -Mode "" -Payload ([pscustomobject]@{}) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "HealthCheck: no change"
     $payExt = [pscustomobject]@{ mode = "Warn5"; baySessionId = "s-1"; playEndUtc = "2026-10-08T13:25:00Z" }
     $r = Get-KioskIntentForCommand -CommandType $CMD_UPDATESESSIONDISPLAY -Mode "Warn5" -Payload $payExt -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow
     Assert-True ($null -ne $r -and $r.Launcher -eq "wanted" -and $r.UntilUtc -eq (ConvertTo-KioskUtc "2026-10-08T13:27:00Z")) "UpdateSessionDisplay with a later end for the SAME session extends the intent"
@@ -250,31 +273,68 @@ try {
     Assert-True (-not (Test-Path -LiteralPath "$KioskIntentPath.tmp")) "no temporary file left behind"
     $raw = [IO.File]::ReadAllText($KioskIntentPath)
     Assert-True ($raw -match '"untilUtc":\s*"2026-10-08T12:57:00Z"') "untilUtc is stored as zoned text"
-    $ok = Write-KioskIntent -Launcher "not_wanted" -UntilUtc $null -SessionId "s-1" -Reason "test"
-    Assert-True ($ok -and -not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $UtcNow).Wanted) "not_wanted round-trips"
+    $ok = Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId "s-1" -Reason "test"
+    $wu = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $UtcNow
+    Assert-True ($ok -and -not $wu.Wanted -and -not $wu.Closed) "unmanaged round-trips (neither wanted nor closed)"
+    $ok = Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-1" -Reason "test"
+    $wcl = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ($ok -and $wcl.Closed -and $null -ne $wcl.ClosedSinceUtc -and [Math]::Abs(((Get-Date).ToUniversalTime() - $wcl.ClosedSinceUtc).TotalSeconds) -lt 60) "closed round-trips with its writtenUtc"
 
     # ============================================================ K6
-    Section "K6 the intent at agent start comes from session.json"
+    Section "K6 the intent at agent start: a readable one is kept; an absent one is derived, never as closed"
     $now6 = (Get-Date).ToUniversalTime()
     $sj = Join-Path $Sandbox "session.json"
+    function Read-IntentNow6 { return (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now6) }
+    function Remove-Intent { if (Test-Path -LiteralPath $KioskIntentPath) { Remove-Item -LiteralPath $KioskIntentPath -Force } }
+    Remove-Intent
     Set-TestFile $sj (ConvertTo-Json -InputObject ([ordered]@{ status = "ACTIVE"; baySessionId = "s-9"; sessionEndUtc = $now6.AddMinutes(30).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
     Initialize-KioskIntent -NowUtc $now6
-    $w = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now6
-    Assert-True ($w.Wanted -and $w.SessionId -eq "s-9") "ACTIVE with a future end: wanted (an agent restart mid-session keeps the member playing)"
+    $w = Read-IntentNow6
+    Assert-True ($w.Wanted -and $w.SessionId -eq "s-9") "no intent, ACTIVE with a future end: wanted (an agent restart mid-session keeps the member playing)"
+    Remove-Intent
+    Set-TestFile $sj (ConvertTo-Json -InputObject ([ordered]@{ status = "ENDED"; baySessionId = "s-9"; sessionEndUtc = $now6.AddMinutes(-30).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
+    Initialize-KioskIntent -NowUtc $now6
+    $w = Read-IntentNow6
+    Assert-True (-not $w.Wanted -and -not $w.Closed) "no intent, ENDED: unmanaged, never closed (session.json can be rewritten by a late EndSession of an older session)"
+    Remove-Intent
     Set-TestFile $sj (ConvertTo-Json -InputObject ([ordered]@{ status = "ENDED"; baySessionId = "s-9"; sessionEndUtc = $now6.AddMinutes(30).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
     Initialize-KioskIntent -NowUtc $now6
-    Assert-True (-not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now6).Wanted) "ENDED: not wanted"
+    $w = Read-IntentNow6
+    Assert-True (-not $w.Wanted -and -not $w.Closed) "no intent, ENDED with an end still ahead: not wanted (only ACTIVE or ENDING is a running session)"
+    Remove-Intent
     Set-TestFile $sj (ConvertTo-Json -InputObject ([ordered]@{ status = "ACTIVE"; baySessionId = "s-9"; sessionEndUtc = $now6.AddMinutes(-3).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
     Initialize-KioskIntent -NowUtc $now6
-    Assert-True (-not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now6).Wanted) "ACTIVE whose end passed more than the grace ago: not wanted"
+    Assert-True (-not (Read-IntentNow6).Wanted) "no intent, ACTIVE whose end passed more than the grace ago: not wanted"
+    Remove-Intent
+    Remove-Item -LiteralPath $sj -Force
+    Initialize-KioskIntent -NowUtc $now6
+    $w = Read-IntentNow6
+    Assert-True ((Test-Path -LiteralPath $KioskIntentPath) -and -not $w.Wanted -and -not $w.Closed) "no intent and no session.json: unmanaged, written"
+    # A readable intent outlives the restart, whatever session.json says.
+    Set-TestFile $sj (ConvertTo-Json -InputObject ([ordered]@{ status = "ENDED"; baySessionId = "s-old"; sessionEndUtc = $now6.AddMinutes(-90).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
+    [void](Write-KioskIntent -Launcher "wanted" -UntilUtc ($now6.AddMinutes(40)) -SessionId "s-9" -Reason "test")
+    Initialize-KioskIntent -NowUtc $now6
+    $w = Read-IntentNow6
+    Assert-True ($w.Wanted -and $w.SessionId -eq "s-9") "a readable wanted intent is kept although session.json says ENDED for an older session"
+    [void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-9" -Reason "test")
     Set-TestFile $sj (ConvertTo-Json -InputObject ([ordered]@{ status = "ACTIVE"; baySessionId = "s-9"; sessionEndUtc = $now6.AddMinutes(30).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
+    Initialize-KioskIntent -NowUtc $now6
+    Assert-True ((Read-IntentNow6).Closed) "a readable closed intent is kept"
+    Set-TestFile $KioskIntentPath "{ garbage"
+    Initialize-KioskIntent -NowUtc $now6
+    Assert-True ((Read-IntentNow6).Wanted) "an unreadable intent is derived again (ACTIVE: wanted)"
+    [void](Write-KioskIntent -Launcher "wanted" -UntilUtc ($now6.AddMinutes(40)) -SessionId "s-9" -Reason "test")
     $Global:EmergencyStopEngaged = $true
     Initialize-KioskIntent -NowUtc $now6
     $Global:EmergencyStopEngaged = $false
-    Assert-True (-not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now6).Wanted) "an engaged emergency stop at start: not wanted"
-    Remove-Item -LiteralPath $sj -Force
+    $w = Read-IntentNow6
+    Assert-True (-not $w.Wanted -and -not $w.Closed) "an engaged emergency stop at start turns wanted into unmanaged"
+    [void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-9" -Reason "test")
+    $Global:EmergencyStopEngaged = $true
     Initialize-KioskIntent -NowUtc $now6
-    Assert-True (-not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now6).Wanted) "no session.json: not wanted"
+    $Global:EmergencyStopEngaged = $false
+    Assert-True ((Read-IntentNow6).Closed) "...and leaves closed closed"
+    Remove-Item -LiteralPath $sj -Force
 
     # ============================================================ K7
     Section "K7 the activation verifier refuses every shape but a verified file, in order"
@@ -462,7 +522,8 @@ try {
     $Global:EffectiveConfig = @{ "Bay.AgentStatus" = $AGENTSTATUS_MAINTENANCE; "Bay.AgentStatusReason" = "test" }
     Invoke-KioskReconcileTick -NowUtc $now9 -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
     $Global:EffectiveConfig = $null
-    Assert-True (-not (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now9).Wanted) "Maintenance mode turns a wanted intent into not wanted"
+    $wm = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now9
+    Assert-True (-not $wm.Wanted -and -not $wm.Closed) "Maintenance mode turns a wanted intent into unmanaged (no restarts; never closed)"
 
     $cap = Get-KioskCapability
     $capJson = ConvertTo-Json -InputObject $cap -Depth 8 -Compress
@@ -486,14 +547,14 @@ try {
     $hbLive.supervising = $true; $hbLive.degraded = $true; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
     Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not when the shell is degraded"
     $hbLive.degraded = $false; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
-    [void](Write-KioskIntent -Launcher "not_wanted" -UntilUtc $null -SessionId "s-1" -Reason "test")
-    Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not when the intent is not wanted (a Start with no end time)"
+    [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId "s-1" -Reason "test")
+    Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not when the intent is unmanaged (a Start with no end time)"
     Set-TestFile $KioskKillSwitchPath ""
     [void](Write-KioskIntent -Launcher "wanted" -UntilUtc ($nowA.AddMinutes(30)) -SessionId "s-1" -Reason "test")
     Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not with the kill switch present"
     Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: not with the kill switch present"
     Remove-Item -LiteralPath $KioskKillSwitchPath -Force
-    [void](Write-KioskIntent -Launcher "not_wanted" -UntilUtc $null -SessionId "s-1" -Reason "test")
+    [void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-1" -Reason "test")
     Assert-True ((Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: a live supervising companion shell owns the wall whatever the intent"
     Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clGone).Defer) "wall: not when the shell process is gone"
     $hbLive.degraded = $true; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
@@ -506,12 +567,19 @@ try {
 
     # ============================================================ K11
     Section "K11 the shell's own decisions"
-    foreach ($w in @($true, $false)) { foreach ($rn in @($true, $false)) { foreach ($ab in @(0, 1, 2, 5)) { foreach ($al in @($true, $false)) { foreach ($pe in @($true, $false)) {
-        $a = Get-KioskLauncherAction -Wanted $w -Running $rn -AbsentTicks $ab -StartAllowed $al -PathExists $pe
-        if ($a -notin @("none", "wait", "held", "missing", "start")) { Assert-True $false "unexpected launcher action '$a'" }
-        if ($a -eq "start" -and -not ($w -and -not $rn -and $ab -ge 2 -and $al -and $pe)) { Assert-True $false "start without every condition (w=$w r=$rn a=$ab allowed=$al path=$pe)" }
-    } } } } }
-    Assert-True $true "the launcher action is one of none/wait/held/missing/start for all 160 combinations, never a stop, and start needs every condition"
+    $comboBad = 0; $combos = 0
+    foreach ($w in @($true, $false)) { foreach ($rn in @($true, $false)) { foreach ($ab in @(0, 1, 2, 5)) { foreach ($al in @($true, $false)) { foreach ($pe in @($true, $false)) { foreach ($cl in @($true, $false)) { foreach ($cf in @(0, 14, 15, 60)) {
+        if ($w -and $cl) { continue }   # the reader never returns both
+        $combos++
+        $a = Get-KioskLauncherAction -Wanted $w -Running $rn -AbsentTicks $ab -StartAllowed $al -PathExists $pe -Closed $cl -ClosedForSeconds $cf -CloseGraceSeconds 15
+        if ($a -notin @("none", "wait", "held", "missing", "start", "close")) { $comboBad++; Write-Host "        unexpected launcher action '$a'" }
+        if ($a -eq "start" -and -not ($w -and -not $rn -and $ab -ge 2 -and $al -and $pe)) { $comboBad++; Write-Host "        start without every condition (w=$w r=$rn a=$ab allowed=$al path=$pe closed=$cl)" }
+        if ($a -eq "close" -and -not ($cl -and $rn -and $cf -ge 15)) { $comboBad++; Write-Host "        close without every condition (closed=$cl running=$rn for=$cf)" }
+    } } } } } } }
+    Assert-True ($comboBad -eq 0 -and $combos -eq 384) "over all $combos combinations: start needs wanted+absent 2 ticks+allowed+path; close needs closed+running+15 s; nothing else acts"
+    Assert-True ((Get-KioskLauncherAction -Wanted $false -Running $true -AbsentTicks 0 -StartAllowed $true -PathExists $true -Closed $true -ClosedForSeconds 15) -eq "close") "closed for 15 s and a launcher running (a member relaunched it after End): close"
+    Assert-True ((Get-KioskLauncherAction -Wanted $false -Running $true -AbsentTicks 0 -StartAllowed $true -PathExists $true -Closed $true -ClosedForSeconds 14) -eq "none") "closed for 14 s: not yet (EndSession closes it first)"
+    Assert-True ((Get-KioskLauncherAction -Wanted $false -Running $true -AbsentTicks 0 -StartAllowed $true -PathExists $true -Closed $false -ClosedForSeconds 600) -eq "none") "unmanaged with a launcher running: hands off"
     Assert-True ((Get-KioskLauncherAction -Wanted $false -Running $false -AbsentTicks 9 -StartAllowed $true -PathExists $true) -eq "none") "not wanted, absent: nothing (no free play after End)"
     Assert-True ((Get-KioskLauncherAction -Wanted $true -Running $false -AbsentTicks 1 -StartAllowed $true -PathExists $true) -eq "wait") "wanted, absent one tick: wait"
     Assert-True ((Get-KioskLauncherAction -Wanted $true -Running $false -AbsentTicks 2 -StartAllowed $true -PathExists $true) -eq "start") "wanted, absent two ticks: start"
@@ -609,7 +677,14 @@ try {
     Assert-True (@($inWl | Where-Object { $_.Parent -is [System.Management.Automation.Language.CommandParameterAst] -or ($_.Parent -is [System.Management.Automation.Language.CommandAst] -and $_.Parent.GetCommandName() -ne "Get-ItemProperty") }).Count -eq 0) "...and both are arguments of Get-ItemProperty (a read)"
     Assert-True (@(Get-HiveStrings $ShellAst).Count -eq 0) "the shell's code names no registry hive at all"
     Assert-True (@($shellCode | Where-Object { $_ -match '(?i)^(Stop-Process|kill|spps|taskkill|taskkill\.exe|Stop-Computer|Restart-Computer|logoff|shutdown|shutdown\.exe)$' }).Count -eq 0) "the shell stops no process (and never signs out or restarts)"
-    Assert-True ($shellText -notmatch '(?i)\.Kill\(|CloseMainWindow|WM_CLOSE') "...and no .Kill() or window close either"
+    $shellEnds = @($ShellAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Extent.Text -match '(?i)^(Kill|CloseMainWindow|WaitForExit|CloseMainWindowAsync)$' }, $true))
+    $closeDef = @($ShellDefs | Where-Object { $_.Name -eq "Close-KioskLauncher" })[0]
+    $inClose = @($shellEnds | Where-Object { $_.Extent.StartOffset -ge $closeDef.Extent.StartOffset -and $_.Extent.EndOffset -le $closeDef.Extent.EndOffset })
+    Assert-True ($shellEnds.Count -eq 2 -and $inClose.Count -eq 2 -and @($inClose | Where-Object { $_.Member.Extent.Text -eq "Kill" }).Count -eq 1) "the shell ends a process in exactly one place: one CloseMainWindow and one Kill, both inside Close-KioskLauncher"
+    $closeCalls = @($ShellAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Close-KioskLauncher" }, $true))
+    Assert-True ($closeCalls.Count -eq 1 -and $closeCalls[0].Parent.Parent.Extent.Text -match '^\{\s*Close-KioskLauncher' -and $closeCalls[0].Parent.Parent.Parent.Extent.Text -match '^switch \(\$action\)') "...reached only from the 'close' clause of the launcher action switch"
+    $closeText = Get-DefText $ShellDefs "Close-KioskLauncher"
+    Assert-True ($closeText -match '\$fresh\.ProcessName -ine \[string\]\$S\.Cfg\.LauncherName -or \$fresh\.SessionId -ne \$S\.SessionId -or \$null -eq \$fst -or \$fst -ne \$rec\.Start') "...and it re-checks name, session and start time before ending anything"
     Assert-True (@($shellCode | Where-Object { $_ -match '(?i)^Remove-Item$' }).Count -eq 1 -and (Get-DefText $ShellDefs "Remove-KioskOldLogs") -match 'Remove-Item') "the shell's only Remove-Item is the 14-day log retention"
     Assert-True ($shellText -notmatch '(?i)Invoke-RestMethod|Invoke-WebRequest|EffectiveConfig|ConfigItem|BayProfile|dataverse|crm\.dynamics') "the shell reads nothing from the platform (I6)"
     Assert-True (@([regex]::Matches($shellText, '(?m)^\$BaseDir = "C:\\AllBirdies\\BayAgent"\r?$')).Count -eq 1) "the shell has exactly one install-path literal (the launch test repoints only it)"
@@ -674,11 +749,14 @@ try {
     $wallRes = $null; try { $wallRes = Test-RealStartSessionDisplay ([pscustomobject]@{}) } catch { $wallRes = @{ reason = "threw: " + $_.Exception.Message } }
     Assert-True ($null -ne $wallRes -and $wallRes.reason -eq "kiosk_shell_owns_wall") "Start-SessionDisplay leaves the wall to the live supervising shell (got: $(if ($wallRes) { $wallRes.reason }))"
 
+    function Get-IntentField([string]$f) { try { return [string](([IO.File]::ReadAllText($KioskIntentPath) | ConvertFrom-Json).$f) } catch { return "" } }
     $res = Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-1" ',"launcher":{"startOnStart":false}') -BayLabel "Bay"
-    Assert-True (-not (Get-IntentNow).Wanted -and $script:LauncherStarts -eq 0 -and $res.launcher.reason -eq "startOnStart_false") "Start with launcher.startOnStart=false: not wanted, so the shell cannot start what the agent would not"
+    Assert-True ((Get-IntentField "launcher") -eq "unmanaged" -and $script:LauncherStarts -eq 0 -and $res.launcher.reason -eq "startOnStart_false") "Start with launcher.startOnStart=false: unmanaged, so the shell neither starts nor closes what the agent left alone"
 
+    $reasonBefore = Get-IntentField "writtenUtc"
+    Start-Sleep -Milliseconds 1100
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Prep" "s-1") -BayLabel "Bay")
-    Assert-True (-not (Get-IntentNow).Wanted) "Prep: not wanted"
+    Assert-True ((Get-IntentField "writtenUtc") -eq $reasonBefore -and (Get-IntentField "launcher") -eq "unmanaged") "Prep: the intent is not touched"
 
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-1") -BayLabel "Bay")
     Assert-True ((Get-IntentNow).Wanted) "Start again: wanted"
@@ -688,11 +766,15 @@ try {
     # Start s-1 again so the next EndSession is judged against s-1.)
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-1") -BayLabel "Bay")
     $res = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-1") -BayLabel "Bay"
-    Assert-True (-not (Get-IntentNow).Wanted -and $res.kiosk.launcher -eq "not_wanted") "EndSession of the current session: not wanted"
+    Assert-True ((Get-IntentNow).Closed -and $res.kiosk.launcher -eq "closed") "EndSession of the current session: closed"
 
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-2") -BayLabel "Bay")
     [void](Execute-Command -CommandType $CMD_RESET -PayloadJson '{}' -BayLabel "Bay")
-    Assert-True (-not (Get-IntentNow).Wanted) "Reset: not wanted"
+    Assert-True ((Get-IntentNow).Wanted) "Reset while s-2 plays (a canceled other booking): s-2 stays wanted"
+    [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-2") -BayLabel "Bay")
+    Assert-True ((Get-IntentNow).Closed) "EndSession s-2: closed"
+    [void](Execute-Command -CommandType $CMD_RESET -PayloadJson '{}' -BayLabel "Bay")
+    Assert-True ((Get-IntentNow).Closed) "Reset with nothing playing: closed"
 
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-3") -BayLabel "Bay")
     $later = (Get-Date).ToUniversalTime().AddMinutes(80).ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -700,11 +782,47 @@ try {
     $wNow = Get-IntentNow
     Assert-True ($wNow.Wanted -and $wNow.UntilUtc -eq (ConvertTo-KioskUtc $later).AddSeconds(120)) "UpdateSessionDisplay with a later end for the same session extends the intent"
     [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"engage","reason":"test"}' -BayLabel "Bay")
-    Assert-True (-not (Get-IntentNow).Wanted) "emergency stop: not wanted"
+    $we = Get-IntentNow
+    Assert-True (-not $we.Wanted -and -not $we.Closed -and (Get-IntentField "launcher") -eq "unmanaged") "emergency stop during a session: unmanaged (no restarts, closes nothing)"
     $script:LauncherStarts = 0
     $res = Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-4") -BayLabel "Bay"
-    Assert-True (-not (Get-IntentNow).Wanted -and $script:LauncherStarts -eq 0 -and $res.note -eq "emergency_stop_engaged") "Start while the stop is engaged: refused, not wanted"
+    Assert-True ((Get-IntentField "launcher") -eq "unmanaged" -and $script:LauncherStarts -eq 0 -and $res.note -eq "emergency_stop_engaged") "Start while the stop is engaged: refused, unmanaged"
     $Global:EmergencyStopEngaged = $false
+
+    # ============================================================ K14
+    Section "K14 the shell's one closer ends only the process it began to close (real process, injected clock)"
+    foreach ($st in @($ShellAst.EndBlock.Statements)) {
+        if ($st -is [System.Management.Automation.Language.AssignmentStatementAst] -and $st.Left.Extent.Text -match '^\$KioskClose') { . ([scriptblock]::Create($st.Extent.Text)) }
+    }
+    $dummy = Start-Process -FilePath (Join-Path $env:WINDIR "System32\PING.EXE") -ArgumentList "-n 300 127.0.0.1" -WindowStyle Hidden -PassThru
+    try {
+        $own = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+        $S14 = @{ Closing = @{}; Cfg = @{ LauncherName = "PING" }; SessionId = $own }
+        function Test-DummyAlive { try { $p = Get-Process -Id $dummy.Id -ErrorAction Stop; return (-not $p.HasExited) } catch { return $false } }
+        $t0 = (Get-Date).ToUniversalTime()
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0
+        Assert-True ((Test-DummyAlive) -and $S14.Closing.ContainsKey($dummy.Id)) "first pass: asked to close (no window here), recorded, not ended"
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(5)
+        Assert-True (Test-DummyAlive) "5 s later: not ended yet (the polite close gets $KioskCloseKillAfterSeconds s)"
+        $S14.Closing[$dummy.Id].Start = ([DateTime]$S14.Closing[$dummy.Id].Start).AddSeconds(-30)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(9)
+        Assert-True ((Test-DummyAlive) -and -not $S14.Closing.ContainsKey($dummy.Id)) "a different start time than recorded (a reused id): NOT ended, and forgotten"
+        $S14.Cfg = @{ LauncherName = "SomethingElse" }
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(10)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(19)
+        Assert-True (Test-DummyAlive) "a process that is not the configured launcher: NOT ended"
+        $S14.Cfg = @{ LauncherName = "PING" }; $S14.SessionId = $own + 1000
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(20)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(29)
+        Assert-True (Test-DummyAlive) "a process in another session: NOT ended"
+        $S14.SessionId = $own
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(30)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(39)
+        $gone = $false; for ($i = 0; $i -lt 20 -and -not $gone; $i++) { if (-not (Test-DummyAlive)) { $gone = $true } else { Start-Sleep -Milliseconds 200 } }
+        Assert-True $gone "the configured launcher, same session, same start, 9 s after the polite close: ended"
+    } finally {
+        try { if (-not $dummy.HasExited) { Stop-Process -Id $dummy.Id -Force -ErrorAction SilentlyContinue } } catch { }
+    }
 }
 finally {
     try { Remove-Item -LiteralPath $Sandbox -Recurse -Force -ErrorAction SilentlyContinue } catch {}

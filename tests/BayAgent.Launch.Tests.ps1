@@ -501,7 +501,7 @@ try {
         Assert-True ($shellProcs.Count -eq 0) "[$kmode] no kiosk shell process exists for this install"
         foreach ($sp7 in $shellProcs) { try { Stop-Process -Id $sp7.ProcessId -Force } catch { } }
         $int7 = $null; try { $int7 = [IO.File]::ReadAllText((Join-Path $l7.Root "state\kiosk-intent.json")) | ConvertFrom-Json } catch { }
-        Assert-True ($null -ne $int7 -and $int7.launcher -eq "not_wanted" -and [string]$int7.reason -match "agent start") "[$kmode] the intent was derived at start: not wanted (no session.json)"
+        Assert-True ($null -ne $int7 -and $int7.launcher -eq "unmanaged" -and [string]$int7.reason -match "agent start") "[$kmode] the intent was derived at start: unmanaged (no intent file, no session.json; never closed from a guess)"
         $patches = @($sync["Requests"] | Select-Object -Skip $before7 | Where-Object { $_.requestLine -match '^PATCH /api/data/v9\.2/build_baies\(' })
         $capBody = ($patches | ForEach-Object { $_.body }) -join "`n"
         Write-Host ("        [L7-{0}] {1} PATCH(es) to the bay row, {2} chars" -f $kmode, $patches.Count, $capBody.Length) -ForegroundColor DarkGray

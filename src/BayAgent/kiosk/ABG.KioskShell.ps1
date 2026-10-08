@@ -5,7 +5,7 @@ WHAT THIS IS
   The bay kiosk shell: a small supervisor that runs in the BayKiosk desktop session and keeps the bay's two
   programs where a member expects them:
     - the golf launcher, restarted after it closes ONLY while BayAgent says a session wants it, placed and
-      maximized on the control screen (the touchscreen);
+      maximized on the control screen (the touchscreen), and closed if a member reopens it after the session ended;
     - the wall display (Edge, the same profile folder BayAgent uses), kept up on the session screen (the TV).
   Design: C:\aoc-wt\reports\kiosk-shell-design-2026-10-06.md. It replaces the never-shipped ABG.LauncherShell.ps1,
   which reopened the launcher 2 s after ANY exit (free play after every session) and never placed it.
@@ -19,11 +19,13 @@ WHAT THIS RELEASE DOES AND DOES NOT DO
   is never started by it.
 
 RULES IT KEEPS (each one is a test)
-  - It NEVER closes the launcher and never stops any process at all (EndSession closes the launcher; the self-heal
-    watchdog closes a frozen one; nothing else kills anything). With one screen it moves the wall display aside
-    (minimizes it) rather than closing it.
   - It restarts the launcher only while state\kiosk-intent.json says "wanted" AND the time is before its untilUtc.
-    Anything unreadable, absent, expired or unknown means "not wanted".
+  - It closes a launcher ONLY under an explicit "closed" intent (written by EndSession of the running session and by a
+    Reset outside a session), 15 s after it was written (EndSession closes the launcher itself first): the backstop for
+    a member who relaunches the launcher from the desktop after the end (bench Part B Test 11; A0.360 "the launcher
+    appears only from session start to play end"). By process id, only the configured launcher in this session.
+  - Anything unreadable, absent, expired, "unmanaged" or unknown means hands off: never restart, never close. It stops
+    no other process. With one screen it moves the wall display aside (minimizes it) rather than closing it.
   - It takes its program paths and screen roles from the LOCAL agent-config.json only, never from the platform.
   - Every failure ends at the Windows desktop: in companion mode Explorer is already the desktop; if this script ever
     finds no Explorer in its session it starts one, and it never exits while there is no Explorer.
@@ -77,6 +79,8 @@ $KioskLauncherStartWindowSec = 120
 $KioskEdgeMaxStarts          = 3
 $KioskEdgeStartWindowSec     = 300
 $KioskPlaceWaitSeconds       = 15     # how long a newly started program has to show a window before placement gives up
+$KioskCloseGraceSeconds      = 15     # a closed intent this old before the shell closes a launcher (EndSession goes first)
+$KioskCloseKillAfterSeconds  = 8      # after asking a launcher to close, end it if it is still there (its X only minimizes)
 $KioskDegradeAfterFailures   = 5      # inner failures inside the window below = degraded (supervision stops)
 $KioskDegradeWindowSec       = 600
 $KioskLogRetentionDays       = 14
@@ -175,9 +179,13 @@ function Get-KioskPolicyDecision($PolicyRead, [bool]$KillSwitchPresent, [string[
 }
 
 function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
-    # "Wanted" only for a readable intent whose launcher field is exactly "wanted" and whose untilUtc (with its zone)
-    # is in the future. Any other shape is "not wanted" and says why. Newer schemas are read by field name.
-    $w = @{ Wanted = $false; Reason = ""; UntilUtc = $null; SessionId = $null }
+    # Three answers, read strictly:
+    #   Wanted   only for an exact "wanted" whose untilUtc (with its zone) is in the future: the shell restarts it.
+    #   Closed   only for an exact "closed" with a readable writtenUtc: no session may play (written by EndSession of the
+    #            running session, and by Reset outside a session); the shell closes a launcher that appears (A0.360).
+    #   neither  ("unmanaged", "not_wanted", expired, unreadable, unknown): hands off, never restart, never close.
+    # A failure to read is never a reason to close anything. Newer schemas are read by field name.
+    $w = @{ Wanted = $false; Closed = $false; ClosedSinceUtc = $null; Reason = ""; UntilUtc = $null; SessionId = $null }
     if ($null -eq $IntentRead -or -not $IntentRead.Ok) {
         $why = $(if ($null -ne $IntentRead) { [string]$IntentRead.Why } else { "no read" })
         $w.Reason = "intent unreadable ($why)"; return $w
@@ -188,6 +196,14 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
     $sid = Get-KioskProp $o "baySessionId" $null
     if ($sid -is [string]) { $w.SessionId = $sid }
     $l = Get-KioskProp $o "launcher" $null
+    if ($l -is [string] -and $l -ceq "closed") {
+        $since = ConvertTo-KioskUtc (Get-KioskProp $o "writtenUtc" $null)
+        if ($null -eq $since) { $w.Reason = "intent closed without a readable writtenUtc (left alone)"; return $w }
+        $w.Closed = $true
+        $w.ClosedSinceUtc = $since
+        $w.Reason = "intent closed (no session)"
+        return $w
+    }
     if ($l -isnot [string] -or $l -cne "wanted") { $w.Reason = "intent says not wanted"; return $w }
     $until = ConvertTo-KioskUtc (Get-KioskProp $o "untilUtc" $null)
     if ($null -eq $until) { $w.Reason = "intent untilUtc missing or without a zone"; return $w }
@@ -294,10 +310,15 @@ function Get-KioskFloorAction([bool]$CompanionRole, [bool]$Supervise, [bool]$Exp
     return "idle"
 }
 
-function Get-KioskLauncherAction([bool]$Wanted, [bool]$Running, [int]$AbsentTicks, [bool]$StartAllowed, [bool]$PathExists) {
+function Get-KioskLauncherAction([bool]$Wanted, [bool]$Running, [int]$AbsentTicks, [bool]$StartAllowed, [bool]$PathExists, [bool]$Closed = $false, [double]$ClosedForSeconds = 0, [int]$CloseGraceSeconds = 15) {
     # Start only after the launcher has been seen absent on two ticks in a row (2 to 4 s; a member who closes it gets it
-    # back, and a program that is just replacing its own process is not doubled). Never "stop": this shell closes
-    # nothing.
+    # back, and a program that is just replacing its own process is not doubled). "close" only under an explicit closed
+    # intent, and only once it is CloseGraceSeconds old (EndSession closes the launcher itself right after writing it;
+    # the shell is the backstop for a member who relaunches it from the desktop after the end, bench Part B Test 11).
+    if ($Closed) {
+        if ($Running -and $ClosedForSeconds -ge $CloseGraceSeconds) { return "close" }
+        return "none"
+    }
     if (-not $Wanted) { return "none" }
     if ($Running) { return "none" }
     if (-not $PathExists) { return "missing" }
@@ -627,6 +648,7 @@ function New-KioskState {
         LauncherPid       = $null
         LauncherPlaceUntil = $null
         LauncherPlacedSig = ""
+        Closing           = @{}
         WallPids          = @()
         WallRunning       = $false
         WallStarts        = [DateTime[]]@()
@@ -671,6 +693,8 @@ function Write-KioskHeartbeat($S, [DateTime]$NowUtc, [switch]$Force) {
             topology       = [ordered]@{ count = @($S.Screens).Count; signature = $S.TopoSig; stable = ($S.TopoSig -eq $S.TopoStableSig) }
             launcher       = [ordered]@{
                 wanted   = $(if ($null -ne $S.Wanted) { [bool]$S.Wanted.Wanted } else { $false })
+                closed   = $(if ($null -ne $S.Wanted) { [bool]$S.Wanted.Closed } else { $false })
+                closing  = @($S.Closing.Keys)
                 reason   = $(if ($null -ne $S.Wanted) { $S.Wanted.Reason } else { $null })
                 untilUtc = $(if ($null -ne $S.Wanted -and $null -ne $S.Wanted.UntilUtc) { $S.Wanted.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null })
                 running  = $launcherRunning
@@ -685,13 +709,43 @@ function Write-KioskHeartbeat($S, [DateTime]$NowUtc, [switch]$Force) {
             stopping       = [bool]$S.Stop
             stopReason     = $S.StopReason
         }
-        $sig = (ConvertTo-Json -InputObject ([ordered]@{ a = $hb.supervising; b = $hb.launcher.wanted; c = $hb.launcher.running; d = $hb.wall; e = $hb.topology; f = $hb.degraded; g = $hb.stopping; h = $hb.policyMode }) -Compress -Depth 5)
+        $sig = (ConvertTo-Json -InputObject ([ordered]@{ a = $hb.supervising; b = $hb.launcher.wanted; b2 = $hb.launcher.closed; c = $hb.launcher.running; d = $hb.wall; e = $hb.topology; f = $hb.degraded; g = $hb.stopping; h = $hb.policyMode }) -Compress -Depth 5)
         if (-not $Force -and $sig -eq $S.HeartbeatSig -and ($NowUtc - $S.HeartbeatUtc).TotalSeconds -lt $KioskHeartbeatEverySeconds) { return }
         Write-KioskJsonAtomic -Path $KioskHeartbeatPath -Obj $hb
         $S.HeartbeatUtc = $NowUtc
         $S.HeartbeatSig = $sig
     } catch {
         Write-KioskLog ("heartbeat could not be written: " + $_.Exception.Message) "WARN" "heartbeat-error"
+    }
+}
+
+function Close-KioskLauncher($S, [object[]]$Procs, [DateTime]$NowUtc) {
+    # Reached ONLY from the "close" action (an explicit closed intent, CloseGraceSeconds old). The only place this shell
+    # ends a process. By process id, and only a process that is STILL the configured launcher, in this session, with the
+    # start time it had when the close began (a reused id is never touched). First a polite close of its window; after
+    # $KioskCloseKillAfterSeconds the process is ended (bench Part B: the launcher's X only minimizes it).
+    foreach ($p in @($Procs)) {
+        $procId = [int]$p.Id
+        $st = $null; try { $st = $p.StartTime.ToUniversalTime() } catch { $st = $null }
+        if (-not $S.Closing.ContainsKey($procId)) {
+            $S.Closing[$procId] = @{ First = $NowUtc; Start = $st }
+            try { [void]$p.CloseMainWindow() } catch { }
+            Write-KioskLog ("launcher pid {0} is running with no session (intent closed): asked it to close" -f $procId) "WARN"
+            continue
+        }
+        $rec = $S.Closing[$procId]
+        if (($NowUtc - $rec.First).TotalSeconds -lt $KioskCloseKillAfterSeconds) { continue }
+        $fresh = $null
+        try { $fresh = Get-Process -Id $procId -ErrorAction Stop } catch { $fresh = $null }
+        $S.Closing.Remove($procId)
+        if ($null -eq $fresh) { continue }
+        $fst = $null; try { $fst = $fresh.StartTime.ToUniversalTime() } catch { $fst = $null }
+        if ($fresh.ProcessName -ine [string]$S.Cfg.LauncherName -or $fresh.SessionId -ne $S.SessionId -or $null -eq $fst -or $fst -ne $rec.Start) {
+            Write-KioskLog ("pid {0} is no longer the launcher it was; left alone" -f $procId) "WARN"
+            continue
+        }
+        try { $fresh.Kill(); Write-KioskLog ("launcher pid {0} did not close within {1} s with no session: ended" -f $procId, $KioskCloseKillAfterSeconds) "WARN" }
+        catch { Write-KioskLog ("launcher pid {0} could not be ended: {1}" -f $procId, $_.Exception.Message) "ERROR" }
     }
 }
 
@@ -733,7 +787,7 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
 
     # ---- launcher ----
     $S.Wanted = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192) -NowUtc $NowUtc
-    Write-KioskLog ("launcher " + $(if ($S.Wanted.Wanted) { "wanted until " + $S.Wanted.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { "not wanted (" + $S.Wanted.Reason + ")" })) "INFO" "wanted"
+    Write-KioskLog ("launcher " + $(if ($S.Wanted.Wanted) { "wanted until " + $S.Wanted.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } elseif ($S.Wanted.Closed) { "closed (no session) since " + $S.Wanted.ClosedSinceUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { "hands off (" + $S.Wanted.Reason + ")" })) "INFO" "wanted"
     $procs = @(Get-KioskProcessesInSession -Name $S.Cfg.LauncherName -SessionId $S.SessionId)
     if ($procs.Count -gt 0) {
         $S.LauncherAbsent = 0
@@ -743,10 +797,13 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
         $S.LauncherAbsent++
         $S.LauncherPid = $null
     }
+    $closedFor = $(if ($S.Wanted.Closed -and $null -ne $S.Wanted.ClosedSinceUtc) { ($NowUtc - $S.Wanted.ClosedSinceUtc).TotalSeconds } else { 0 })
     $action = Get-KioskLauncherAction -Wanted ([bool]$S.Wanted.Wanted) -Running ($procs.Count -gt 0) -AbsentTicks $S.LauncherAbsent `
         -StartAllowed (Test-KioskStartAllowed -Times $S.LauncherStarts -NowUtc $NowUtc -WindowSeconds $KioskLauncherStartWindowSec -MaxStarts $KioskLauncherMaxStarts) `
-        -PathExists (Test-Path -LiteralPath $S.Cfg.LauncherPath -PathType Leaf)
+        -PathExists (Test-Path -LiteralPath $S.Cfg.LauncherPath -PathType Leaf) -Closed ([bool]$S.Wanted.Closed) -ClosedForSeconds $closedFor -CloseGraceSeconds $KioskCloseGraceSeconds
+    if ($action -ne "close" -and $S.Closing.Count -gt 0) { $S.Closing.Clear() }
     switch ($action) {
+        "close" { Close-KioskLauncher -S $S -Procs $procs -NowUtc $NowUtc }
         "start" {
             $keep = $NowUtc.AddSeconds(-2 * $KioskLauncherStartWindowSec)
             $S.LauncherStarts = [DateTime[]]@(@(@($S.LauncherStarts) | Where-Object { $_ -gt $keep }) + $NowUtc)
@@ -810,7 +867,7 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
 
     # ---- placement, only on a stable layout, once per window per layout ----
     if ($stable -and @($S.Screens).Count -gt 0) {
-        if ($null -ne $S.LauncherPid -and $S.LauncherPlacedSig -ne $S.TopoStableSig) {
+        if ($null -ne $S.LauncherPid -and $S.LauncherPlacedSig -ne $S.TopoStableSig -and -not $S.Wanted.Closed) {
             $r = Set-KioskWindowPlacement -Pids @([int]$S.LauncherPid) -Screen $roles.Control -Maximize
             if ($r.Done -or ($null -ne $S.LauncherPlaceUntil -and $NowUtc -ge $S.LauncherPlaceUntil) -or $null -eq $S.LauncherPlaceUntil) {
                 $S.LauncherPlacedSig = $S.TopoStableSig

@@ -17,8 +17,10 @@ WHAT IT PROVES
   S3  intent wanted: launcher started, placed maximized on the control screen; on this one-screen PC the wall is moved
       aside (minimized), never closed
   S4  the launcher is stopped by its id (a member closing it): restarted within seconds, new id
-  S5  intent flips to not wanted: the running launcher is NOT closed by the shell (EndSession's job); stopped by id, it
-      is NOT restarted; the wall comes back from aside
+  S5  intent flips to unmanaged: the running launcher is NOT closed; stopped by id, it is NOT restarted; the wall comes
+      back from aside
+  S5b ACCEPTANCE (Part B Test 11): under a "closed" intent (after End) a launcher a member relaunches is ended, after
+      the 15 s grace, even though its close only minimizes it; a second relaunch is ended again
   S6  an expired intent and a garbage intent: no restart
   S7  a second copy exits 0 at once and starts nothing
   S8  the policy flips to explorer: the shell exits 0, leaving the launcher and the wall running
@@ -77,7 +79,7 @@ function Set-Text([string]$p, [string]$t) { [IO.File]::WriteAllText($p, $t, (New
 function Set-Policy([string]$mode) { Set-Text $PolicyPath ("{`"schema`":1,`"mode`":`"$mode`",`"minShellBytes`":4096}") }
 function Set-Intent([string]$launcher, $untilUtc) {
     $u = $(if ($null -ne $untilUtc) { '"' + ([DateTime]$untilUtc).ToString("yyyy-MM-ddTHH:mm:ssZ") + '"' } else { "null" })
-    Set-Text $IntentPath ("{`"schema`":1,`"launcher`":`"$launcher`",`"untilUtc`":$u,`"baySessionId`":`"live`"}")
+    Set-Text $IntentPath ("{`"schema`":1,`"launcher`":`"$launcher`",`"untilUtc`":$u,`"baySessionId`":`"live`",`"writtenUtc`":`"" + (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") + "`"}")
 }
 function Read-Hb { try { return ([IO.File]::ReadAllText($HbPath) | ConvertFrom-Json) } catch { return $null } }
 
@@ -98,9 +100,13 @@ public static class AbgKsStub {
         var f = new Form();
         f.Text = "Kiosk shell live test stand-in (closes itself in 10 minutes)";
         f.Width = 360; f.Height = 120;
+        bool noClose = args.Length > 0 && args[0] == "noclose";
+        bool leaving = false;
+        // "noclose": like the Uneekor launcher measured in bench Part B, its X (a window close) only minimizes it.
+        f.FormClosing += (s, e) => { if (noClose && !leaving) { e.Cancel = true; f.WindowState = FormWindowState.Minimized; } };
         var quit = new Timer();
         quit.Interval = 600000;
-        quit.Tick += (s, e) => { Application.Exit(); };
+        quit.Tick += (s, e) => { leaving = true; Application.Exit(); };
         quit.Start();
         Application.Run(f);
     }
@@ -116,7 +122,7 @@ $LaunchExe = Join-Path $Root ($LaunchName + ".exe")
 $WallExe = Join-Path $Root ($WallName + ".exe")
 function Write-Config([string]$launcherPath, [string]$wallPath) {
     $c = [ordered]@{
-        launcher = [ordered]@{ path = $launcherPath; args = ""; processName = $LaunchName }
+        launcher = [ordered]@{ path = $launcherPath; args = "noclose"; processName = $LaunchName }
         sessionDisplay = [ordered]@{ mode = "kiosk"; url = "about:blank"; profileDir = (Join-Path $Root "edge-profile"); edgePath = $wallPath }
     }
     Set-Text $CfgPath (ConvertTo-Json -InputObject $c -Depth 5)
@@ -228,17 +234,29 @@ try {
     Stop-Process -Id $l1Id -Force
     Assert-True (Wait-Until { @(Get-Ours $LaunchName | Where-Object { $_.Id -ne $l1Id }).Count -eq 1 } 10) "restarted within 10 s with a new id"
 
-    Section "S5 not wanted: the shell never closes it, and never reopens it"
-    Set-Intent "not_wanted" $null
-    Start-Sleep -Seconds 6
+    Section "S5 unmanaged (a Start with no end, an emergency stop): hands off, neither closed nor reopened"
+    Set-Intent "unmanaged" $null
+    Start-Sleep -Seconds 20
     $l2 = @(Get-Ours $LaunchName)
-    Assert-True ($l2.Count -eq 1) "6 s after 'not wanted' the running launcher is still running (closing it is EndSession's job)"
+    Assert-True ($l2.Count -eq 1) "20 s after 'unmanaged' the running launcher is still running"
     if ($screenCount -eq 1) {
         Assert-True (Wait-Until { $w = [AbgKsProbe]::WindowOf($wallPid); $w -ne [IntPtr]::Zero -and -not [AbgKsProbe]::IsIconic($w) } 20) "the wall comes back from aside"
     }
     if ($l2.Count) { Stop-Process -Id $l2[0].Id -Force }
     Start-Sleep -Seconds 8
-    Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "stopped after the end: NOT restarted (8 s; no free play after End)"
+    Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "stopped while unmanaged: NOT restarted (8 s)"
+
+    Section "S5b ACCEPTANCE (bench Part B Test 11): after End, a member who relaunches the launcher is closed again"
+    # EndSession writes "closed" and closes the launcher itself; the stand-in, like Uneekor, only minimizes on a close.
+    Set-Intent "closed" $null
+    $m1 = Start-Process -FilePath $LaunchExe -ArgumentList "noclose" -PassThru
+    Start-Sleep -Seconds 8
+    Assert-True (-not $m1.HasExited) "within the 15 s grace after End (EndSession's own close goes first) the shell has not acted"
+    Assert-True (Wait-Until { $m1.Refresh(); $m1.HasExited } 40) "then the relaunched launcher is ended (asked to close, then ended after 8 s: its X only minimizes)"
+    $m2 = Start-Process -FilePath $LaunchExe -ArgumentList "noclose" -PassThru
+    Assert-True (Wait-Until { $m2.Refresh(); $m2.HasExited } 20) "relaunched again later: ended again within 20 s"
+    Assert-True ((Get-LogText) -match "running with no session \(intent closed\)") "the log says why"
+    Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "and the shell itself started nothing"
 
     Section "S6 an expired intent and a garbage intent restart nothing"
     Set-Intent "wanted" ((Get-Date).ToUniversalTime().AddSeconds(-5))
@@ -277,7 +295,7 @@ try {
 
     Section "S10 no agent-config.json: defaults, and it says so"
     Remove-Item -LiteralPath $CfgPath -Force
-    Set-Intent "not_wanted" $null
+    Set-Intent "unmanaged" $null
     $sh3 = Start-Shell
     Assert-True (Wait-Until { $h = Read-Hb; $null -ne $h -and $h.pid -eq $sh3.Id -and [string]$h.config -match "defaults" } 15) "running, heartbeat says the config is defaults"
     Start-Sleep -Seconds 4
@@ -301,7 +319,7 @@ try {
     $bad1 = Join-Path $Root "not-a-program-1.exe"; Set-Text $bad1 "this is text, not a program"
     $bad2 = Join-Path $Root "not-a-program-2.exe"; Set-Text $bad2 "this is text, not a program"
     Write-Config $bad1 $bad2
-    Set-Intent "not_wanted" $null
+    Set-Intent "unmanaged" $null
     $sh5 = Start-Shell
     # The wall fails to start every 10 s (3 allowed per 5 minutes); then the launcher, once wanted, 4 times.
     Start-Sleep -Seconds 33
