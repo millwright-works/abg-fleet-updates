@@ -84,7 +84,9 @@ $KillPath = Join-Path $Root "control\kiosk.off"
 $CfgPath = Join-Path $Root "agent-config.json"
 function Set-Text([string]$p, [string]$t) { [IO.File]::WriteAllText($p, $t, (New-Object Text.UTF8Encoding($false))) }
 function Set-Policy([string]$mode) { Set-Text $PolicyPath ("{`"schema`":1,`"mode`":`"$mode`",`"minShellBytes`":4096}") }
-function Set-Intent([string]$launcher, $untilUtc) {
+function Set-Intent([string]$launcher, $untilUtc, [switch]$NoSessionJson) {
+    # As the agent does at Start: session.json says the session runs (ACTIVE) before the intent says wanted.
+    if ($launcher -eq "wanted" -and -not $NoSessionJson) { Set-SessionJson "ACTIVE" "live" $untilUtc }
     $u = $(if ($null -ne $untilUtc) { '"' + ([DateTime]$untilUtc).ToString("yyyy-MM-ddTHH:mm:ssZ") + '"' } else { "null" })
     Set-Text $IntentPath ("{`"schema`":1,`"launcher`":`"$launcher`",`"untilUtc`":$u,`"baySessionId`":`"live`",`"writtenUtc`":`"" + (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") + "`"}")
 }
@@ -314,6 +316,16 @@ try {
     $hbC = Read-Hb
     Assert-True ($null -ne $hbC -and [string]$hbC.launcher.closeHeld -match "s-B") "the heartbeat says the close is held and why ($(if ($hbC) { $hbC.launcher.closeHeld }))"
     if (-not $mB.HasExited) { Stop-Process -Id $mB.Id -Force -ErrorAction SilentlyContinue }
+
+    Section "S5e source divergence (live): the intent FILE still says wanted, but session.json says the session ended"
+    # The End's intent write failed (the agent's own decision is closed, pending); session.json was written ENDED first.
+    Set-Intent "wanted" ((Get-Date).ToUniversalTime().AddMinutes(10)) -NoSessionJson
+    Set-SessionJson "ENDED" "live" ((Get-Date).ToUniversalTime().AddMinutes(-1))
+    Start-Sleep -Seconds 10
+    Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "no launcher is (re)started for a session session.json says ended"
+    $hbE = Read-Hb
+    Assert-True ($null -ne $hbE -and $hbE.launcher.wanted -eq $false -and [string]$hbE.launcher.reason -match "no restart") "the heartbeat says why ($(if ($hbE) { $hbE.launcher.reason }))"
+    Set-Intent "unmanaged" $null
 
     Section "S5d attack RF1 (live, the agent's real intent writers): e-stop engage and clear, then a canceled booking's Reset"
     $Global:KioskIntentExpectedText = $null

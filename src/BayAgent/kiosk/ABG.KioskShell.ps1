@@ -239,16 +239,32 @@ function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime
     $o = $SessionRead.Obj
     $status = Get-KioskProp $o "status" $null
     if ($status -isnot [string]) { return @{ AllowClose = $false; Why = "session.json has no status: cannot tell, nothing closed" } }
-    # Only the statuses BayAgent writes when nobody plays allow a close outright; anything else (ACTIVE, ENDING, STOP after
-    # an emergency stop, an unknown value) needs the checks below.
+    # ALLOWLIST (security review "fail-open guard", 2026-10-08): only the statuses BayAgent writes when nobody plays allow
+    # a close. Anything else holds: ACTIVE or ENDING (whichever session, even the one the intent says ended, even past
+    # its end: the two sources disagree, so neither is trusted to end a game), STOP, or an unknown value.
     if ($status -cin @("ENDED", "READY", "PREP")) { return @{ AllowClose = $true; Why = "no session running (status $status)" } }
     $sid = Get-KioskProp $o "baySessionId" $null
-    if ($sid -is [string] -and -not [string]::IsNullOrWhiteSpace($sid) -and -not [string]::IsNullOrWhiteSpace($ClosedSessionId) -and $sid -ceq $ClosedSessionId) {
-        return @{ AllowClose = $true; Why = "session.json still names the ended session" }
+    return @{ AllowClose = $false; Why = ("session.json says '{0}' (session '{1}'): the closed intent (session '{2}') is not acted on" -f $status, $sid, $ClosedSessionId) }
+}
+
+function Get-KioskSessionBacksWanted($SessionRead, [string]$WantedSessionId) {
+    # The second source a RESTART needs (security review "source divergence", 2026-10-08): the shell acts on the intent
+    # FILE, while the agent decides from what it last decided; if a write of "closed" (End) failed, the file can still say
+    # "wanted" for a session the agent has ended. session.json, written by the same command before the intent, must show
+    # that same session ACTIVE or ENDING. Anything else, unreadable included: no restart (toward not reopening, never
+    # toward free play). @{ Backed; Why }
+    if ($null -eq $SessionRead -or -not $SessionRead.Ok) {
+        $why = $(if ($null -ne $SessionRead) { [string]$SessionRead.Why } else { "no read" })
+        return @{ Backed = $false; Why = "session.json unreadable ($why): no restart" }
     }
-    $end = ConvertTo-KioskUtc (Get-KioskProp $o "sessionEndUtc" $null)
-    if ($null -ne $end -and $NowUtc -gt $end.AddSeconds($GraceSeconds)) { return @{ AllowClose = $true; Why = ("session.json's session ended at " + $end.ToString("yyyy-MM-ddTHH:mm:ssZ")) } }
-    return @{ AllowClose = $false; Why = ("session.json shows session '{0}' running: the closed intent (session '{1}') is not acted on" -f $sid, $ClosedSessionId) }
+    $o = $SessionRead.Obj
+    $status = Get-KioskProp $o "status" $null
+    $sid = Get-KioskProp $o "baySessionId" $null
+    if ($status -isnot [string] -or $status -cnotin @("ACTIVE", "ENDING")) { return @{ Backed = $false; Why = ("session.json says '{0}': no restart" -f $status) } }
+    if ($sid -isnot [string] -or [string]::IsNullOrWhiteSpace($sid) -or [string]::IsNullOrWhiteSpace($WantedSessionId) -or $sid -cne $WantedSessionId) {
+        return @{ Backed = $false; Why = ("session.json runs session '{0}', the intent wants '{1}': no restart" -f $sid, $WantedSessionId) }
+    }
+    return @{ Backed = $true; Why = "session.json runs the wanted session" }
 }
 
 function Test-KioskIsConfiguredLauncher($Proc, $Cfg, [int]$SessionId) {
@@ -850,6 +866,11 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
 
     # ---- launcher ----
     $S.Wanted = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192) -NowUtc $NowUtc
+    if ($S.Wanted.Wanted) {
+        # Two sources must agree before the shell (re)starts a launcher: the intent AND session.json.
+        $backing = Get-KioskSessionBacksWanted -SessionRead (Read-KioskJsonFile -Path $S.Cfg.SessionJsonPath -MaxBytes 262144) -WantedSessionId ([string]$S.Wanted.SessionId)
+        if (-not $backing.Backed) { $S.Wanted.Wanted = $false; $S.Wanted.Reason = "intent wanted but " + $backing.Why }
+    }
     Write-KioskLog ("launcher " + $(if ($S.Wanted.Wanted) { "wanted until " + $S.Wanted.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } elseif ($S.Wanted.Closed) { "closed (no session) since " + $S.Wanted.ClosedSinceUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { "hands off (" + $S.Wanted.Reason + ")" })) "INFO" "wanted"
     $procs = @(Get-KioskProcessesInSession -Name $S.Cfg.LauncherName -SessionId $S.SessionId)
     if ($procs.Count -gt 0) {

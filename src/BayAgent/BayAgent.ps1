@@ -5519,6 +5519,15 @@ function Get-KioskCapability {
     $k["signerKnown"] = (-not [string]::IsNullOrWhiteSpace([string]$Global:KioskSignerThumbprint))
     $k["intentRestored"] = $Global:KioskIntentTamper
     $k["intentPending"] = [bool]$Global:KioskIntentPending
+    # The shell reads session.json at the LOCAL config's path; a platform overlay that moved it would leave the shell
+    # unable to confirm any session (it then neither restarts nor closes anything). Say so if they differ.
+    try {
+        $localSj = $null
+        $lr = Read-KioskJsonFile -Path $CfgPath -MaxBytes 262144
+        if ($lr.Ok) { $localSj = Get-KioskProp $lr.Obj "sessionJsonPath" $null }
+        if ($localSj -isnot [string] -or [string]::IsNullOrWhiteSpace($localSj)) { $localSj = "C:\AllBirdies\SessionDisplay\data\session.json" }
+        $k["sessionJsonPathSharedWithShell"] = ([IO.Path]::GetFullPath([string](Get-SessionJsonPath)) -ieq [IO.Path]::GetFullPath($localSj))
+    } catch { $k["sessionJsonPathSharedWithShell"] = $null }
     return $k
 }
 

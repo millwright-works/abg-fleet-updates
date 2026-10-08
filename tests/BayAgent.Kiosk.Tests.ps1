@@ -256,6 +256,7 @@ try {
         Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload $resetPayload -CurrentIntentRead $rc.R -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) ("Reset over {0}: no change, never closed (RF1)" -f $rc.W)
     }
     Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload ([pscustomobject]@{ mode = "End" }) -CurrentIntentRead $curWanted -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "an EndSession that names no session: no closed (it cannot prove it ends the running one)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload ([pscustomobject]@{ mode = "End" }) -CurrentIntentRead $none -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "...also when no intent names a session at all (attack E6)"
     $curWantedB = @{ Ok = $true; Why = ""; Obj = [pscustomobject]@{ schema = 1; launcher = "wanted"; untilUtc = "2026-10-08T13:57:00Z"; baySessionId = "s-B" } }
     Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payStart -CurrentIntentRead $curWantedB -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow)) "an EndSession of s-1 while the intent names s-B: no closed"
     $rEnd2 = Get-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payStart -CurrentIntentRead $curUnmanagedPlaying -SameSession $true -EmergencyStopEngaged $false -NowUtc $UtcNow
@@ -911,15 +912,28 @@ try {
     Assert-True (-not (Get-G (New-SR @{ baySessionId = "s-A" }) "s-A").AllowClose) "no status: hold"
     Assert-True ((Get-G (New-SR @{ status = "ENDED"; baySessionId = "s-A"; sessionEndUtc = $pastEnd }) "s-A").AllowClose) "ENDED: allow"
     Assert-True ((Get-G (New-SR @{ status = "READY" }) "s-A").AllowClose) "READY (after a Reset): allow"
-    Assert-True ((Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-A"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "ACTIVE but it is the ended session itself: allow"
+    Assert-True (-not (Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-A"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "ACTIVE even for the session the intent says ended: hold (the two sources disagree; fail-open review)"
     Assert-True (-not (Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-B"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "ACTIVE for ANOTHER session still within its time: hold"
     Assert-True (-not (Get-G (New-SR @{ status = "ENDING"; baySessionId = "s-B"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "ENDING (last five minutes) for another session: hold"
     Assert-True (-not (Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-B"; sessionEndUtc = $futureEnd }) "").AllowClose) "a closed intent naming no session, another running: hold"
     Assert-True (-not (Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-B" }) "s-A").AllowClose) "ACTIVE for another session with no readable end: hold"
-    Assert-True ((Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-B"; sessionEndUtc = $pastEnd }) "s-A").AllowClose) "ACTIVE for another session that ended 10 minutes ago (no End arrived): allow"
+    Assert-True (-not (Get-G (New-SR @{ status = "ACTIVE"; baySessionId = "s-B"; sessionEndUtc = $pastEnd }) "s-A").AllowClose) "ACTIVE for another session past its end (no End arrived, or an extension the agent never heard of): hold"
     Assert-True (-not (Get-G (New-SR @{ status = "active"; baySessionId = "s-B"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "an unknown status (here lower case) for another session within its time: hold"
     Assert-True (-not (Get-G (New-SR @{ status = "STOP"; baySessionId = "s-B"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "STOP (the emergency-stop banner) over another session within its time: hold"
     Assert-True ((Get-G (New-SR @{ status = "PREP"; baySessionId = "s-C"; sessionEndUtc = $futureEnd }) "s-A").AllowClose) "PREP of the next booking (nobody plays before Start): allow"
+    Assert-True (-not (Get-G (New-SR @{ status = 5; baySessionId = "s-B" }) "s-A").AllowClose) "a status that is not text: hold"
+
+    Section "K20 a restart needs session.json to run the wanted session (security review: source divergence)"
+    function Get-B($obj, [string]$wantedSid) { return (Get-KioskSessionBacksWanted -SessionRead $obj -WantedSessionId $wantedSid) }
+    Assert-True ((Get-B (New-SR @{ status = "ACTIVE"; baySessionId = "s-A" }) "s-A").Backed) "ACTIVE, same session: restart allowed"
+    Assert-True ((Get-B (New-SR @{ status = "ENDING"; baySessionId = "s-A" }) "s-A").Backed) "ENDING (last five minutes), same session: restart allowed"
+    Assert-True (-not (Get-B (New-SR @{ status = "ENDED"; baySessionId = "s-A" }) "s-A").Backed) "ENDED for the wanted session (its End's intent write failed): no restart"
+    Assert-True (-not (Get-B (New-SR @{ status = "ACTIVE"; baySessionId = "s-B" }) "s-A").Backed) "ACTIVE for ANOTHER session: no restart for this one"
+    Assert-True (-not (Get-B @{ Ok = $false; Why = "absent"; Obj = $null } "s-A").Backed) "session.json unreadable: no restart"
+    Assert-True (-not (Get-B (New-SR @{ status = "ACTIVE"; baySessionId = "s-A" }) "").Backed) "an intent naming no session: no restart"
+    Assert-True (-not (Get-B (New-SR @{ status = "ACTIVE" }) "s-A").Backed) "session.json naming no session: no restart"
+    Assert-True (-not (Get-B (New-SR @{ status = "active"; baySessionId = "s-A" }) "s-A").Backed) "an unknown status: no restart"
+    Assert-True (-not (Get-B (New-SR @{ status = "STOP"; baySessionId = "s-A" }) "s-A").Backed) "STOP: no restart"
 
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-3") -BayLabel "Bay")
     $later = (Get-Date).ToUniversalTime().AddMinutes(80).ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -987,6 +1001,12 @@ try {
     Assert-True ((Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())).Closed) "a command decides from the restored intent, not the edited one (Reset after an edit to 'wanted' still closes)"
     $capT = ConvertTo-Json -InputObject (Get-KioskCapability) -Depth 6 -Compress
     Assert-True ($capT -match '"intentRestored":\{"count":[0-9]+') "the capability report carries the restore count"
+    $CfgPath = Join-Path $Sandbox "agent-config.json"
+    Set-TestFile $CfgPath ("{`"sessionJsonPath`":" + (ConvertTo-Json -InputObject ([string]$cfg.sessionJsonPath)) + "}")
+    Assert-True ((Get-KioskCapability)["sessionJsonPathSharedWithShell"] -eq $true) "the report says the agent and the shell read the same session.json"
+    Set-TestFile $CfgPath "{`"sessionJsonPath`":`"C:\\Elsewhere\\session.json`"}"
+    Assert-True ((Get-KioskCapability)["sessionJsonPathSharedWithShell"] -eq $false) "...and says so when a platform overlay moved the agent's (the shell would then neither restart nor close)"
+    Remove-Item -LiteralPath $CfgPath -Force
     Remove-Item -LiteralPath $KioskIntentPath -Force
     $Global:KioskIntentExpectedText = $null
 
