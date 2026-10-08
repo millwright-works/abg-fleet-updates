@@ -12,7 +12,7 @@
 # Expect: KILLED, SURVIVED (baselines) or EITHER (one layer of a check enforced twice; named in the results).
 # Results and copies go to -WorkDir (default %TEMP%\bayagent-kiosk-mut). Resume with -Only M1,M2 or -From <id>.
 [CmdletBinding()]
-param([string]$Only = "", [string]$From = "", [string]$Repo = "", [string]$WorkDir = "", [string]$ResultsName = "kiosk-mutation-results.txt", [switch]$DryRun, [string]$Suites = "")
+param([string]$Only = "", [string]$From = "", [string]$Repo = "", [string]$WorkDir = "", [string]$ResultsName = "kiosk-mutation-results.txt", [switch]$DryRun, [string]$OnlySuites = "")
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -179,7 +179,8 @@ $Muts = @(
     (M "O01" "ordertest" "order" "kiosk shell left out of the analyzed list" @('    "src\BayAgent\kiosk\ABG.KioskShell.ps1"') @('    # MUTANT dropped'))
 )
 if ($Only) { $Muts = @($Muts | Where-Object { $_.Id -in ($Only -split ",") }) }
-if ($Suites) { $Muts = @($Muts | Where-Object { $_.Suite -in ($Suites -split ",") }) }
+# (Not named $Suites: that is the suite-path table above, and PowerShell names are case-insensitive.)
+if ($OnlySuites) { $Muts = @($Muts | Where-Object { $_.Suite -in ($OnlySuites -split ",") }) }
 if ($From) { $idx = -1; for ($i = 0; $i -lt $Muts.Count; $i++) { if ($Muts[$i].Id -eq $From) { $idx = $i; break } }; if ($idx -lt 0) { throw "no mutant $From" }; $Muts = @($Muts | Select-Object -Skip $idx) }
 
 function Read-Src([string]$p) { $b = [IO.File]::ReadAllBytes($p); $bom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF); return @{ Text = [IO.File]::ReadAllText($p); Bom = $bom } }
