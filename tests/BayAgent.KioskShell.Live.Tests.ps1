@@ -131,10 +131,31 @@ function Write-Config([string]$launcherPath, [string]$wallPath) {
     $c = [ordered]@{
         launcher = [ordered]@{ path = $launcherPath; args = "noclose"; processName = $LaunchName }
         sessionDisplay = [ordered]@{ mode = "kiosk"; url = "about:blank"; profileDir = (Join-Path $Root "edge-profile"); edgePath = $wallPath }
+        sessionJsonPath = $SessionJsonPath
     }
     Set-Text $CfgPath (ConvertTo-Json -InputObject $c -Depth 5)
 }
+$SessionJsonPath = Join-Path $Root "session.json"
+function Set-SessionJson([string]$status, [string]$sid, $endUtc) {
+    # What BayAgent's Write-SessionFiles leaves for the shell's second check (attack RF1/RF2).
+    Set-Text $SessionJsonPath (ConvertTo-Json -InputObject ([ordered]@{ status = $status; baySessionId = $sid; sessionEndUtc = ([DateTime]$endUtc).ToString("yyyy-MM-ddTHH:mm:ssZ") }))
+}
 Write-Config $LaunchExe $WallExe
+
+# The agent's REAL intent writers (lifted by AST, BaseDir pointed at this sandbox): S5d drives the intent exactly as the
+# command handlers do.
+$BaseDir = $Root
+$Global:EmergencyStopEngaged = $false
+function Write-Log { param([string]$Message, [string]$Level = "INFO") }
+foreach ($st in @($agentAst.EndBlock.Statements)) {
+    if ($st -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+    if ($st.Left.Extent.Text -match '^\$(CMD_|Kiosk)' -or $st.Left.Extent.Text -match '^\$Global:Kiosk') { . ([scriptblock]::Create($st.Extent.Text)) }
+}
+foreach ($fn in @("Get-KioskProp", "Read-KioskJsonFile", "ConvertTo-KioskUtc", "Get-KioskLauncherWanted", "Get-KioskIntentForCommand", "Write-KioskIntentText", "Write-KioskIntent", "Test-KioskIntentIntegrity", "Set-KioskIntentForCommand")) {
+    $fd = @($agentAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true))
+    if ($fd.Count -ne 1) { throw "$fn not found in BayAgent.ps1" }
+    . ([scriptblock]::Create($fd[0].Extent.Text))
+}
 
 # ---------------------------------------------------------------- native window probes
 Add-Type -AssemblyName System.Windows.Forms
@@ -271,6 +292,7 @@ try {
 
     Section "S5b ACCEPTANCE (bench Part B Test 11): after End, a member who relaunches the launcher is closed again"
     # EndSession writes "closed" and closes the launcher itself; the stand-in, like Uneekor, only minimizes on a close.
+    Set-SessionJson "ENDED" "live" ((Get-Date).ToUniversalTime().AddMinutes(-1))
     Set-Intent "closed" $null
     $m1 = Start-Process -FilePath $LaunchExe -ArgumentList "noclose" -PassThru
     # 13 s: past the polite-close-plus-8-s an ungraced closer would need (so its absence is visible), inside the 15 s grace.
@@ -281,6 +303,36 @@ try {
     Assert-True (Wait-Until { $m2.Refresh(); $m2.HasExited } 20) "relaunched again later: ended again within 20 s"
     Assert-True ((Get-LogText) -match "running with no session \(intent closed\)") "the log says why"
     Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "and the shell itself started nothing"
+
+    Section "S5c attack RF2 (live): A's closed is still on disk while B pays and plays: B's game is NOT ended"
+    # B's Start wrote session.json (ACTIVE, s-B) but its intent write failed, so A's closed (written long ago) remains.
+    Set-Text $IntentPath ("{`"schema`":1,`"launcher`":`"closed`",`"untilUtc`":null,`"baySessionId`":`"s-A`",`"writtenUtc`":`"" + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString("yyyy-MM-ddTHH:mm:ssZ") + "`"}")
+    Set-SessionJson "ACTIVE" "s-B" ((Get-Date).ToUniversalTime().AddMinutes(45))
+    $mB = Start-Process -FilePath $LaunchExe -ArgumentList "noclose" -PassThru
+    Start-Sleep -Seconds 35
+    Assert-True (-not $mB.HasExited) "B's launcher (45 paid minutes left) is still running 35 s later"
+    $hbC = Read-Hb
+    Assert-True ($null -ne $hbC -and [string]$hbC.launcher.closeHeld -match "s-B") "the heartbeat says the close is held and why ($(if ($hbC) { $hbC.launcher.closeHeld }))"
+    if (-not $mB.HasExited) { Stop-Process -Id $mB.Id -Force -ErrorAction SilentlyContinue }
+
+    Section "S5d attack RF1 (live, the agent's real intent writers): e-stop engage and clear, then a canceled booking's Reset"
+    $Global:KioskIntentExpectedText = $null
+    $endD = (Get-Date).ToUniversalTime().AddMinutes(45)
+    $payD = [pscustomobject]@{ mode = "Start"; baySessionId = "s-D"; playEndUtc = $endD.ToString("yyyy-MM-ddTHH:mm:ssZ") }
+    $wS = Set-KioskIntentForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload $payD
+    Set-SessionJson "ACTIVE" "s-D" $endD
+    Assert-True ($null -ne $wS -and $wS.launcher -eq "wanted" -and $wS.written) "Start s-D: wanted, written by the agent's own function"
+    $mD = @(Get-Ours $LaunchName)
+    Assert-True (Wait-Until { @(Get-Ours $LaunchName).Count -eq 1 } 10) "the shell started the member's launcher"
+    [void](Set-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "engage" }))
+    [void](Set-KioskIntentForCommand -CommandType $CMD_EMERGENCY_STOP -Mode "" -Payload ([pscustomobject]@{ action = "clear" }))
+    $rR = Set-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload ([pscustomobject]@{ mode = "Full"; reason = "BookingCanceled" })
+    Assert-True ($null -eq $rR) "the Reset changed nothing"
+    $dPid = $(if (@(Get-Ours $LaunchName).Count) { @(Get-Ours $LaunchName)[0].Id } else { 0 })
+    Start-Sleep -Seconds 35
+    Assert-True ($dPid -gt 0 -and @(Get-Ours $LaunchName | Where-Object { $_.Id -eq $dPid }).Count -eq 1) "35 s after the Reset the paying member's launcher is still the same running process"
+    Stop-Ours $LaunchName
+    Set-Intent "unmanaged" $null
 
     Section "S6 an expired intent and a garbage intent restart nothing"
     Set-Intent "wanted" ((Get-Date).ToUniversalTime().AddSeconds(-5))
