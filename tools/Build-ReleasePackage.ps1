@@ -23,6 +23,8 @@ WHAT IT PRODUCES
       tools/Update-PromosPack.ps1
       tools/Publish-Current.ps1
       tools/Watch-BayAgentUpdate.ps1     (1.3.1: the update rollback guard)
+      kiosk/ABG.KioskShell.ps1           (1.4.0, A0.363: the kiosk shell; signed on arrival like every .ps1)
+      kiosk/kiosk-policy.json            (1.4.0: the ONLY kiosk mode switch; 1.4.0 ships "explorer" = dormant)
 
 SIGNING -- READ THIS BEFORE ADDING A SIGNING STEP HERE
   The package ships UNSIGNED, and that is correct, not an omission. MEASURED 2026-09-14
@@ -80,8 +82,18 @@ $Entries = @(
     @{ Zip = "tools/Update-SessionDisplay.ps1"; Src = "tools\Update-SessionDisplay.ps1" },
     @{ Zip = "tools/Update-PromosPack.ps1";     Src = "tools\Update-PromosPack.ps1" },
     @{ Zip = "tools/Publish-Current.ps1";       Src = "tools\Publish-Current.ps1" },
-    @{ Zip = "tools/Watch-BayAgentUpdate.ps1";  Src = "tools\Watch-BayAgentUpdate.ps1" }
+    @{ Zip = "tools/Watch-BayAgentUpdate.ps1";  Src = "tools\Watch-BayAgentUpdate.ps1" },
+    @{ Zip = "kiosk/ABG.KioskShell.ps1";        Src = "kiosk\ABG.KioskShell.ps1" },
+    @{ Zip = "kiosk/kiosk-policy.json";         Src = "kiosk\kiosk-policy.json" }
 )
+
+# 1.4.0 (A0.363): every release from now on ships the kiosk shell AND its policy. The policy is the ONLY switch for the
+# kiosk mode, so a package without it would be read on the bay as "no kiosk" (explorer): safe, but a silent change of
+# mode that no release row says. Refuse to build one.
+$RequiredKioskEntries = @("kiosk/ABG.KioskShell.ps1", "kiosk/kiosk-policy.json")
+# Modes this release's code implements. "shell" (replace Explorer) is designed but NOT built; a package asking for it
+# would be read as explorer by the agent, so the build refuses it rather than ship a policy that does not do what it says.
+$BuildableKioskModes = @("explorer", "companion")
 
 # See the header note: JavaScript misfiled as .ps1, never executed on a bay.
 $ParseExempt = @("tools/Publish-Current.ps1")
@@ -96,6 +108,11 @@ Write-Host ""
 foreach ($e in $Entries) {
     $p = Join-Path $srcBay $e.Src
     if (-not (Test-Path -LiteralPath $p)) { Fail "missing source file: $p" }
+}
+
+# ---------------------------------------------------------------- gate 0b: the kiosk files are in the package
+foreach ($k in $RequiredKioskEntries) {
+    if (@($Entries | Where-Object { $_.Zip -ceq $k }).Count -ne 1) { Fail ("the package must ship {0} exactly once (A0.363: the kiosk policy is the only mode switch)" -f $k) }
 }
 
 # ---------------------------------------------------------------- gate 1: manifest agrees
@@ -124,12 +141,39 @@ $manifestLen = (Get-Item -LiteralPath $manifestPath).Length
 if ($manifestLen -in @(65, 68)) { Fail ("manifest.json is {0} bytes, the length of every shipped manifest from 1.2.0 to 1.3.0; an updater from before 1.3.1 would skip copying it. Change its length (add or remove a field)." -f $manifestLen) }
 Write-Host ("  OK  manifest.json is {0} bytes (differs from the 65/68 of every earlier manifest)" -f $manifestLen)
 
-# ---------------------------------------------------------------- gate 2: parse + ASCII
+# ---------------------------------------------------------------- gate 1d: the kiosk shell's own version agrees (1.4.0)
+$shellText = [IO.File]::ReadAllText((Join-Path $srcBay "kiosk\ABG.KioskShell.ps1"))
+$sv = [regex]::Matches($shellText, '(?m)^\$KioskShellCodeVersion = "([^"]+)"\r?$')
+if ($sv.Count -ne 1) { Fail ("ABG.KioskShell.ps1 must carry exactly one line `$KioskShellCodeVersion = `"<version>`" (found {0})" -f $sv.Count) }
+if ($sv[0].Groups[1].Value -ne $Version) { Fail ("ABG.KioskShell.ps1 says `$KioskShellCodeVersion = '{0}' but -Version is '{1}'" -f $sv[0].Groups[1].Value, $Version) }
+Write-Host ("  OK  ABG.KioskShell.ps1 KioskShellCodeVersion = {0}" -f $Version)
+
+# ---------------------------------------------------------------- gate 1e: the kiosk policy is exactly a policy this code runs
+# The agent reads anything else as "explorer" (the safe answer), which would make the package say one thing and do
+# another. So the BUILD is strict where the bay is forgiving: schema 1, a mode this release implements, a size floor.
+$policyPath = Join-Path $srcBay "kiosk\kiosk-policy.json"
+$policy = $null
+try { $policy = [IO.File]::ReadAllText($policyPath) | ConvertFrom-Json } catch { Fail ("kiosk-policy.json is not valid JSON: {0}" -f $_.Exception.Message) }
+if ($null -eq $policy -or $policy -is [Array]) { Fail "kiosk-policy.json must be a JSON object" }
+$pSchema = $policy.PSObject.Properties["schema"]; $pMode = $policy.PSObject.Properties["mode"]; $pMin = $policy.PSObject.Properties["minShellBytes"]
+if ($null -eq $pSchema -or -not ($pSchema.Value -is [int] -or $pSchema.Value -is [long]) -or [int64]$pSchema.Value -ne 1) { Fail "kiosk-policy.json schema must be the integer 1" }
+if ($null -eq $pMode -or $pMode.Value -isnot [string] -or $pMode.Value -cnotin $BuildableKioskModes) { Fail ("kiosk-policy.json mode must be one of: {0} (shell mode is not built)" -f ($BuildableKioskModes -join ", ")) }
+if ($null -eq $pMin -or -not ($pMin.Value -is [int] -or $pMin.Value -is [long]) -or [int64]$pMin.Value -lt 1024 -or [int64]$pMin.Value -gt 1048576) { Fail "kiosk-policy.json minShellBytes must be an integer from 1024 to 1048576" }
+$shellLen = (Get-Item -LiteralPath (Join-Path $srcBay "kiosk\ABG.KioskShell.ps1")).Length
+if ([int64]$pMin.Value -gt $shellLen) { Fail ("kiosk-policy.json minShellBytes {0} is larger than the shell itself ({1} bytes); the bay would refuse it" -f $pMin.Value, $shellLen) }
+Write-Host ("  OK  kiosk-policy.json mode = {0}, minShellBytes = {1} (shell {2} bytes)" -f $pMode.Value, $pMin.Value, $shellLen)
+
+# ---------------------------------------------------------------- gate 2: parse + CRLF + ASCII (.ps1), CRLF + ASCII (.json)
+# 1.4.0: the CRLF and ASCII gates cover the package's .json files too (AG-48 attack residual R1): the kiosk policy is
+# read on the bay by a strict reader, and its bytes are part of the package hash like everything else.
 foreach ($e in $Entries) {
     $p = Join-Path $srcBay $e.Src
-    if (-not $e.Zip.EndsWith(".ps1")) { continue }
+    $isPs1 = $e.Zip.EndsWith(".ps1")
+    if (-not $isPs1 -and -not $e.Zip.EndsWith(".json")) { continue }
 
-    if ($ParseExempt -notcontains $e.Zip) {
+    if (-not $isPs1) {
+        # (.json: no parse step here; manifest.json and kiosk-policy.json are parsed by gates 1 and 1e above)
+    } elseif ($ParseExempt -notcontains $e.Zip) {
         $errs = $null; $toks = $null
         [System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$toks, [ref]$errs) | Out-Null
         $n = @($errs).Count
@@ -177,7 +221,7 @@ foreach ($e in $Entries) {
     for ($i = $start; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -gt 127) { $bad++ } }
     if ($bad -gt 0) { Fail ("{0} carries {1} non-ASCII byte(s) outside the BOM (BA-15: silent parse failure under AllSigned)" -f $e.Zip, $bad) }
 }
-Write-Host "  OK  no non-ASCII bytes outside a BOM"
+Write-Host "  OK  every .ps1 and .json is CRLF, with no non-ASCII bytes outside a BOM"
 Write-Host ""
 
 # ---------------------------------------------------------------- build

@@ -83,6 +83,7 @@ $ShippedScripts = @(
     "src\BayAgent\tools\Update-SessionDisplay.ps1"
     "src\BayAgent\tools\Update-PromosPack.ps1"
     "src\BayAgent\tools\Watch-BayAgentUpdate.ps1"
+    "src\BayAgent\kiosk\ABG.KioskShell.ps1"
     "src\BayAgent\tools\Setup-BayPC.ps1"
     "src\BayAgent\bootstrap\ABG.AgentHost.ps1"
     "src\BayAgent\bootstrap\ABG.HostWatchdog.ps1"
@@ -489,6 +490,25 @@ foreach ($t in $targets) {
         }
     }
     Assert-True ($d.Count -eq 0) ("{0}: no use-before-definition on any startup path ({1} found)" -f $rel, $d.Count)
+}
+
+Section "S3 drift guard: every .ps1 the package ships is in the list above (AG-48 residual R4)"
+# A new shipped script left out of $ShippedScripts would never be analyzed. Read the package's own entry list.
+if ([string]::IsNullOrWhiteSpace($OnlyPath)) {
+    $bt = $null; $be = $null
+    $bAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot "tools\Build-ReleasePackage.ps1"), [ref]$bt, [ref]$be)
+    $entryAssign = @($bAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$Entries' }, $true))
+    Assert-True ($entryAssign.Count -eq 1) "Build-ReleasePackage.ps1 assigns `$Entries exactly once"
+    $srcs = @()
+    if ($entryAssign.Count -eq 1) {
+        foreach ($m in [regex]::Matches($entryAssign[0].Extent.Text, 'Src\s*=\s*"([^"]+\.ps1)"')) { $srcs += $m.Groups[1].Value }
+    }
+    $exempt = @("tools\Publish-Current.ps1")
+    Assert-True ($srcs.Count -ge 7) "the package's .ps1 entries were read ($($srcs.Count), 7 as of 1.4.0)"
+    foreach ($s in $srcs) {
+        if ($exempt -contains $s) { continue }
+        Assert-True ($ShippedScripts -contains ("src\BayAgent\" + $s)) ("package entry {0} is analyzed here" -f $s)
+    }
 }
 
 Write-Host ""
