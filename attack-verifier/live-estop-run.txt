@@ -1,0 +1,18 @@
+paying member's launcher pid 28768 (Start written: {     "schema":  1,     "launcher":  "wanted",     "untilUtc":  "2026-10-08T22:48:43Z",     "baySessionId":  "S-PAID",     "reason":  "StartSession Start",     "writtenUtc":  "2026-10-08T22:01:44Z",     "agentPid":  31628 })
+shell pid 29496
+t+8s under 'wanted': launcher alive = True
+emergency stop engaged and cleared; member resumes
+Reset for another canceled booking: intent now {     "schema":  1,     "launcher":  "closed",     "untilUtc":  null,     "baySessionId":  "",     "reason":  "Reset",     "writtenUtc":  "2026-10-08T22:02:00Z",     "agentPid":  31628 }
+RESULT: paying member's launcher ENDED 23.0 s after the Reset
+---- shell log
+  2026-10-08T22:01:45Z [INFO] kiosk shell 1.4.0 starting (pid 29496, session 1, role companion)
+  2026-10-08T22:01:45Z [INFO] config: agent-config.json; launcher AbgVerifLaunchd3eade at C:\Users\kedah\AppData\Local\Temp\kiosk-verif-live-1ec7c540\AbgVerifLaunchd3eade.exe
+  2026-10-08T22:01:45Z [INFO] supervision: on (companion)
+  2026-10-08T22:01:45Z [INFO] launcher wanted until 2026-10-08T22:48:43Z
+  2026-10-08T22:01:45Z [INFO] screens: 1 [\\.\DISPLAY1|P|0,0,1920x1080]
+  2026-10-08T22:01:45Z [INFO] wall plan: none
+  2026-10-08T22:01:54Z [INFO] launcher hands off (intent says not wanted)
+  2026-10-08T22:01:56Z [INFO] launcher placement: placed on \\.\DISPLAY1
+  2026-10-08T22:02:02Z [INFO] launcher closed (no session) since 2026-10-08T22:02:00Z
+  2026-10-08T22:02:15Z [WARN] launcher pid 28768 is running with no session (intent closed): asked it to close
+  2026-10-08T22:02:23Z [WARN] launcher pid 28768 did not close within 8 s with no session: ended

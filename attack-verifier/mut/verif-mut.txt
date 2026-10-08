@@ -1,0 +1,11 @@
+﻿# run started 2026-10-08T22:06:45.7412343Z repo C:\aoc-wt\kiosk-attack HEAD 52e10c0
+M00u	SURVIVED	SURVIVED	unit	10s	baseline	298 passed, 0 failed; first: 
+A03	KILLED	KILLED	unit	11s	late EndSession of an older session clears the intent	296 passed, 2 failed; first: a late EndSession for an older session leaves the intent alone
+A15	KILLED	KILLED	unit	16s	Reset closes over a wanted session	296 passed, 2 failed; first: Reset while a session is wanted (a canceled OTHER booking): no change, never closed over a game
+C06	KILLED	KILLED	unit	21s	start time not re-checked	294 passed, 4 failed; first: ...and it re-checks name, session and start time before ending anything
+R01	KILLED	KILLED	unit	10s	the policy FILE alone grants companion (release constant ignored)	295 passed, 3 failed; first: an edited policy file saying companion: explorer, and the disagreement is named (the policy file says 'companion' but this release was built 'explorer' (changed outside a release?): policy)
+R03	KILLED	KILLED	unit	14s	verify cache keyed on size and write time	297 passed, 1 failed; first: the replaced file is verified again and refused (no stale 'verified')
+R04	KILLED	KILLED	unit	18s	an edited intent is never restored	292 passed, 6 failed; first: an edited intent (free play until 2099) is detected
+R05	KILLED	KILLED	unit	14s	commands decide from an edited intent	297 passed, 1 failed; first: a command decides from the restored intent, not the edited one (Reset after an edit to 'wanted' still closes)
+R06	KILLED	KILLED	unit	13s	the main loop never checks the intent	297 passed, 1 failed; first: the main-loop check restores it every pass, even when the reconcile is not due
+# run finished 2026-10-08T22:08:53.3994510Z notApplied=0

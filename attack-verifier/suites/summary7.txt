@@ -1,0 +1,16 @@
+run start 2026-10-08T18:18:23.1425003-04:00
+7    BayAgent.Credential.Tests              exit=1      14s RESULT: 226 passed, 1 failed
+7    BayAgent.EStopPersist.Tests            exit=0      42s RESULT: 131 passed, 0 failed
+7    BayAgent.EStopRouting.Tests            exit=0      24s RESULT: 72 passed, 0 failed
+7    BayAgent.Kiosk.Tests                   exit=0      12s RESULT: 298 passed, 0 failed
+7    BayAgent.KioskPackage.Tests            exit=0      37s RESULT: 27 passed, 0 failed
+7    BayAgent.KioskShell.Live.Tests         exit=0     202s RESULT: 55 passed, 0 failed
+7    BayAgent.Launch.Tests                  exit=0      29s RESULT: 71 passed, 0 failed
+7    BayAgent.PidParam.Tests                exit=0       8s RESULT: 34 passed, 0 failed
+7    BayAgent.RemoteReport.Tests            exit=0      18s RESULT: 55 passed, 0 failed
+7    BayAgent.SelfHeal.Live.Tests           exit=0     101s RESULT: 13 passed, 0 failed
+7    BayAgent.SelfHeal.Tests                exit=0      20s RESULT: 201 passed, 0 failed
+7    BayAgent.SetupShell.Tests              exit=0       1s RESULT: 21 passed, 0 failed
+7    BayAgent.StartupOrder.Tests            exit=0      11s RESULT: 28 passed, 0 failed
+7    BayAgent.UpdateGuard.Tests             exit=0     305s RESULT: 70 passed, 0 failed
+run end 2026-10-08T18:32:07.2371366-04:00

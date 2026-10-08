@@ -1,0 +1,35 @@
+lifted 29 agent functions; intent path C:\Users\kedah\AppData\Local\Temp\kiosk-verif-18101035\state\kiosk-intent.json
+
+== E1 baseline: a member plays (wanted), another booking on the bay is canceled (Reset)
+  E1: intent wanted=True closed=False (intent wanted); shell action on a RUNNING launcher 20 s later = NONE
+
+== E2 emergency stop engaged and CLEARED mid-session, member resumes play, then another booking is canceled
+  E2 after clear: intent wanted=False closed=False (intent says not wanted); shell action on a RUNNING launcher 20 s later = NONE
+  E2 after Reset: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 20 s later = CLOSE
+
+== E3 Maintenance mode mid-session (reconcile writes unmanaged), lifted, member keeps playing, then a Reset
+  E3: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 20 s later = CLOSE
+
+== E4 add-time extension: the Extend display command was not queued (best effort), old end + 2 min passed, member still in paid time, then a Reset
+  E4: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 20 s later = CLOSE
+  E4 after the new-end Warn5 (same session): intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 20 s later = CLOSE
+
+== E5 back-to-back: A's End writes closed; B's Start intent write FAILS (file held open by a reader without FILE_SHARE_DELETE)
+  E5 after A End: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 20 s later = CLOSE
+    [agent log WARN] [KIOSK] intent 'wanted' could not be written: Exception calling "Copy" with "3" argument(s): "The process cannot access the file 'C:\Users\kedah\AppData\Local\Temp\kiosk-verif-18101035\state\kiosk-intent.json' because it is being used by another process."
+  B Start returned: launcher=wanted written=False
+  integrity check after the lock released: restored=False
+  E5 B is playing: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 60 s later = CLOSE
+  E5 B still playing: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 1800 s later = CLOSE
+
+== E6 a late End for an OLDER session with NO baySessionId while B plays (sameSession reads true)
+  E6: intent wanted=False closed=True (intent closed (no session)); shell action on a RUNNING launcher 20 s later = CLOSE
+
+== SUMMARY
+  E1 baseline                              none
+  E2 estop-clear then Reset                close
+  E3 maintenance-lifted then Reset         close
+  E4 extension display lost then Reset     close
+  E5 Start write failed (B paying)         close
+  E5 ... 30 min later                      close
+  E6 sid-less End                          close
