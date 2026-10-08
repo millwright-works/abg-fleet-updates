@@ -576,6 +576,12 @@ try {
     Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"companion`",`"minShellBytes`":4096}"
     Assert-True ((Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "companion + wanted + a live supervising shell: the shell starts it"
     Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clGone).Defer) "...not when the shell process is gone"
+    # A stale heartbeat that still SAYS supervising (the shell froze after writing it): only the alive check stops this.
+    $hbStaleSup = @{ schema = 1; pid = 4242; lastLoopUtc = $nowA.AddSeconds(-90).ToString("yyyy-MM-ddTHH:mm:ssZ"); supervising = $true; degraded = $false }
+    Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbStaleSup)
+    Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not to a shell whose heartbeat is 90 s old, even though it says supervising"
+    Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: not to a shell whose heartbeat is 90 s old, even though it says supervising"
+    Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
     $hbLive.supervising = $false; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
     Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not when the shell says it is not supervising"
     $hbLive.supervising = $true; $hbLive.degraded = $true; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
@@ -774,7 +780,7 @@ try {
     $script:LauncherStarts = 0
     $res = Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-1") -BayLabel "Bay"
     Assert-True ($script:LauncherStarts -eq 0 -and $res.launcher.reason -eq "kiosk_shell_owns_launcher") "companion with a live supervising shell, Start: the agent does NOT start the launcher; the shell does"
-    Assert-True ($res.launcher.shell.running -eq $true) "...and the result reports the shell's launcher running"
+    Assert-True ((Get-PropValue (Get-PropValue $res.launcher "shell" $null) "running" $false) -eq $true) "...and the result reports the shell's launcher running"
     # The REAL Start-SessionDisplay (renamed so the stub above stays for the other handlers). Its Edge path does not
     # exist, so if the deferral were missing it would throw instead of starting a browser on this PC.
     . ([scriptblock]::Create((Get-DefText $AgentDefs "Start-SessionDisplay").Replace("function Start-SessionDisplay(", "function Test-RealStartSessionDisplay(")))
@@ -889,24 +895,24 @@ try {
         $S14 = @{ Closing = @{}; Cfg = @{ LauncherName = "PING" }; SessionId = $own }
         function Test-DummyAlive { try { $p = Get-Process -Id $dummy.Id -ErrorAction Stop; return (-not $p.HasExited) } catch { return $false } }
         $t0 = (Get-Date).ToUniversalTime()
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0
         Assert-True ((Test-DummyAlive) -and $S14.Closing.ContainsKey($dummy.Id)) "first pass: asked to close (no window here), recorded, not ended"
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(5)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(5)
         Assert-True (Test-DummyAlive) "5 s later: not ended yet (the polite close gets $KioskCloseKillAfterSeconds s)"
-        $S14.Closing[$dummy.Id].Start = ([DateTime]$S14.Closing[$dummy.Id].Start).AddSeconds(-30)
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(9)
+        if ($S14.Closing.ContainsKey($dummy.Id)) { $S14.Closing[$dummy.Id]["Start"] = ([DateTime]$S14.Closing[$dummy.Id]["Start"]).AddSeconds(-30) }
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(9)
         Assert-True ((Test-DummyAlive) -and -not $S14.Closing.ContainsKey($dummy.Id)) "a different start time than recorded (a reused id): NOT ended, and forgotten"
         $S14.Cfg = @{ LauncherName = "SomethingElse" }
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(10)
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(19)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(10)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(19)
         Assert-True (Test-DummyAlive) "a process that is not the configured launcher: NOT ended"
         $S14.Cfg = @{ LauncherName = "PING" }; $S14.SessionId = $own + 1000
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(20)
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(29)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(20)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(29)
         Assert-True (Test-DummyAlive) "a process in another session: NOT ended"
         $S14.SessionId = $own
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(30)
-        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id) -NowUtc $t0.AddSeconds(39)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(30)
+        Close-KioskLauncher -S $S14 -Procs @(Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue) -NowUtc $t0.AddSeconds(39)
         $gone = $false; for ($i = 0; $i -lt 20 -and -not $gone; $i++) { if (-not (Test-DummyAlive)) { $gone = $true } else { Start-Sleep -Milliseconds 200 } }
         Assert-True $gone "the configured launcher, same session, same start, 9 s after the polite close: ended"
     } finally {
