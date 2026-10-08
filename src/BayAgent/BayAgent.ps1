@@ -5263,13 +5263,14 @@ function Invoke-KioskReconcileTick {
         $rep["reason"] = $policy.Reason
         $rep["killSwitch"] = (Test-Path -LiteralPath $KioskKillSwitchPath)
 
-        # Maintenance / Offline: the launcher is not wanted (only ever STOPS a restart).
+        # Maintenance / Offline: hands off. Stops restarts, and lifts "closed" so staff working on the bay can run the
+        # launcher; the next EndSession closes it again.
         try {
             if ($Global:EffectiveConfig) {
                 $op = Get-AgentOperationalState -eff $Global:EffectiveConfig
                 if ($op.Blocked) {
                     $cur = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192) -NowUtc $NowUtc
-                    if ($cur.Wanted) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId ([string]$cur.SessionId) -Reason ("bay in {0} mode" -f $op.ModeLabel)) }
+                    if ($cur.Wanted -or $cur.Closed) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId ([string]$cur.SessionId) -Reason ("bay in {0} mode" -f $op.ModeLabel)) }
                 }
             }
         } catch { }

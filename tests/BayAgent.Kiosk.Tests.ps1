@@ -524,6 +524,15 @@ try {
     $Global:EffectiveConfig = $null
     $wm = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now9
     Assert-True (-not $wm.Wanted -and -not $wm.Closed) "Maintenance mode turns a wanted intent into unmanaged (no restarts; never closed)"
+    [void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-1" -Reason "test")
+    $Global:EffectiveConfig = @{ "Bay.AgentStatus" = $AGENTSTATUS_MAINTENANCE; "Bay.AgentStatusReason" = "test" }
+    Invoke-KioskReconcileTick -NowUtc $now9 -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
+    $Global:EffectiveConfig = $null
+    $wm = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now9
+    Assert-True (-not $wm.Wanted -and -not $wm.Closed) "Maintenance mode lifts closed too (staff on the bay can run the launcher)"
+    [void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-1" -Reason "test")
+    Invoke-KioskReconcileTick -NowUtc $now9 -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
+    Assert-True ((Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc $now9).Closed) "...and only in Maintenance/Offline (Online leaves closed as it is)"
 
     $cap = Get-KioskCapability
     $capJson = ConvertTo-Json -InputObject $cap -Depth 8 -Compress
