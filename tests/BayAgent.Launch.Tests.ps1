@@ -468,7 +468,11 @@ try {
     # place but UNSIGNED (a sandbox copy cannot carry the bay's signature). Both must start cleanly; neither may start a
     # shell; both must report the kiosk block in the capabilities PATCH. environmentUrl is the MOCK.
     $shellSrc = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\ABG.KioskShell.ps1"
-    foreach ($kmode in @("explorer", "companion")) {
+    # "tampered": the agent exactly as shipped (built dormant) with a policy FILE edited to companion: it must decide
+    # explorer and report the disagreement (security review 2026-10-08). "companion": the agent built as the companion
+    # release builds it (its signed $KioskReleaseMode constant set to companion), so the file and the code agree.
+    foreach ($kcase in @("explorer", "companion", "tampered")) {
+        $kmode = $(if ($kcase -eq "explorer") { "explorer" } else { "companion" })
         $before7 = $sync["Requests"].Count
         # A launcher and sessionDisplay block as every bay config has: without them Build-AgentCapabilitiesJson throws
         # under strict mode and only the small partial document is sent (pre-existing; measured here 2026-10-08).
@@ -477,7 +481,13 @@ try {
             launcher = [ordered]@{ path = "C:\AbgNoSuchLauncher\NoSuch.exe"; args = ""; processName = "AbgNoSuchLauncher"; displayRole = "control"; startOnPrep = $false; startOnStart = $true }
             sessionDisplay = [ordered]@{ mode = "kiosk"; displayRole = "session"; url = "about:blank"; profileDir = "C:\AbgNoSuchProfile" }
         }
-        $l7 = New-BayInstall -Name ("kiosk-" + $kmode) -TokenPort $port -WithSecretFile -EnvironmentUrl ("http://127.0.0.1:{0}" -f $port) -ExtraConfig $x7
+        $l7 = New-BayInstall -Name ("kiosk-" + $kcase) -TokenPort $port -WithSecretFile -EnvironmentUrl ("http://127.0.0.1:{0}" -f $port) -ExtraConfig $x7
+        if ($kcase -eq "companion") {
+            $agentText7 = [IO.File]::ReadAllText($l7.Agent)
+            $modeLine7 = '$KioskReleaseMode           = "explorer"'
+            if (-not $agentText7.Contains($modeLine7)) { throw "the release-mode constant is not in BayAgent.ps1 as shipped (explorer)" }
+            [IO.File]::WriteAllText($l7.Agent, $agentText7.Replace($modeLine7, '$KioskReleaseMode           = "companion"'), (New-Object Text.UTF8Encoding($false)))
+        }
         # sessionJsonPath must point into the sandbox, never at the live install's session.json.
         $cfgText = [IO.File]::ReadAllText((Join-Path $l7.Root "agent-config.json")).Replace("SANDBOX_SESSION_JSON", ((Join-Path $l7.Root "session.json") -replace '\\', '\\'))
         [IO.File]::WriteAllText((Join-Path $l7.Root "agent-config.json"), $cfgText, (New-Object Text.UTF8Encoding($false)))
@@ -487,26 +497,29 @@ try {
         $shellCopy7 = Join-Path $l7.Root "releases\1.4.0\kiosk\ABG.KioskShell.ps1"
         [IO.File]::WriteAllText($shellCopy7, ([IO.File]::ReadAllText($shellSrc).Replace('$BaseDir = "C:\AllBirdies\BayAgent"', ('$BaseDir = "{0}"' -f $l7.Root))), (New-Object Text.UTF8Encoding($false)))
         $r7 = Start-BayAgentLikeAgentHost -Install $l7 -BoundingSwitch "-Once"
-        Show-Evidence $r7 ("L7-" + $kmode)
-        Assert-True (-not $r7.TimedOut -and $r7.ExitCode -eq 0) "[$kmode] exit code 0 (got $($r7.ExitCode))"
-        Assert-True ($r7.Log -notmatch "FATAL" -and $r7.Log -notmatch "is not recognized as the name of a cmdlet") "[$kmode] no FATAL, nothing used before it was defined"
+        Show-Evidence $r7 ("L7-" + $kcase)
+        Assert-True (-not $r7.TimedOut -and $r7.ExitCode -eq 0) "[$kcase] exit code 0 (got $($r7.ExitCode))"
+        Assert-True ($r7.Log -notmatch "FATAL" -and $r7.Log -notmatch "is not recognized as the name of a cmdlet") "[$kcase] no FATAL, nothing used before it was defined"
         $rec7 = $null; try { $rec7 = [IO.File]::ReadAllText((Join-Path $l7.Root "state\kiosk-reconcile.json")) | ConvertFrom-Json } catch { }
-        Assert-True ($null -ne $rec7 -and $rec7.target -eq $kmode) "[$kmode] the reconciler ran and decided '$kmode' (state\kiosk-reconcile.json)"
-        if ($kmode -eq "companion") {
+        $expect7 = $(if ($kcase -eq "tampered") { "explorer" } else { $kmode })
+        Assert-True ($null -ne $rec7 -and $rec7.target -eq $expect7) "[$kcase] the reconciler ran and decided '$expect7' (state\kiosk-reconcile.json)"
+        if ($kcase -eq "tampered") {
+            Assert-True ($null -ne $rec7 -and [string]$rec7.action -eq "none" -and [string]$rec7.reason -match "built 'explorer'") "[tampered] a policy file edited to companion grants nothing, and the reason names the release (reason: $(if ($rec7) { $rec7.reason }))"
+        } elseif ($kcase -eq "companion") {
             Assert-True ($null -ne $rec7 -and [string]$rec7.action -match "^not started: shell file signature") "[companion] the unsigned shell file was NOT started, and the reason is its signature (action: $(if ($rec7) { $rec7.action }))"
         } else {
             Assert-True ($null -ne $rec7 -and [string]$rec7.action -eq "none") "[explorer] nothing was done"
         }
         $shellProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { [string]$_.CommandLine -like ("*" + $l7.Root + "*ABG.KioskShell.ps1*") })
-        Assert-True ($shellProcs.Count -eq 0) "[$kmode] no kiosk shell process exists for this install"
+        Assert-True ($shellProcs.Count -eq 0) "[$kcase] no kiosk shell process exists for this install"
         foreach ($sp7 in $shellProcs) { try { Stop-Process -Id $sp7.ProcessId -Force } catch { } }
         $int7 = $null; try { $int7 = [IO.File]::ReadAllText((Join-Path $l7.Root "state\kiosk-intent.json")) | ConvertFrom-Json } catch { }
-        Assert-True ($null -ne $int7 -and $int7.launcher -eq "unmanaged" -and [string]$int7.reason -match "agent start") "[$kmode] the intent was derived at start: unmanaged (no intent file, no session.json; never closed from a guess)"
+        Assert-True ($null -ne $int7 -and $int7.launcher -eq "unmanaged" -and [string]$int7.reason -match "agent start") "[$kcase] the intent was derived at start: unmanaged (no intent file, no session.json; never closed from a guess)"
         $patches = @($sync["Requests"] | Select-Object -Skip $before7 | Where-Object { $_.requestLine -match '^PATCH /api/data/v9\.2/build_baies\(' })
         $capBody = ($patches | ForEach-Object { $_.body }) -join "`n"
         Write-Host ("        [L7-{0}] {1} PATCH(es) to the bay row, {2} chars" -f $kmode, $patches.Count, $capBody.Length) -ForegroundColor DarkGray
         foreach ($ln in @($r7.Log -split "`r?`n" | Where-Object { $_ -match "Capabilities update failed|KIOSK" })) { Write-Host ("            $ln") -ForegroundColor DarkGray }
-        Assert-True ($capBody -match '\\"kiosk\\":\{' -and $capBody -match 'hkcuShell' -and $capBody -match 'shellFile') "[$kmode] the heartbeat PATCH carries the kiosk block with the shell file and the Winlogon reads"
+        Assert-True ($capBody -match '\\"kiosk\\":\{' -and $capBody -match 'hkcuShell' -and $capBody -match 'shellFile') "[$kcase] the heartbeat PATCH carries the kiosk block with the shell file and the Winlogon reads"
     }
 }
 finally {

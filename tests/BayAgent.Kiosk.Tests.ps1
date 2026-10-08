@@ -431,6 +431,31 @@ try {
     Assert-True $explorerHere "precondition: Explorer runs in this test's session (the companion needs the desktop)"
     $now9 = (Get-Date).ToUniversalTime()
 
+    # ---- K15 (security review 2026-10-08): the policy FILE can never grant the mode; the signed release constant must
+    Section "K15 authority: a companion policy file in a release built dormant grants nothing, and is reported"
+    Assert-True ($KioskReleaseMode -ceq "explorer") "precondition: the shipped BayAgent.ps1 is built dormant (`$KioskReleaseMode = explorer)"
+    Reset-K9
+    Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"companion`",`"minShellBytes`":4096}"
+    $rp = Get-KioskReleasePolicy
+    Assert-True ($rp.Mode -eq "explorer" -and -not $rp.MatchesRelease -and $rp.Reason -match "built 'explorer'") "an edited policy file saying companion: explorer, and the disagreement is named ($($rp.Reason))"
+    Invoke-KioskReconcileTick -NowUtc $now9 -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
+    Assert-True ($script:Started.Count -eq 0 -and $Global:KioskReport.target -eq "explorer" -and $Global:KioskReport.policyMatchesRelease -eq $false) "...the reconciler starts no shell and reports policyMatchesRelease=false"
+    [void](Write-KioskIntent -Launcher "wanted" -UntilUtc ($now9.AddMinutes(30)) -SessionId "s-1" -Reason "test")
+    Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject @{ schema = 1; pid = 4242; lastLoopUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); supervising = $true; degraded = $false })
+    Assert-True (-not (Get-KioskLauncherDeferral -NowUtc ((Get-Date).ToUniversalTime()) -CommandLineOf $clShell).Defer -and -not (Get-KioskWallDeferral -NowUtc ((Get-Date).ToUniversalTime()) -CommandLineOf $clShell).Defer) "...and the agent hands neither the launcher nor the wall to a shell"
+    $KioskReleaseMode = "companion"
+    $rp = Get-KioskReleasePolicy
+    Assert-True ($rp.Mode -eq "companion" -and $rp.MatchesRelease) "a release built companion with a companion policy: companion"
+    Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"explorer`",`"minShellBytes`":4096}"
+    $rp = Get-KioskReleasePolicy
+    Assert-True ($rp.Mode -eq "explorer" -and -not $rp.MatchesRelease) "a release built companion whose policy file says explorer: explorer (the file may only turn it off), reported"
+    $KioskReleaseMode = "shell"
+    Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"shell`",`"minShellBytes`":4096}"
+    Assert-True ((Get-KioskReleasePolicy).Mode -eq "explorer") "a release constant naming a mode this code does not implement: explorer"
+    # The rest of this suite exercises the companion release.
+    $KioskReleaseMode = "companion"
+    Section "K9 (continued) the reconciler under a companion release"
+
     Reset-K9
     Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"explorer`",`"minShellBytes`":4096}"
     Invoke-KioskReconcileTick -NowUtc $now9 -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
@@ -799,6 +824,61 @@ try {
     $Global:EmergencyStopEngaged = $false
 
     # ============================================================ K14
+    # ============================================================ K16 (security review 2026-10-08)
+    Section "K16 a verified shell file replaced with the same size and write time is verified again (content-keyed cache)"
+    function Get-TestSha([string]$p) { $a = [Security.Cryptography.SHA256]::Create(); try { return ([BitConverter]::ToString($a.ComputeHash([IO.File]::ReadAllBytes($p))) -replace "-", "") } finally { $a.Dispose() } }
+    $script:SignedSha = Get-TestSha $goodShell
+    function Get-KioskAuthenticode([string]$Path) {
+        # Valid only for the exact bytes that were "signed"; any other content reads as NotSigned.
+        if ((Get-TestSha $Path) -eq $script:SignedSha) { return @{ Status = "Valid"; Timestamped = $true; Thumbprint = "AAAA"; Error = $null } }
+        return @{ Status = "NotSigned"; Timestamped = $false; Thumbprint = $null; Error = $null }
+    }
+    $KioskReleaseMode = "companion"; $Global:KioskSignerThumbprint = "AAAA"
+    Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"companion`",`"minShellBytes`":4096}"
+    Reset-K9
+    $now16 = (Get-Date).ToUniversalTime()
+    Invoke-KioskReconcileTick -NowUtc $now16 -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
+    Assert-True ($script:Started.Count -eq 1) "precondition: the signed file verified and a shell was started"
+    $origBytes = [IO.File]::ReadAllBytes($goodShell)
+    $origTime = (Get-Item -LiteralPath $goodShell).LastWriteTimeUtc
+    $tampered = [byte[]]$origBytes.Clone()
+    $idx = [Array]::IndexOf($tampered, [byte][char]'W')
+    $tampered[$idx] = [byte][char]'X'
+    [IO.File]::WriteAllBytes($goodShell, $tampered)
+    (Get-Item -LiteralPath $goodShell).LastWriteTimeUtc = $origTime
+    $fiT = Get-Item -LiteralPath $goodShell
+    Assert-True ($fiT.Length -eq $origBytes.Length -and $fiT.LastWriteTimeUtc -eq $origTime -and (Get-TestSha $goodShell) -ne $script:SignedSha) "precondition: same size, same write time, different bytes"
+    $script:Started.Clear()
+    Invoke-KioskReconcileTick -NowUtc $now16.AddMinutes(1) -CommandLineOf $clGone -StartShell $startSb -StopProcess $stopSb
+    Assert-True ($script:Started.Count -eq 0 -and $Global:KioskReport.action -match "NotSigned" -and $Global:KioskReport.shellFile.ok -eq $false) "the replaced file is verified again and refused (no stale 'verified')"
+    [IO.File]::WriteAllBytes($goodShell, $origBytes)
+    function Get-KioskAuthenticode([string]$Path) { return $script:SigFake }
+
+    # ============================================================ K17 (security review 2026-10-08)
+    Section "K17 an intent edited behind the agent's back is put back before anything acts on it"
+    Reset-K9
+    $Global:KioskIntentTamper = $null
+    [void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId "s-1" -Reason "EndSession")
+    Set-TestFile $KioskIntentPath "{`"schema`":1,`"launcher`":`"wanted`",`"untilUtc`":`"2099-01-01T00:00:00Z`",`"baySessionId`":`"x`"}"
+    Assert-True (Test-KioskIntentIntegrity) "an edited intent (free play until 2099) is detected"
+    $w17 = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ($w17.Closed -and -not $w17.Wanted -and $Global:KioskIntentTamper.count -eq 1) "...restored to what the agent wrote (closed), and counted"
+    Assert-True (-not (Test-KioskIntentIntegrity)) "an untouched intent: nothing to restore"
+    Remove-Item -LiteralPath $KioskIntentPath -Force
+    Assert-True ((Test-KioskIntentIntegrity) -and (Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())).Closed) "a deleted intent is restored too"
+    Set-TestFile $KioskIntentPath "{`"schema`":1,`"launcher`":`"wanted`",`"untilUtc`":`"2099-01-01T00:00:00Z`"}"
+    $Global:KioskNextReconcileUtc = [DateTime]::MaxValue
+    Invoke-KioskReconcileTickIfDue -NowUtc ((Get-Date).ToUniversalTime())
+    $Global:KioskNextReconcileUtc = [DateTime]::MinValue
+    Assert-True ((Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())).Closed) "the main-loop check restores it every pass, even when the reconcile is not due"
+    Set-TestFile $KioskIntentPath "{`"schema`":1,`"launcher`":`"wanted`",`"untilUtc`":`"2099-01-01T00:00:00Z`",`"baySessionId`":`"s-1`"}"
+    [void](Set-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload ([pscustomobject]@{}))
+    Assert-True ((Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())).Closed) "a command decides from the restored intent, not the edited one (Reset after an edit to 'wanted' still closes)"
+    $capT = ConvertTo-Json -InputObject (Get-KioskCapability) -Depth 6 -Compress
+    Assert-True ($capT -match '"intentRestored":\{"count":[0-9]+') "the capability report carries the restore count"
+    Remove-Item -LiteralPath $KioskIntentPath -Force
+    $Global:KioskIntentExpectedText = $null
+
     Section "K14 the shell's one closer ends only the process it began to close (real process, injected clock)"
     foreach ($st in @($ShellAst.EndBlock.Statements)) {
         if ($st -is [System.Management.Automation.Language.AssignmentStatementAst] -and $st.Left.Extent.Text -match '^\$KioskClose') { . ([scriptblock]::Create($st.Extent.Text)) }

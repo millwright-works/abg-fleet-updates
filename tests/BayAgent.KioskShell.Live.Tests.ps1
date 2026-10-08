@@ -69,7 +69,14 @@ $ShellCopy = Join-Path $RelKiosk "ABG.KioskShell.ps1"
 $needle = '$BaseDir = "C:\AllBirdies\BayAgent"'
 $shipped = [IO.File]::ReadAllText($ShellScript)
 if (-not $shipped.Contains($needle)) { throw "the BaseDir literal is not in the shell" }
-[IO.File]::WriteAllText($ShellCopy, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $Root)), (New-Object Text.UTF8Encoding($false)))
+# Two installs of the shipped file. $ShellCopy is built AS THE COMPANION RELEASE would be (the signed mode constant set to
+# companion; security review 2026-10-08: the policy file alone can never turn the shell on). $ShellCopyAsShipped is the
+# dormant 1.4.0 file with only $BaseDir repointed (S0b: a companion policy file must not wake it).
+$modeNeedle = '$KioskShellReleaseMode = "explorer"'
+if (-not $shipped.Contains($modeNeedle)) { throw "the release-mode constant is not in the shell as shipped (explorer)" }
+[IO.File]::WriteAllText($ShellCopy, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $Root)).Replace($modeNeedle, '$KioskShellReleaseMode = "companion"'), (New-Object Text.UTF8Encoding($false)))
+$ShellCopyAsShipped = Join-Path $RelKiosk "ABG.KioskShell.asshipped.ps1"
+[IO.File]::WriteAllText($ShellCopyAsShipped, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $Root)), (New-Object Text.UTF8Encoding($false)))
 $PolicyPath = Join-Path $Root "current\kiosk\kiosk-policy.json"
 $IntentPath = Join-Path $Root "state\kiosk-intent.json"
 $HbPath = Join-Path $Root "state\kiosk-shell.json"
@@ -160,8 +167,8 @@ public static class AbgKsProbe {
 }
 
 $ShellPids = New-Object System.Collections.ArrayList
-function Start-Shell([switch]$NoCompanion) {
-    $argLine = Get-KioskShellArgumentList $ShellCopy
+function Start-Shell([switch]$NoCompanion, [switch]$AsShipped) {
+    $argLine = Get-KioskShellArgumentList $(if ($AsShipped) { $ShellCopyAsShipped } else { $ShellCopy })
     if ($NoCompanion) { $argLine = $argLine.Replace(" -Companion", "") }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ps51
@@ -191,12 +198,28 @@ try {
     $a = [IO.File]::ReadAllLines($ShellScript); $b = [IO.File]::ReadAllLines($ShellCopy)
     Assert-True ($a.Count -eq $b.Count) "line count identical ($($a.Count))"
     $diff = @(); for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -ne $b[$i]) { $diff += $i } }
-    Assert-True ($diff.Count -eq 1 -and $a[$diff[0]].StartsWith('$BaseDir =')) "exactly one line differs and it is the `$BaseDir assignment"
+    Assert-True ($diff.Count -eq 2 -and $a[$diff[0]].StartsWith('$BaseDir =') -and $b[$diff[1]] -eq '$KioskShellReleaseMode = "companion"') "exactly two lines differ: `$BaseDir, and the release-mode constant set as the companion release sets it"
+    $c = [IO.File]::ReadAllLines($ShellCopyAsShipped)
+    $diff2 = @(); for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -ne $c[$i]) { $diff2 += $i } }
+    Assert-True ($c.Count -eq $a.Count -and $diff2.Count -eq 1 -and $a[$diff2[0]].StartsWith('$BaseDir =')) "the as-shipped copy differs in the `$BaseDir line only"
     function Get-FnMap([string]$p) { $t = $null; $e = $null; $x = [System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$t, [ref]$e); return @($x.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { "{0}@{1}" -f $_.Name, $_.Extent.StartLineNumber }) }
     Assert-True (((Get-FnMap $ShellScript) -join "|") -eq ((Get-FnMap $ShellCopy) -join "|")) "every function has the same name, order and line in both"
     Assert-True ((Test-Path -LiteralPath $LaunchExe) -and (Test-Path -LiteralPath $WallExe)) "the two stand-in programs were built"
     $screenCount = @([System.Windows.Forms.Screen]::AllScreens).Count
     Write-Host ("        this PC has {0} screen(s)" -f $screenCount) -ForegroundColor DarkGray
+
+    Section "S0b AUTHORITY: the shell as shipped (built dormant) is not woken by a companion policy file (security review)"
+    Set-Policy "companion"
+    Set-Intent "wanted" ((Get-Date).ToUniversalTime().AddMinutes(10))
+    $sh0 = Start-Shell -AsShipped
+    Assert-True ($sh0.WaitForExit(20000) -and $sh0.ExitCode -eq 0) "it exits 0 (Explorer is the desktop; the release says explorer)"
+    Assert-True (@(Get-Ours $LaunchName).Count -eq 0 -and @(Get-Ours $WallName).Count -eq 0) "...having started no launcher (the intent said wanted) and no wall"
+    $hb0 = Read-Hb
+    Assert-True ($null -ne $hb0 -and $hb0.supervising -eq $false -and $hb0.releaseMode -eq "explorer" -and [string]$hb0.stopReason -match "not implemented by this release") "...and its last heartbeat says why"
+    # If it did NOT exit (the insecure form), stop it and what it started, so the scenarios below run on a clean bay.
+    if (-not $sh0.HasExited) { Stop-Process -Id $sh0.Id -Force -ErrorAction SilentlyContinue; [void]$sh0.WaitForExit(5000) }
+    Stop-Ours $LaunchName; Stop-Ours $WallName
+    Set-Intent "unmanaged" $null
 
     Section "S1/S2 companion policy, no intent: heartbeat, no launcher, the wall kept up"
     Set-Policy "companion"
@@ -300,7 +323,7 @@ try {
     Assert-True (Wait-Until { $h = Read-Hb; $null -ne $h -and $h.pid -eq $sh3.Id -and [string]$h.config -match "defaults" } 15) "running, heartbeat says the config is defaults"
     Start-Sleep -Seconds 4
     Assert-True (-not $sh3.HasExited) "...and still running"
-    Stop-Process -Id $sh3.Id -Force
+    Stop-Process -Id $sh3.Id -Force -ErrorAction SilentlyContinue
     Write-Config $LaunchExe $WallExe
 
     Section "S11 started without -Companion: supervises nothing, never exits"
@@ -312,7 +335,7 @@ try {
     Start-Sleep -Seconds 8
     Assert-True (-not $sh4.HasExited) "still running after 8 s (a Windows shell that exits may sign the user out)"
     Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "and it started no launcher, though the intent says wanted"
-    Stop-Process -Id $sh4.Id -Force
+    Stop-Process -Id $sh4.Id -Force -ErrorAction SilentlyContinue
 
     Section "S12 induced failures: the shell degrades and stays up"
     Stop-Ours $WallName
@@ -330,7 +353,7 @@ try {
     Start-Sleep -Seconds 4
     Assert-True (-not $sh5.HasExited) "...and the shell is still running (the agent does not restart a degraded companion)"
     Assert-True ((Get-LogText) -match "degraded: supervision stops") "the log records it"
-    Stop-Process -Id $sh5.Id -Force
+    Stop-Process -Id $sh5.Id -Force -ErrorAction SilentlyContinue
 
     Section "S13 the log holds state changes only"
     $lines = @((Get-LogText) -split "`r?`n" | Where-Object { $_ })

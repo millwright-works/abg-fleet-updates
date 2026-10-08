@@ -141,11 +141,36 @@ try {
     $b = Invoke-Build $t
     Assert-True ($b.Exit -ne 0 -and $b.Out -match "must ship kiosk/kiosk-policy.json") "refused: the package must ship the policy"
 
-    Section "P6 a companion policy builds (the next stage is a policy edit and a release)"
+    function Set-ReleaseModeConstants([string]$root, [string]$mode) {
+        $ap = Join-Path $root "src\BayAgent\BayAgent.ps1"; $sp2 = Join-Path $root "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+        $at = [IO.File]::ReadAllText($ap); $st2 = [IO.File]::ReadAllText($sp2)
+        if (-not $at.Contains('$KioskReleaseMode           = "explorer"') -or -not $st2.Contains('$KioskShellReleaseMode = "explorer"')) { throw "release-mode constants not found as shipped" }
+        [IO.File]::WriteAllText($ap, $at.Replace('$KioskReleaseMode           = "explorer"', ('$KioskReleaseMode           = "{0}"' -f $mode)), (New-Object Text.UTF8Encoding($true)))
+        [IO.File]::WriteAllText($sp2, $st2.Replace('$KioskShellReleaseMode = "explorer"', ('$KioskShellReleaseMode = "{0}"' -f $mode)), (New-Object Text.UTF8Encoding($false)))
+    }
+    $companionPolicy = "{`r`n  `"schema`": 1,`r`n  `"mode`": `"companion`",`r`n  `"minShellBytes`": 4096`r`n}`r`n"
+
+    Section "P6 the companion release builds: the policy AND both signed constants say companion"
     $t = New-Tree
-    Set-Bytes (Get-PolicyPath $t) "{`r`n  `"schema`": 1,`r`n  `"mode`": `"companion`",`r`n  `"minShellBytes`": 4096`r`n}`r`n"
+    Set-Bytes (Get-PolicyPath $t) $companionPolicy
+    Set-ReleaseModeConstants $t "companion"
     $b = Invoke-Build $t
-    Assert-True ($b.Exit -eq 0 -and $null -ne $b.Zip -and $b.Out -match "mode = companion") "builds, and says companion"
+    Assert-True ($b.Exit -eq 0 -and $null -ne $b.Zip -and $b.Out -match "mode = companion" -and $b.Out -match "the signed code carries the same kiosk mode \(companion\)") "builds, and says companion"
+
+    Section "P7 security review 2026-10-08: the policy file and the signed code must agree, or no package"
+    $t = New-Tree
+    Set-Bytes (Get-PolicyPath $t) $companionPolicy
+    $b = Invoke-Build $t
+    Assert-True ($b.Exit -ne 0 -and $null -eq $b.Zip -and $b.Out -match "the kiosk mode disagrees") "a companion policy over code built explorer: refused"
+    $t = New-Tree
+    Set-ReleaseModeConstants $t "companion"
+    $b = Invoke-Build $t
+    Assert-True ($b.Exit -ne 0 -and $null -eq $b.Zip -and $b.Out -match "the kiosk mode disagrees") "code built companion under an explorer policy: refused"
+    $t = New-Tree
+    $sp3 = Join-Path $t "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+    [IO.File]::WriteAllText($sp3, ([IO.File]::ReadAllText($sp3).Replace('$KioskShellReleaseMode = "explorer"', '$KioskShellReleaseMode = "companion"')), (New-Object Text.UTF8Encoding($false)))
+    $b = Invoke-Build $t
+    Assert-True ($b.Exit -ne 0 -and $b.Out -match "the kiosk mode disagrees") "the shell's constant alone disagreeing: refused"
 }
 finally {
     try { Remove-Item -LiteralPath $Sandbox -Recurse -Force -ErrorAction SilentlyContinue } catch { }

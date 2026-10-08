@@ -61,6 +61,10 @@ $ErrorActionPreference = "Stop"
 $BaseDir = "C:\AllBirdies\BayAgent"
 
 $KioskShellCodeVersion = "1.4.0"
+# THE AUTHORITY FOR THE MODE IS THIS LINE OF SIGNED CODE (twin of BayAgent.ps1's $KioskReleaseMode; the build refuses a
+# package where they and kiosk-policy.json disagree). The policy file is writable by the bay account and, in companion
+# mode, reachable from the desktop: it may only turn the kiosk OFF, never on.
+$KioskShellReleaseMode = "explorer"
 $KioskCfgPath       = Join-Path $BaseDir "agent-config.json"
 $KioskPolicyPath    = Join-Path $BaseDir "current\kiosk\kiosk-policy.json"
 $KioskKillSwitch    = Join-Path $BaseDir "control\kiosk.off"
@@ -690,6 +694,7 @@ function Write-KioskHeartbeat($S, [DateTime]$NowUtc, [switch]$Force) {
             superviseReason = $(if ($null -ne $S.Supervise) { $S.Supervise.Reason } else { $null })
             policyMode     = $(if ($null -ne $S.Policy) { $S.Policy.Mode } else { $null })
             policyReason   = $(if ($null -ne $S.Policy) { $S.Policy.Reason } else { $null })
+            releaseMode    = $KioskShellReleaseMode
             topology       = [ordered]@{ count = @($S.Screens).Count; signature = $S.TopoSig; stable = ($S.TopoSig -eq $S.TopoStableSig) }
             launcher       = [ordered]@{
                 wanted   = $(if ($null -ne $S.Wanted) { [bool]$S.Wanted.Wanted } else { $false })
@@ -768,7 +773,9 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
         $S.CfgReadUtc = $NowUtc
         Write-KioskLog ("config: " + $S.Cfg.Source + "; launcher " + $S.Cfg.LauncherName + " at " + $S.Cfg.LauncherPath) "INFO" "config"
     }
-    $S.Policy = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitch)
+    $allowedModes = @("explorer")
+    if ($KioskShellReleaseMode -ceq "companion") { $allowedModes += "companion" }
+    $S.Policy = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitch) -SupportedModes $allowedModes
     $S.Supervise = Get-KioskSupervision -CompanionRole ([bool]$Companion) -PolicyDecision $S.Policy -Degraded ([bool]$S.Degraded)
     Write-KioskLog ("supervision: " + $(if ($S.Supervise.Supervise) { "on" } else { "off" }) + " (" + $S.Supervise.Reason + ")") "INFO" "supervise"
 

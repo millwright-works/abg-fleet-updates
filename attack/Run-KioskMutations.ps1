@@ -70,7 +70,7 @@ $Muts = @(
     (M "A09" "agent" "unit" "session.json ENDED read as running at start" @('if ($status -in @("ACTIVE", "ENDING") -and $null -ne $end') @('if ($status -in @("ACTIVE", "ENDING", "ENDED") -and $null -ne $end'))
     (M "A10" "agent" "unit" "engaged stop ignored at agent start" @('if ($cur.Wanted) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId ([string]$cur.SessionId) -Reason "agent start: emergency stop engaged") }') @('if ($false) { }'))
     (M "A19" "agent" "unit" "Maintenance leaves closed in force" @('if ($cur.Wanted -or $cur.Closed) {') @('if ($cur.Wanted) {'))
-    (M "A12" "agent" "unit" "agent start re-derives over a readable intent" @('if ($l -is [string] -and $l -cin @("wanted", "closed", "unmanaged")) { return }') @('if ($false) { return }'))
+    (M "A12" "agent" "unit" "agent start re-derives over a readable intent" @('if ($l -is [string] -and $l -cin @("wanted", "closed", "unmanaged")) {') @('if ($false) {'))
     (M "A13" "agent" "unit" "agent start derives closed from session.json" @('[void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId $sid -Reason ("agent start: no running session (status ''{0}'')" -f $status))') @('[void](Write-KioskIntent -Launcher "closed" -UntilUtc $null -SessionId $sid -Reason "x")'))
     (M "A14" "agent" "unit" "EndSession writes unmanaged instead of closed" @('return @{ Launcher = "closed"; UntilUtc = $null; SessionId = $sid; Reason = "EndSession" }') @('return @{ Launcher = "unmanaged"; UntilUtc = $null; SessionId = $sid; Reason = "EndSession" }'))
     (M "A15" "agent" "unit" "Reset closes over a wanted session" @('        if ($cur.Wanted) { return $null }') @('        if ($false) { return $null }'))
@@ -174,6 +174,16 @@ $Muts = @(
     (M "P04" "builder" "package" "shell version not checked" @('if ($sv[0].Groups[1].Value -ne $Version) {') @('if ($false) {'))
     (M "P05" "builder" "package" "minShellBytes above the shell size accepted" @('if ([int64]$pMin.Value -gt $shellLen) {') @('if ($false) {'))
     (M "P06" "builder" "package" "schema value not checked" @(' -or [int64]$pSchema.Value -ne 1) { Fail "kiosk-policy.json schema must be the integer 1" }') @(') { Fail "kiosk-policy.json schema must be the integer 1" }'))
+
+    # ---- security review 2026-10-08: each is the INSECURE form the fix replaced; each must be KILLED
+    (M "R01" "agent" "unit" "the policy FILE alone grants companion (release constant ignored)" @('if ($KioskReleaseMode -ceq "companion") { $allowed += "companion" }') @('$allowed += "companion"'))
+    (M "R01l" "agent" "launch" "the policy FILE alone grants companion (real agent, tampered case)" @('if ($KioskReleaseMode -ceq "companion") { $allowed += "companion" }') @('$allowed += "companion"'))
+    (M "R02" "shell" "live" "the shell's policy FILE alone grants companion" @('if ($KioskShellReleaseMode -ceq "companion") { $allowedModes += "companion" }') @('$allowedModes += "companion"'))
+    (M "R03" "agent" "unit" "verify cache keyed on size and write time" @('$key = $(if ($null -ne $shellSha) { "{0}|{1}|{2}|{3}" -f $shellPath, $shellSha, $policy.MinShellBytes, $Global:KioskSignerThumbprint } else { "nohash|" + [guid]::NewGuid().ToString("N") })') @('$fiM = Get-Item -LiteralPath $shellPath -ErrorAction SilentlyContinue; $key = $(if ($null -ne $fiM) { "{0}|{1}|{2}|{3}|{4}" -f $shellPath, $fiM.Length, $fiM.LastWriteTimeUtc.Ticks, $policy.MinShellBytes, $Global:KioskSignerThumbprint } else { "absent" })'))
+    (M "R04" "agent" "unit" "an edited intent is never restored" @('        if ($null -ne $onDisk -and $onDisk -ceq $exp) { return $false }') @('        return $false'))
+    (M "R05" "agent" "unit" "commands decide from an edited intent" @('    [void](Test-KioskIntentIntegrity)') @('    # MUTANT no integrity check'))
+    (M "R06" "agent" "unit" "the main loop never checks the intent" @('try { [void](Test-KioskIntentIntegrity) } catch { }') @('# MUTANT no main-loop check'))
+    (M "R07" "builder" "package" "policy and signed constants may disagree" @('if ($amode[0].Groups[1].Value -cne $pMode.Value -or $smode[0].Groups[1].Value -cne $pMode.Value) {') @('if ($false) {'))
 
     # ---- the order test's drift guard
     (M "O01" "ordertest" "order" "kiosk shell left out of the analyzed list" @('    "src\BayAgent\kiosk\ABG.KioskShell.ps1"') @('    # MUTANT dropped'))

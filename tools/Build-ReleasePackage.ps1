@@ -163,6 +163,18 @@ $shellLen = (Get-Item -LiteralPath (Join-Path $srcBay "kiosk\ABG.KioskShell.ps1"
 if ([int64]$pMin.Value -gt $shellLen) { Fail ("kiosk-policy.json minShellBytes {0} is larger than the shell itself ({1} bytes); the bay would refuse it" -f $pMin.Value, $shellLen) }
 Write-Host ("  OK  kiosk-policy.json mode = {0}, minShellBytes = {1} (shell {2} bytes)" -f $pMode.Value, $pMin.Value, $shellLen)
 
+# ---------------------------------------------------------------- gate 1f: the signed code carries the same mode (security review 2026-10-08)
+# The policy file is writable on the bay, so the agent and the shell take "on" only from their own signed constants and
+# let the file only turn the kiosk off. The three must agree in a package, or the release would not do what it says.
+$amode = [regex]::Matches($agentText, '(?m)^\$KioskReleaseMode\s+= "([^"]+)"\r?$')
+$smode = [regex]::Matches($shellText, '(?m)^\$KioskShellReleaseMode = "([^"]+)"\r?$')
+if ($amode.Count -ne 1) { Fail ("BayAgent.ps1 must carry exactly one line `$KioskReleaseMode = `"<mode>`" (found {0})" -f $amode.Count) }
+if ($smode.Count -ne 1) { Fail ("ABG.KioskShell.ps1 must carry exactly one line `$KioskShellReleaseMode = `"<mode>`" (found {0})" -f $smode.Count) }
+if ($amode[0].Groups[1].Value -cne $pMode.Value -or $smode[0].Groups[1].Value -cne $pMode.Value) {
+    Fail ("the kiosk mode disagrees: kiosk-policy.json '{0}', BayAgent.ps1 `$KioskReleaseMode '{1}', ABG.KioskShell.ps1 `$KioskShellReleaseMode '{2}'" -f $pMode.Value, $amode[0].Groups[1].Value, $smode[0].Groups[1].Value)
+}
+Write-Host ("  OK  the signed code carries the same kiosk mode ({0}) as the policy" -f $pMode.Value)
+
 # ---------------------------------------------------------------- gate 2: parse + CRLF + ASCII (.ps1), CRLF + ASCII (.json)
 # 1.4.0: the CRLF and ASCII gates cover the package's .json files too (AG-48 attack residual R1): the kiosk policy is
 # read on the bay by a strict reader, and its bytes are part of the package hash like everything else.

@@ -4835,6 +4835,14 @@ $KioskShellHungSeconds      = 180
 $KioskShellMaxStartsPerHour = 6
 $KioskDeferWaitSeconds      = 10
 
+# THE AUTHORITY FOR THE KIOSK MODE IS THIS LINE OF SIGNED CODE, not the policy file (security review, 2026-10-08).
+# Everything under C:\AllBirdies\BayAgent is writable by the bay account, and in companion mode a member at the desktop
+# can reach it too. So the policy file may only turn the kiosk OFF (toward today's desktop, like the kill switch); it can
+# never turn it on. "On" needs this constant, which ships in the signed, hash-pinned package (the bay signs it on arrival
+# and an edit breaks the signature under AllSigned), AND the policy file to agree. The build refuses a package in which
+# this constant, the shell's twin ($KioskShellReleaseMode) and kiosk-policy.json disagree.
+$KioskReleaseMode           = "explorer"
+
 # Shared with kiosk\ABG.KioskShell.ps1, byte for byte (tests\BayAgent.Kiosk.Tests.ps1 K-PARITY pins it): the agent
 # and the shell must decide the mode and the intent the same way.
 function Get-KioskProp($obj, [string]$name, $default = $null) {
@@ -4960,6 +4968,21 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
     $w.Wanted = $true
     $w.Reason = "intent wanted"
     return $w
+}
+
+function Get-KioskReleasePolicy {
+    # The mode this agent acts on: "companion" only when BOTH the signed release constant ($KioskReleaseMode) AND the
+    # policy file say so and no kill switch is present. A policy file that disagrees with the release is reported
+    # (MatchesRelease = false) and never grants anything. Never throws.
+    $allowed = @("explorer")
+    if ($KioskReleaseMode -ceq "companion") { $allowed += "companion" }
+    $d = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitchPath) -SupportedModes $allowed
+    $d["ReleaseMode"] = $KioskReleaseMode
+    $d["MatchesRelease"] = ([string]$d.Requested -ceq [string]$KioskReleaseMode)
+    if (-not $d.MatchesRelease -and $d.Reason -notmatch "^kill switch") {
+        $d.Reason = ("the policy file says '{0}' but this release was built '{1}' (changed outside a release?): {2}" -f $d.Requested, $KioskReleaseMode, $d.Reason)
+    }
+    return $d
 }
 
 function Get-KioskShellPath {
@@ -5153,6 +5176,7 @@ function Write-KioskIntent([string]$Launcher, $UntilUtc, [string]$SessionId, [st
         $backU = ConvertTo-KioskUtc (Get-KioskProp $back.Obj "untilUtc" $null)
         if ($expectU -ne $backU) { throw "read back a different untilUtc" }
         $Global:KioskIntentLast = [ordered]@{ launcher = $Launcher; untilUtc = $o.untilUtc; reason = $Reason; utc = $o.writtenUtc; ok = $true }
+        $Global:KioskIntentExpectedText = [IO.File]::ReadAllText($KioskIntentPath)
         return $true
     } catch {
         $Global:KioskIntentLast = [ordered]@{ launcher = $Launcher; reason = $Reason; ok = $false; error = $_.Exception.Message }
@@ -5161,9 +5185,37 @@ function Write-KioskIntent([string]$Launcher, $UntilUtc, [string]$SessionId, [st
     }
 }
 
+function Test-KioskIntentIntegrity {
+    # The intent file is state the shell ACTS on (restart, or end a relaunched launcher), and the bay account (or a member
+    # at the companion desktop) can write it. This agent is its only author: content that differs from what this agent
+    # last wrote, or kept at start, is put back and reported (security review, 2026-10-08). Before this process has
+    # written or kept an intent there is nothing to compare. Returns $true when it restored. Never throws.
+    try {
+        $exp = $Global:KioskIntentExpectedText
+        if ($null -eq $exp) { return $false }
+        $onDisk = $null
+        try { $onDisk = [IO.File]::ReadAllText($KioskIntentPath) } catch { $onDisk = $null }
+        if ($null -ne $onDisk -and $onDisk -ceq $exp) { return $false }
+        $tmp = "$KioskIntentPath.tmp"
+        [IO.File]::WriteAllText($tmp, $exp, (New-Object Text.UTF8Encoding($false)))
+        try {
+            if (Test-Path -LiteralPath $KioskIntentPath) { [IO.File]::Replace($tmp, $KioskIntentPath, [NullString]::Value, $true) }
+            else { [IO.File]::Move($tmp, $KioskIntentPath) }
+        } catch { [IO.File]::Copy($tmp, $KioskIntentPath, $true); try { [IO.File]::Delete($tmp) } catch { } }
+        $prev = $Global:KioskIntentTamper
+        $n = $(if ($null -ne $prev) { [int]$prev["count"] + 1 } else { 1 })
+        $Global:KioskIntentTamper = [ordered]@{ count = $n; lastUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); found = $(if ($null -eq $onDisk) { "missing" } else { "changed" }) }
+        try { Write-Log ("[KIOSK] the intent file was {0} outside the agent; restored ({1} so far)" -f $Global:KioskIntentTamper.found, $n) "WARN" } catch { }
+        $Global:NextCapabilitiesUtc = [DateTime]::MinValue
+        return $true
+    } catch { return $false }
+}
+
 function Set-KioskIntentForCommand {
     # Execute-Command's one call per command. Never throws; returns a small summary for the command result, or $null.
     param([int]$CommandType, [string]$Mode, $Payload, [bool]$SameSession = $true)
+    # Decide from the intent this agent wrote, never from one edited behind its back.
+    [void](Test-KioskIntentIntegrity)
     try {
         $now = (Get-Date).ToUniversalTime()
         $cur = Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192
@@ -5190,10 +5242,11 @@ function Initialize-KioskIntent([DateTime]$NowUtc) {
         if ($Global:EmergencyStopEngaged) {
             if ($cur.Wanted) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId ([string]$cur.SessionId) -Reason "agent start: emergency stop engaged") }
             elseif (-not $curRead.Ok) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId "" -Reason "agent start: emergency stop engaged") }
+            else { $Global:KioskIntentExpectedText = [IO.File]::ReadAllText($KioskIntentPath) }
             return
         }
         $l = $(if ($curRead.Ok) { Get-KioskProp $curRead.Obj "launcher" $null } else { $null })
-        if ($l -is [string] -and $l -cin @("wanted", "closed", "unmanaged")) { return }
+        if ($l -is [string] -and $l -cin @("wanted", "closed", "unmanaged")) { $Global:KioskIntentExpectedText = [IO.File]::ReadAllText($KioskIntentPath); return }
         $model = Read-SessionModelFromDisk
         $status = [string](Get-KioskProp $model "status" "")
         $end = ConvertTo-KioskUtc (Get-KioskProp $model "sessionEndUtc" $null)
@@ -5234,6 +5287,8 @@ $Global:KioskSignerThumbprint = $null
 $Global:KioskVerifyCache = $null
 $Global:KioskReport = $null
 $Global:KioskIntentLast = $null
+$Global:KioskIntentExpectedText = $null
+$Global:KioskIntentTamper = $null
 $Global:KioskStarts = [DateTime[]]@()
 $Global:KioskNextReconcileUtc = [DateTime]::MinValue
 
@@ -5257,11 +5312,13 @@ function Invoke-KioskReconcileTick {
     if ($null -eq $StopProcess) { $StopProcess = { param($procId) Stop-Process -Id $procId -Force -ErrorAction Stop } }
     $rep = [ordered]@{ utc = $NowUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") }
     try {
-        $policy = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitchPath)
+        $policy = Get-KioskReleasePolicy
         $rep["target"] = $policy.Mode
         $rep["requested"] = $policy.Requested
         $rep["reason"] = $policy.Reason
         $rep["killSwitch"] = (Test-Path -LiteralPath $KioskKillSwitchPath)
+        $rep["releaseMode"] = $policy.ReleaseMode
+        $rep["policyMatchesRelease"] = [bool]$policy.MatchesRelease
 
         # Maintenance / Offline: hands off. Stops restarts, and lifts "closed" so staff working on the bay can run the
         # launcher; the next EndSession closes it again.
@@ -5277,9 +5334,18 @@ function Invoke-KioskReconcileTick {
 
         $shellPath = Get-KioskShellPath
         $verify = $null
-        $fi = $null
-        try { $fi = Get-Item -LiteralPath $shellPath -ErrorAction Stop } catch { $fi = $null }
-        $key = $(if ($null -ne $fi) { "{0}|{1}|{2}|{3}|{4}" -f $shellPath, $fi.Length, $fi.LastWriteTimeUtc.Ticks, $policy.MinShellBytes, $Global:KioskSignerThumbprint } else { "absent|" + $shellPath })
+        # The cached verdict is keyed on the file's CONTENT (SHA256, taken every tick), never on its size and write time:
+        # a file replaced with the same size and time (robocopy treats that as "same") must be verified again, or a stale
+        # "verified" would keep authorizing whatever now sits at that path (security review, 2026-10-08).
+        $shellSha = $null
+        try {
+            if (Test-Path -LiteralPath $shellPath -PathType Leaf) {
+                $hAlg = [System.Security.Cryptography.SHA256]::Create()
+                $hFs = [IO.File]::OpenRead($shellPath)
+                try { $shellSha = ([BitConverter]::ToString($hAlg.ComputeHash($hFs)) -replace "-", "").ToLowerInvariant() } finally { $hFs.Dispose(); $hAlg.Dispose() }
+            }
+        } catch { $shellSha = $null }
+        $key = $(if ($null -ne $shellSha) { "{0}|{1}|{2}|{3}" -f $shellPath, $shellSha, $policy.MinShellBytes, $Global:KioskSignerThumbprint } else { "nohash|" + [guid]::NewGuid().ToString("N") })
         if ($null -ne $Global:KioskVerifyCache -and $Global:KioskVerifyCache.Key -eq $key) { $verify = $Global:KioskVerifyCache.Result }
         else {
             $verify = Test-KioskShellFile -Path $shellPath -MinBytes $policy.MinShellBytes -ExpectedSignerThumbprint ([string]$Global:KioskSignerThumbprint) `
@@ -5333,6 +5399,8 @@ function Invoke-KioskReconcileTick {
 }
 
 function Invoke-KioskReconcileTickIfDue([DateTime]$NowUtc) {
+    # Every main-loop pass (a few seconds): an edited intent file is put back before it can steer the shell for long.
+    try { [void](Test-KioskIntentIntegrity) } catch { }
     if ($NowUtc -lt $Global:KioskNextReconcileUtc) { return }
     $Global:KioskNextReconcileUtc = $NowUtc.AddSeconds($KioskReconcileEverySeconds)
     try { Invoke-KioskReconcileTick -NowUtc $NowUtc } catch { }
@@ -5343,7 +5411,7 @@ function Get-KioskLauncherDeferral([DateTime]$NowUtc, [scriptblock]$CommandLineO
     # under a companion policy AND the intent says wanted. Anything else: BayAgent starts it itself, as before.
     if ($null -eq $CommandLineOf) { $CommandLineOf = { param($procId) Get-KioskProcessCommandLine $procId } }
     try {
-        $policy = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitchPath)
+        $policy = Get-KioskReleasePolicy
         if ($policy.Mode -ne "companion") { return @{ Defer = $false; Why = "policy " + $policy.Mode } }
         $want = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192) -NowUtc $NowUtc
         if (-not $want.Wanted) { return @{ Defer = $false; Why = $want.Reason } }
@@ -5359,7 +5427,7 @@ function Get-KioskWallDeferral([DateTime]$NowUtc, [scriptblock]$CommandLineOf = 
     # Anything else (and any failure to tell): BayAgent starts and routes it, as before. Never throws.
     if ($null -eq $CommandLineOf) { $CommandLineOf = { param($procId) Get-KioskProcessCommandLine $procId } }
     try {
-        $policy = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitchPath)
+        $policy = Get-KioskReleasePolicy
         if ($policy.Mode -ne "companion") { return @{ Defer = $false; Why = "wall: policy " + $policy.Mode } }
         $live = Get-KioskShellLiveness -HeartbeatRead (Read-KioskJsonFile -Path $KioskHeartbeatPath -MaxBytes 65536) -NowUtc $NowUtc -CommandLineOf $CommandLineOf
         if ($live.State -ne "alive") { return @{ Defer = $false; Why = "wall: shell " + $live.State } }
@@ -5392,6 +5460,7 @@ function Get-KioskCapability {
         $k["intent"] = [ordered]@{ wanted = [bool]$w.Wanted; closed = [bool]$w.Closed; reason = $w.Reason; untilUtc = $(if ($null -ne $w.UntilUtc) { $w.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }); lastWrite = $Global:KioskIntentLast }
     } catch { }
     $k["signerKnown"] = (-not [string]::IsNullOrWhiteSpace([string]$Global:KioskSignerThumbprint))
+    $k["intentRestored"] = $Global:KioskIntentTamper
     return $k
 }
 
