@@ -3303,6 +3303,11 @@ function Start-SessionDisplay($payloadObj) {
     $enabled = Get-PropValue $sdPayload "enabled" (Get-PropValue $sdCfg "enabled" $true)
     if ($enabled -eq $false) { return @{ started = $false; reason = "disabled" } }
 
+    # A0.363 (I5, one owner): while a live kiosk shell supervises, IT starts and places the wall window (and moves it
+    # aside when one screen must serve the launcher). The agent still writes the session files the wall shows.
+    $kioskWall = Get-KioskWallDeferral -NowUtc ((Get-Date).ToUniversalTime())
+    if ($kioskWall.Defer) { return @{ started = $false; reason = "kiosk_shell_owns_wall" } }
+
     $mode = (Get-PropValue $sdPayload "mode" (Get-PropValue $sdCfg "mode" "kiosk")).ToString().ToLowerInvariant()
 
     $edgePath = Get-PropValue $sdPayload "edgePath" (Get-PropValue $sdCfg "edgePath" $null)
@@ -4808,6 +4813,8 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
 #      command line names a kiosk shell file under this install. It stops nothing else.
 #   5. At StartSession Start, while a live shell supervises, it leaves starting and placing the launcher to the shell
 #      (one starter at a time) and reports what the shell did; otherwise it starts the launcher itself, as before.
+#      Start-SessionDisplay likewise leaves the wall window to a live supervising shell (it still writes the session
+#      files the wall shows).
 # WHAT IT NEVER DOES: write the registry, take a mode from the platform (the mode is the package's policy file and the
 # on-site kill switch control\kiosk.off only), or close the launcher outside EndSession.
 
@@ -5306,6 +5313,20 @@ function Get-KioskLauncherDeferral([DateTime]$NowUtc, [scriptblock]$CommandLineO
         if (-not $live.Supervising -or $live.Degraded) { return @{ Defer = $false; Why = "shell not supervising" } }
         return @{ Defer = $true; Why = "the kiosk shell starts and places the launcher" }
     } catch { return @{ Defer = $false; Why = "deferral check failed: " + $_.Exception.Message } }
+}
+
+function Get-KioskWallDeferral([DateTime]$NowUtc, [scriptblock]$CommandLineOf = $null) {
+    # The wall window: left to the shell while a live, supervising, non-degraded shell runs under a companion policy.
+    # Anything else (and any failure to tell): BayAgent starts and routes it, as before. Never throws.
+    if ($null -eq $CommandLineOf) { $CommandLineOf = { param($procId) Get-KioskProcessCommandLine $procId } }
+    try {
+        $policy = Get-KioskPolicyDecision -PolicyRead (Read-KioskJsonFile -Path $KioskPolicyPath -MaxBytes 4096) -KillSwitchPresent (Test-Path -LiteralPath $KioskKillSwitchPath)
+        if ($policy.Mode -ne "companion") { return @{ Defer = $false; Why = "wall: policy " + $policy.Mode } }
+        $live = Get-KioskShellLiveness -HeartbeatRead (Read-KioskJsonFile -Path $KioskHeartbeatPath -MaxBytes 65536) -NowUtc $NowUtc -CommandLineOf $CommandLineOf
+        if ($live.State -ne "alive") { return @{ Defer = $false; Why = "wall: shell " + $live.State } }
+        if (-not $live.Supervising -or $live.Degraded) { return @{ Defer = $false; Why = "wall: shell not supervising" } }
+        return @{ Defer = $true; Why = "the kiosk shell keeps the wall" }
+    } catch { return @{ Defer = $false; Why = "wall deferral check failed: " + $_.Exception.Message } }
 }
 
 function Wait-KioskShellLauncher([int]$TimeoutSeconds) {

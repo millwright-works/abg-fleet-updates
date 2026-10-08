@@ -137,6 +137,7 @@ public static class AbgKsProbe {
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
     public static IntPtr WindowOf(int pid) {
         IntPtr found = IntPtr.Zero;
         EnumWindowsProc cb = delegate (IntPtr h, IntPtr l) {
@@ -213,6 +214,11 @@ try {
     if ($screenCount -eq 1) {
         Assert-True (Wait-Until { $w = [AbgKsProbe]::WindowOf($wallPid); $w -ne [IntPtr]::Zero -and [AbgKsProbe]::IsIconic($w) } 20) "one screen and the member needs the launcher: the wall is minimized (aside)"
         Assert-True (@(Get-Ours $WallName).Count -ge 1) "...and still running (never closed)"
+        # Something else (BayAgent's routing at Warn5, a person) restores the wall over the only screen: back aside.
+        $ww = [AbgKsProbe]::WindowOf($wallPid)
+        if ($ww -ne [IntPtr]::Zero) { [void][AbgKsProbe]::ShowWindow($ww, 9) }
+        Assert-True (Wait-Until { $w = [AbgKsProbe]::WindowOf($wallPid); $w -ne [IntPtr]::Zero -and -not [AbgKsProbe]::IsIconic($w) } 3) "precondition: the test restored the wall window"
+        Assert-True (Wait-Until { $w = [AbgKsProbe]::WindowOf($wallPid); $w -ne [IntPtr]::Zero -and [AbgKsProbe]::IsIconic($w) } 20) "a wall restored over the only screen is moved aside again within 20 s"
     } else {
         Assert-True ((Read-Hb).wall.plan -eq "show") "two or more screens: the wall stays on its own screen"
     }

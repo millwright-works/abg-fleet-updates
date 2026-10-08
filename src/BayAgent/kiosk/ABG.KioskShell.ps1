@@ -827,6 +827,11 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
                 $S.WallAside = ($aside -and $r.Done)
                 Write-KioskLog ("wall placement: " + $r.Why + $(if ($r.Done -and $r.ContainsKey("Device")) { " on " + $r.Device } else { "" })) "INFO" "wall-place"
             }
+        } elseif ($S.WallRunning -and $S.WallPids.Count -gt 0 -and $S.WallPlan -eq "aside" -and $S.WallCheckedUtc -eq $NowUtc) {
+            # Aside is re-checked at every wall check (10 s): something else may have restored the wall over the only
+            # screen the member has. Minimizing a minimized window is a no-op, so this cannot loop or steal focus.
+            $r = Set-KioskWindowPlacement -Pids $S.WallPids -Screen $null -Aside
+            if ($r.Why -eq "moved aside (minimized)") { Write-KioskLog "wall was restored over the only screen while the launcher is wanted: moved aside again" "WARN" }
         }
     }
 

@@ -491,7 +491,18 @@ try {
     Set-TestFile $KioskKillSwitchPath ""
     [void](Write-KioskIntent -Launcher "wanted" -UntilUtc ($nowA.AddMinutes(30)) -SessionId "s-1" -Reason "test")
     Assert-True (-not (Get-KioskLauncherDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "...not with the kill switch present"
+    Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: not with the kill switch present"
     Remove-Item -LiteralPath $KioskKillSwitchPath -Force
+    [void](Write-KioskIntent -Launcher "not_wanted" -UntilUtc $null -SessionId "s-1" -Reason "test")
+    Assert-True ((Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: a live supervising companion shell owns the wall whatever the intent"
+    Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clGone).Defer) "wall: not when the shell process is gone"
+    $hbLive.degraded = $true; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
+    Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: not when the shell is degraded"
+    $hbLive.degraded = $false; $hbLive.supervising = $false; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
+    Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: not when the shell is not supervising"
+    $hbLive.supervising = $true; Set-TestFile $KioskHeartbeatPath (ConvertTo-Json -InputObject $hbLive)
+    Set-TestFile $KioskPolicyPath "{`"schema`":1,`"mode`":`"explorer`",`"minShellBytes`":4096}"
+    Assert-True (-not (Get-KioskWallDeferral -NowUtc $nowA -CommandLineOf $clShell).Defer) "wall: not under an explorer policy"
 
     # ============================================================ K11
     Section "K11 the shell's own decisions"
@@ -655,6 +666,13 @@ try {
     $res = Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-1") -BayLabel "Bay"
     Assert-True ($script:LauncherStarts -eq 0 -and $res.launcher.reason -eq "kiosk_shell_owns_launcher") "companion with a live supervising shell, Start: the agent does NOT start the launcher; the shell does"
     Assert-True ($res.launcher.shell.running -eq $true) "...and the result reports the shell's launcher running"
+    # The REAL Start-SessionDisplay (renamed so the stub above stays for the other handlers). Its Edge path does not
+    # exist, so if the deferral were missing it would throw instead of starting a browser on this PC.
+    . ([scriptblock]::Create((Get-DefText $AgentDefs "Start-SessionDisplay").Replace("function Start-SessionDisplay(", "function Test-RealStartSessionDisplay(")))
+    $Global:SessionDisplayProfileDir = Join-Path $Sandbox "edge-profile"
+    $cfg | Add-Member -NotePropertyName sessionDisplay -NotePropertyValue ([pscustomobject]@{ edgePath = "C:\AbgNoSuch\msedge.exe"; url = "about:blank"; profileDir = $Global:SessionDisplayProfileDir; mode = "kiosk" }) -Force
+    $wallRes = $null; try { $wallRes = Test-RealStartSessionDisplay ([pscustomobject]@{}) } catch { $wallRes = @{ reason = "threw: " + $_.Exception.Message } }
+    Assert-True ($null -ne $wallRes -and $wallRes.reason -eq "kiosk_shell_owns_wall") "Start-SessionDisplay leaves the wall to the live supervising shell (got: $(if ($wallRes) { $wallRes.reason }))"
 
     $res = Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-1" ',"launcher":{"startOnStart":false}') -BayLabel "Bay"
     Assert-True (-not (Get-IntentNow).Wanted -and $script:LauncherStarts -eq 0 -and $res.launcher.reason -eq "startOnStart_false") "Start with launcher.startOnStart=false: not wanted, so the shell cannot start what the agent would not"
