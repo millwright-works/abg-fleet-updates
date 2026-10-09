@@ -282,9 +282,11 @@ try {
 
     Section "S5 unmanaged (a Start with no end, an emergency stop): hands off, neither closed nor reopened"
     Set-Intent "unmanaged" $null
+    # session.json says no session runs, so only the intent value keeps the closer away (no second layer to hide behind).
+    Set-SessionJson "ENDED" "live" ((Get-Date).ToUniversalTime().AddMinutes(-1))
     Start-Sleep -Seconds 20
     $l2 = @(Get-Ours $LaunchName)
-    Assert-True ($l2.Count -eq 1) "20 s after 'unmanaged' the running launcher is still running"
+    Assert-True ($l2.Count -eq 1) "20 s after 'unmanaged' (session.json ENDED) the running launcher is still running"
     if ($screenCount -eq 1) {
         Assert-True (Wait-Until { $w = [AbgKsProbe]::WindowOf($wallPid); $w -ne [IntPtr]::Zero -and -not [AbgKsProbe]::IsIconic($w) } 20) "the wall comes back from aside"
     }
