@@ -25,3 +25,6 @@
 # CRLF (manifest.json 68 bytes, 65 in git). A build on a machine without autocrlf would ship different bytes and a
 # different package hash from the same commit. Pinned to what has always shipped.
 src/BayAgent/*.json text eol=crlf
+
+# The kiosk policy inside the package (1.4.0, A0.363): the same reason, and the build's CRLF gate now covers .json.
+src/BayAgent/kiosk/*.json text eol=crlf

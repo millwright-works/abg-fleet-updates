@@ -42,6 +42,11 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($AgentScript)) { $AgentScript = Join-Path $RepoRoot "src/BayAgent/BayAgent.ps1" }
 $AgentScript = (Resolve-Path $AgentScript).Path
 $IsWin = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+# The version the code under test carries in its own constant (1.4.0: read, not hard-coded, so this suite follows the
+# code's version from release to release; the build gate pins the constant to the package version).
+$CodeVersionMatch = [regex]::Match([IO.File]::ReadAllText($AgentScript), '(?m)^\$AgentCodeVersion = "([^"]+)"\r?$')
+if (-not $CodeVersionMatch.Success) { throw "BayAgent.ps1 carries no `$AgentCodeVersion line" }
+$CodeVersion = $CodeVersionMatch.Groups[1].Value
 
 $script:Pass = 0; $script:Fail = 0; $script:Failures = @()
 function Assert-True([bool]$cond, [string]$msg) {
@@ -279,9 +284,9 @@ Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms,System.
     Assert-True ($null -ne $r1.Cap) "the heartbeat carried a capabilities document that parses ($($r1.Diag))"
     if ($null -ne $r1.Cap) {
         $c = $r1.Cap
-        Assert-True ([string]$c.agentVersion -eq "1.3.1") "V: agentVersion is the code's own constant 1.3.1 even with a stale 1.2.1 manifest beside it (got '$($c.agentVersion)')"
+        Assert-True ([string]$c.agentVersion -eq $CodeVersion) "V: agentVersion is the code's own constant $CodeVersion even with a stale 1.2.1 manifest beside it (got '$($c.agentVersion)')"
         Assert-True ((Has $c "manifestVersion") -and [string]$c.manifestVersion -eq "1.2.1") "V: manifestVersion reports the stale manifest as it is (1.2.1), so the mismatch is visible"
-        Assert-True ($r1.Log -match "Version=1\.3\.1 ManifestVersion=1\.2\.1") "V: the agent's own startup log line names both versions"
+        Assert-True ($r1.Log -match ("Version=" + [regex]::Escape($CodeVersion) + " ManifestVersion=1\.2\.1")) "V: the agent's own startup log line names both versions"
         $inst = $c.install
         Assert-True ((Has $inst "codeSha256") -and [string]$inst.codeSha256 -eq $agentCopySha) "C: install.codeSha256 is the SHA256 of the file that ran ($agentCopySha)"
         Assert-True ((Has $inst "manifestMatchesCode") -and $inst.manifestMatchesCode -eq $false) "C: install.manifestMatchesCode is false for the stale manifest"
@@ -318,7 +323,7 @@ Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms,System.
     if ($null -ne $r1.Result) {
         $h = $r1.Result
         Assert-True ($r1.ResultRaw.Length -le 2000 -and -not (Has $h "resultTrimmed")) "C: the HealthCheck {report:true} result fits build_resultjson untrimmed ($($r1.ResultRaw.Length) chars)"
-        Assert-True ([string]$h.codeSha256 -eq $agentCopySha -and [string]$h.manifestVersion -eq "1.2.1" -and [string]$h.agentVersion -eq "1.3.1") "C: HealthCheck carries agentVersion, manifestVersion and codeSha256"
+        Assert-True ([string]$h.codeSha256 -eq $agentCopySha -and [string]$h.manifestVersion -eq "1.2.1" -and [string]$h.agentVersion -eq $CodeVersion) "C: HealthCheck carries agentVersion, manifestVersion and codeSha256"
         Assert-True ($h.selfHealRunning -eq $false -and $h.currentIsLink -eq $true) "C: HealthCheck carries selfHealRunning and currentIsLink"
         Assert-True ((Has $h "windows") -and @($h.windows | Where-Object { [string]$_.name -eq "launcher" -and $_.running -eq $true -and [string]$_.device -match "DISPLAY" }).Count -eq 1) "C: HealthCheck {report:true} carries the compact window summary"
         Assert-True ($h.fullReportRequested -eq $true -and [string]$h.fullReportIn -eq "build_agentcapabilitiesjson") "C: HealthCheck {report:true} requests the full report"
@@ -326,7 +331,7 @@ Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms,System.
     # A: the alive record from a real pass
     $alive = $null
     if (Test-Path -LiteralPath $alivePath) { try { $alive = [IO.File]::ReadAllText($alivePath) | ConvertFrom-Json } catch { } }
-    Assert-True ($null -ne $alive -and [string]$alive.codeSha256 -eq $agentCopySha -and [string]$alive.codeVersion -eq "1.3.1") "A: a real pass (heartbeat accepted, poll ok) wrote state\agent-alive.json with the hash of the file that ran"
+    Assert-True ($null -ne $alive -and [string]$alive.codeSha256 -eq $agentCopySha -and [string]$alive.codeVersion -eq $CodeVersion) "A: a real pass (heartbeat accepted, poll ok) wrote state\agent-alive.json with the hash of the file that ran"
     Assert-True ($null -ne $alive -and (UtcText $alive.firstOkUtc) -eq (UtcText $alive.lastOkUtc) -and [int]$alive.writes -eq 1) "A: one pass writes the record once, first = last"
 
     # A plain HealthCheck (no report) stays small and requests nothing

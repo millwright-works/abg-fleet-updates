@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "mode": "explorer",
+  "minShellBytes": 4096,
+  "comment": "BayAgent 1.4.0 ships the kiosk shell DORMANT: mode explorer. Only a signed, hash-pinned fleet release changes this file (A0.363)."
+}
