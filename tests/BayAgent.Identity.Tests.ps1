@@ -532,6 +532,29 @@ try {
     [IO.File]::WriteAllText($DisplayPassStatePath, (Pass-Json @{}))
     Assert-True ($null -eq (Get-DisplayPassWallUrl)) "mode off: none, whatever is on disk"
     $DisplayPassReleaseMode = "on"
+    Section "VFY1 (verifier probe) CONFIRMED own identity, own app refused as after a revoke: does Acquire-Token fall back to the shared secret?"
+    $null = Make-OwnActive
+    Set-Variable -Name Secret -Scope Script -Value "vfy-fallback-0123456789"; $script:HasSecretCredential = $true
+    $sync["MintFail"][$OwnApp] = "AADSTS7000112"
+    Set-Variable -Name AccessToken -Scope Global -Value $null
+    $vfyTok = $null; $vfyErr = $null
+    try { $vfyTok = Acquire-Token } catch { $vfyErr = $_.Exception.Message }
+    Write-Host ("VFY1 observed: token-is-shared={0} mode={1} probation={2} err={3}" -f ($vfyTok -eq "at-$SharedApp-dv"), $Global:CredentialTelemetry.lastMintMode, ($null -ne (Get-IdentityProbation)), $vfyErr)
+    Assert-True ($vfyTok -eq "at-$SharedApp-dv") "VFY1 PROBE: after confirm, a refused own app falls back to the shared secret (observed behavior)"
+    Set-Variable -Name Secret -Scope Script -Value $null; $script:HasSecretCredential = $false
+    $sync["MintFail"].Remove($OwnApp)
+
+    Section "VFY2 (verifier probe) on probation, the poll succeeds every pass but every command CLAIM is refused by the guard: does it ever revert before 72 h?"
+    $null = Open-Probation
+    1..12 | ForEach-Object {
+        Clear-IdentityProbationFailures
+        $Global:LastDvErrorBody = '{"error":{"message":"Only the BayAgent user may advance command status."}}'
+        Register-IdentityProbationFailure "command lock: The remote server returned an error: (400) Bad Request."
+    }
+    Write-Host ("VFY2 observed: after 12 refused claims each preceded by a good poll, active app is own={0} failures={1}" -f ((Get-ActiveClientId) -eq $OwnApp), $Global:IdentityProbationFailures)
+    Assert-True ((Get-ActiveClientId) -eq $OwnApp) "VFY2 PROBE: claim refusals never accumulate (a good poll clears the count each pass)"
+    $Global:LastDvErrorBody = $null
+
 }
 finally {
     $sync["Stop"] = $true
