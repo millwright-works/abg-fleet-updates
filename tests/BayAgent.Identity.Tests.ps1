@@ -261,8 +261,9 @@ try {
     $st = Read-CredentialState
     Assert-True ($res.ok -and $res.identitySwitched) "activate reports the identity switched"
     Assert-True ([string]$st.activeClientId -eq $OwnApp -and [string]$st.activeThumbprint -eq $cand.Thumbprint) "credential.json: active certificate and the bay's own app"
-    Assert-True ($null -ne $st.identityProbation -and [string]$st.identityProbation.clientId -eq $OwnApp) "the switch is ON PROBATION"
-    Assert-True ([string]::IsNullOrEmpty([string]$st.identityProbation.previousThumbprint) -and [string]::IsNullOrEmpty([string]$st.identityProbation.previousClientId)) "...remembering the bay was on the configured secret"
+    $prob = Get-PropValue $st "identityProbation" $null
+    Assert-True ($null -ne $prob -and [string](Get-PropValue $prob "clientId" "") -eq $OwnApp) "the switch is ON PROBATION"
+    Assert-True ($null -ne $prob -and [string]::IsNullOrEmpty([string](Get-PropValue $prob "previousThumbprint" "")) -and [string]::IsNullOrEmpty([string](Get-PropValue $prob "previousClientId" ""))) "...remembering the bay was on the configured secret"
     $newTok = "at-$OwnApp-dv"
     Assert-True (@(Requests "WhoAmI" | Where-Object { $_.auth -eq $newTok }).Count -eq 1) "proof: WhoAmI as the NEW identity"
     Assert-True (@($sync["Requests"] | Where-Object { $_.method -eq "GET" -and $_.path -match "build_baies\($BayId\)" -and $_.auth -eq $newTok }).Count -eq 1) "proof: this bay's row read as the new identity"
@@ -349,6 +350,12 @@ try {
     1..8 | ForEach-Object { Register-IdentityProbationFailure "mint: Token endpoint unreachable: Unable to connect to the remote server" }
     1..8 | ForEach-Object { Register-IdentityProbationFailure "poll: The operation has timed out." }
     Assert-True ((Get-ActiveClientId) -eq $OwnApp) "sixteen outage failures: still on the bay's own app"
+    # An outage while an earlier refusal's body is still held (or a proxy's words carry a status) is still an outage.
+    $Global:LastDvErrorBody = '{"error":{"message":"Only the BayAgent user may write execution fields."}}'
+    1..8 | ForEach-Object { Register-IdentityProbationFailure "poll: Unable to connect to the remote server" }
+    $Global:LastDvErrorBody = $null
+    1..8 | ForEach-Object { Register-IdentityProbationFailure "mint: Token endpoint unreachable (proxy answered 403)" }
+    Assert-True ((Get-ActiveClientId) -eq $OwnApp) "outages next to refusal words: still on the bay's own app"
 
     Section "I9 a probation nobody confirms within 72 hours is reverted; an unreadable start is treated as expired"
     $null = Open-Probation ((Get-Date).ToUniversalTime().AddHours(-71).ToString("yyyy-MM-ddTHH:mm:ssZ"))
@@ -468,6 +475,13 @@ try {
         Assert-True ($r2 -eq "bad_shape") "refused as bad_shape (got '$r2')"
         Assert-True ((Read-DisplayPassState).bayRef -eq "bay-7") "the earlier good pass is kept"
     }
+
+    Section "D4b the expiry reader takes only a zoned instant (text, as Windows PowerShell 5.1 hands it over)"
+    $soon = (Get-Date).ToUniversalTime().AddHours(6)
+    Assert-True ($null -eq (ConvertTo-DisplayPassUtc ($soon.ToString("yyyy-MM-ddTHH:mm:ss")))) "a zone-less instant inside the window: refused"
+    Assert-True ((ConvertTo-DisplayPassUtc ($soon.ToString("yyyy-MM-ddTHH:mm:ss") + "Z")) -eq [DateTime]::new($soon.Year, $soon.Month, $soon.Day, $soon.Hour, $soon.Minute, $soon.Second, [DateTimeKind]::Utc)) "the same instant with Z: read as UTC"
+    Assert-True ((ConvertTo-DisplayPassUtc "2026-10-09T12:00:00+02:00") -eq [DateTime]::new(2026, 10, 9, 10, 0, 0, [DateTimeKind]::Utc)) "an offset: converted to UTC"
+    Assert-True ($null -eq (ConvertTo-DisplayPassUtc ([DateTime]::new(2026, 10, 9, 10, 0, 0, [DateTimeKind]::Unspecified)))) "an unzoned DateTime (PowerShell 7's read of zone-less text): refused"
 
     Section "D5 a refusal is reported by its code and writes nothing"
     $null = Make-OwnActive
