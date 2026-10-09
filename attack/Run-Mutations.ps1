@@ -59,8 +59,8 @@ $Muts = @(
                                                    To='    $persisted = 0   # MUTANT M3: prior total ignored' }
   @{ Id="M4"; Target="1 non-exportable key";      From='        -KeyExportPolicy NonExportable `'
                                                    To='        -KeyExportPolicy Exportable `' }
-  @{ Id="M5"; Target="3 activate proof";          From='    $j = Acquire-TokenWithCertificate -Thumbprint $tp'
-                                                   To='    $j = [pscustomobject]@{ expires_in = 3599 }   # MUTANT M5: proof removed' }
+  @{ Id="M5"; Target="3 activate proof";          From='        $j = Acquire-TokenWithCertificate -Thumbprint $tp -ForClientId $mintClient'
+                                                   To='        $j = [pscustomobject]@{ expires_in = 3599 }   # MUTANT M5: proof removed' }
   @{ Id="M6"; Target="2 cert preferred";          From='    if ($activeTp) {
         try {
             $json = Acquire-TokenWithCertificate -Thumbprint $activeTp'

@@ -72,7 +72,11 @@ $wanted = @(
     "Invoke-CredentialEnroll", "Invoke-CredentialTest", "Invoke-CredentialActivate", "Invoke-CredentialRetire",
     "Invoke-CredentialStatus", "Invoke-CredentialRotate",
     "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate", "Sync-FallbackTelemetry",
-    "Start-GenericProcess", "Read-LastUpdateResult", "Test-HasUsableSecret", "New-EnrollCertPayload"
+    "Start-GenericProcess", "Read-LastUpdateResult", "Test-HasUsableSecret", "New-EnrollCertPayload",
+    # A0.458: the identity helpers the token path and activate now reach.
+    "ConvertTo-AgentGuid", "Get-ActiveClientId", "Test-OwnIdentityActive", "Get-IdentityProbation",
+    "Test-IdentityRefusal", "Register-IdentityProbationFailure", "Clear-IdentityProbationFailures", "Invoke-IdentityRevert",
+    "Test-IdentityCandidate", "Invoke-CredentialConfirm", "Invoke-CredentialRevert"
 )
 $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $lifted = 0
@@ -111,6 +115,12 @@ $Global:CredentialTelemetry = @{
     lastCertError = $null; lastSecretError = $null; fallbackCount = 0; lastTest = $null
     fallbackFlushed = 0; lastFallbackUtc = $null
 }
+# A0.458 script state the identity helpers read (mirrors BayAgent.ps1).
+$IdentityProbationMaxFailures = 5
+$IdentityProbationMaxHours    = 72
+$Global:IdentityProbationFailures = 0
+$Global:CurrentCommandId = $null
+$Global:LastDvErrorBody = $null
 function Reset-TelemetryAsIfRestarted {
     # Exactly what a Host Watchdog restart does to the in-memory counters: wipes them.
     $Global:CredentialTelemetry = @{
