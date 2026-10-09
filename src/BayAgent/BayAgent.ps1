@@ -658,6 +658,53 @@ function Get-PendingCertThumbprint {
     return (Normalize-Thumbprint ([string](Get-PropValue $st "pendingThumbprint" "")))
 }
 
+# ---------------- A0.458: the bay's OWN identity ----------------
+# Kevin's prompt answer 2026-10-08 ("Each bay its own identity"): each bay signs in as ITS OWN Entra app with a
+# certificate whose key never leaves this machine, so the cloud knows exactly which bay is asking. agent-config.json's
+# clientId stays the SHARED bay-agent app (it is what the DPAPI secret belongs to); credential.json's activeClientId,
+# when present, names the bay's own app and goes with activeThumbprint. A switch to it is proven against Dataverse and
+# the command guard BEFORE it happens, held on probation, and undone by the agent itself when the new identity cannot
+# work (Invoke-IdentityRevert), so a remote switch cannot strand the bay.
+
+function ConvertTo-AgentGuid([string]$Text) {
+    # A GUID in its canonical lower-case D form, or $null. Never throws.
+    $g = [guid]::Empty
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    if (-not [guid]::TryParse($Text.Trim(), [ref]$g)) { return $null }
+    if ($g -eq [guid]::Empty) { return $null }
+    return $g.ToString("D")
+}
+
+function Get-ActiveClientId {
+    # The app the ACTIVE certificate signs in as. A valid activeClientId in credential.json, else the configured
+    # (shared) clientId. A corrupt state file names nothing, so this falls back to the configured app, which is what
+    # the active certificate also falls back to (Get-ActiveCertThumbprint).
+    $st = Read-CredentialState
+    $own = ConvertTo-AgentGuid ([string](Get-PropValue $st "activeClientId" ""))
+    if ($own) { return $own }
+    return (ConvertTo-AgentGuid $ClientId)
+}
+
+function Test-OwnIdentityActive {
+    # True when the active credential is a certificate on an app other than the configured shared one.
+    $tp = Get-ActiveCertThumbprint
+    if (-not $tp) { return $false }
+    return ((Get-ActiveClientId) -ne (ConvertTo-AgentGuid $ClientId))
+}
+
+function Get-IdentityProbation {
+    # The probation record written by an identity switch, or $null when none is open.
+    $st = Read-CredentialState
+    $p = Get-PropValue $st "identityProbation" $null
+    if ($null -eq $p) { return $null }
+    if (-not (ConvertTo-AgentGuid ([string](Get-PropValue $p "clientId" "")))) { return $null }
+    return $p
+}
+
+# The body of the last refused Dataverse call (Invoke-DvSafe sets it); read by the identity probation. Set here, before
+# anything can read it, because reading an unset variable is a terminating error under strict mode.
+$Global:LastDvErrorBody = $null
+
 function Get-CertStoreSearchOrder {
     $stores = @("Cert:\CurrentUser\My", "Cert:\LocalMachine\My")
     if ($CertStoreCfg) {
@@ -809,19 +856,34 @@ function Invoke-TokenEndpoint {
 function Acquire-TokenWithCertificate {
     # Mints with ONE named certificate and does NOT touch the token cache or telemetry - so it doubles as the
     # proof step for activate / test / retire.
-    param([Parameter(Mandatory=$true)][string]$Thumbprint)
+    # A0.458: -ForClientId names the app the certificate signs in as (default: the active app when this is the active
+    # certificate, else the configured shared app); -Scope names the resource (default: this bay's Dataverse).
+    param(
+        [Parameter(Mandatory=$true)][string]$Thumbprint,
+        [string]$ForClientId = "",
+        [string]$Scope = ""
+    )
     $cert = Find-ClientCertificate $Thumbprint
     if ($null -eq $cert) { throw "Certificate $Thumbprint (with private key) not found in $((Get-CertStoreSearchOrder) -join ', ')" }
     if ($cert.NotAfter.ToUniversalTime() -lt (Get-Date).ToUniversalTime()) { throw "Certificate $Thumbprint expired $($cert.NotAfter.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))" }
 
+    $clientForMint = ConvertTo-AgentGuid $ForClientId
+    if (-not $clientForMint) {
+        if ((Normalize-Thumbprint $Thumbprint) -eq (Get-ActiveCertThumbprint)) { $clientForMint = Get-ActiveClientId }
+        else { $clientForMint = ConvertTo-AgentGuid $ClientId }
+    }
+    if (-not $clientForMint) { throw "No client id to sign in as (agent-config.json clientId is not a GUID)" }
+    $scopeForMint = $Scope
+    if ([string]::IsNullOrWhiteSpace($scopeForMint)) { $scopeForMint = "$OrgUrl/.default" }
+
     $tokenUrl  = Get-TokenUrl
-    $assertion = New-ClientAssertionJwt -Certificate $cert -ClientId $ClientId -Audience $tokenUrl -Alg $AssertionAlg
+    $assertion = New-ClientAssertionJwt -Certificate $cert -ClientId $clientForMint -Audience $tokenUrl -Alg $AssertionAlg
     $body = @(
-        "client_id=$([uri]::EscapeDataString($ClientId))"
+        "client_id=$([uri]::EscapeDataString($clientForMint))"
         "client_assertion_type=$([uri]::EscapeDataString('urn:ietf:params:oauth:client-assertion-type:jwt-bearer'))"
         "client_assertion=$assertion"
         "grant_type=client_credentials"
-        "scope=$([uri]::EscapeDataString("$OrgUrl/.default"))"
+        "scope=$([uri]::EscapeDataString($scopeForMint))"
     ) -join "&"
     return (Invoke-TokenEndpoint -TokenUrl $tokenUrl -FormBody $body)
 }
@@ -853,6 +915,8 @@ function Acquire-Token {
             $Global:CredentialTelemetry.lastCertError   = $null
         } catch {
             $Global:CredentialTelemetry.lastCertError = $_.Exception.Message
+            # A0.458: on probation, a certificate that cannot sign in as the bay's own app counts toward going back.
+            Register-IdentityProbationFailure ("mint: " + $_.Exception.Message)
             if ($HasSecretCredential) {
                 $Global:CredentialTelemetry.fallbackCount++
                 $Global:CredentialTelemetry.lastFallbackUtc = $nowStr
@@ -956,9 +1020,27 @@ function Get-CredentialTelemetry {
     $secretMode = "none"
     if ($SecretPath) { $secretMode = "dpapi" } elseif ($Secret) { $secretMode = "plaintext" }
 
+    # A0.458: which app the bay signs in as (public ids), and the state of an identity switch. The operator ladder's
+    # activate reads activeClientId and activeThumbprint from here, next to the platform's own record of who wrote the row.
+    $idState = $null
+    try { $idState = Read-CredentialState } catch { }
+    $probation = $null
+    try { $probation = Get-IdentityProbation } catch { }
+    $identity = [ordered]@{
+        activeClientId       = $(try { Get-ActiveClientId } catch { $null })
+        configuredClientId   = (ConvertTo-AgentGuid $ClientId)
+        ownIdentity          = $(try { Test-OwnIdentityActive } catch { $false })
+        probationSinceUtc    = $(if ($probation) { [string](Get-PropValue $probation "sinceUtc" "") } else { $null })
+        probationFailures    = [int]$Global:IdentityProbationFailures
+        confirmedUtc         = [string](Get-PropValue $idState "identityConfirmedUtc" "")
+        reverted             = (Get-PropValue $idState "identityReverted" $null)
+    }
+
     $t = $Global:CredentialTelemetry
     return [ordered]@{
         schema                 = 2
+        activeClientId         = $identity.activeClientId
+        identity               = $identity
         configuredMode         = $(if ($activeTp) { "certificate" } else { "secret" })
         # A corrupt state file is the one condition under which every OTHER number in this block is
         # untrustworthy -- including fallbackCountTotal, which gates the irreversible retirement. Say so.
@@ -1056,6 +1138,7 @@ function Invoke-DvSafe {
         [string]$BodyJson = $null
     )
 
+    $Global:LastDvErrorBody = $null
     try {
         if ($Method -eq "PATCH") {
             Invoke-RestMethod -Method Patch -Uri $Uri -Headers $Headers -ContentType "application/json" -Body $BodyJson -ErrorAction Stop | Out-Null
@@ -1090,6 +1173,9 @@ function Invoke-DvSafe {
             } catch {}
         }
         if (-not [string]::IsNullOrWhiteSpace($body)) { Write-Log "Dataverse response body: $body" "ERROR" }
+        # A0.458: the identity probation reads the platform's refusal text (a plugin's refusal arrives as a 400 whose
+        # message is only in the body).
+        $Global:LastDvErrorBody = $body
 
         throw
     }
@@ -1167,6 +1253,320 @@ function Patch-Row {
     $json = ($bodyObj | ConvertTo-Json -Depth 10)
 
     Invoke-DvSafe -Method PATCH -Uri $uri -Headers (New-DvHeaders $token $ifMatch) -BodyJson $json
+}
+
+# ---------------- A0.458: identity switch proof, probation and revert ----------------
+# An identity switch is held on PROBATION until an operator confirms it (CredentialRotate action=confirm, which can
+# only run if the new identity can claim a command). While on probation the agent goes back to its previous credential
+# on its own when the new identity is REFUSED (an Entra code, a 401/403, the command guard) five times in a row, or
+# when nobody confirms within 72 hours. A network outage is not a refusal and never triggers it.
+$IdentityProbationMaxFailures = 5
+$IdentityProbationMaxHours    = 72
+$Global:IdentityProbationFailures = 0
+$Global:CurrentCommandId = $null
+
+function Test-IdentityRefusal([string]$Message) {
+    # Refused BY the platform, as opposed to unreachable. Reads the last Dataverse error body too (a plugin refusal
+    # is a 400 whose words are only in the body).
+    $text = "$Message $([string]$Global:LastDvErrorBody)"
+    if ($text -match "unreachable|timed out|could not be resolved|No such host|actively refused|Unable to connect") { return $false }
+    return ($text -match "AADSTS\d+|\(401\)|\(403\)|\b401\b|\b403\b|Unauthorized|Forbidden|Only the BayAgent user|not found in Cert:|expired")
+}
+
+function Register-IdentityProbationFailure([string]$What) {
+    # Never throws: it is called from the token path and the main loop's catch.
+    try {
+        if ($null -eq (Get-IdentityProbation)) { return }
+        if (-not (Test-IdentityRefusal $What)) { return }
+        $Global:IdentityProbationFailures = [int]$Global:IdentityProbationFailures + 1
+        Write-Log ("[IDENTITY] the bay's own identity was refused ({0}/{1}): {2}" -f $Global:IdentityProbationFailures, $IdentityProbationMaxFailures, $What) "WARN"
+        if ($Global:IdentityProbationFailures -ge $IdentityProbationMaxFailures) {
+            [void](Invoke-IdentityRevert -Reason ("auto: refused {0} times in a row; last: {1}" -f $Global:IdentityProbationFailures, $What))
+        }
+    } catch {
+        Write-Log ("[IDENTITY] could not record a probation failure: {0}" -f $_.Exception.Message) "ERROR"
+    }
+}
+
+function Clear-IdentityProbationFailures {
+    $Global:IdentityProbationFailures = 0
+}
+
+function Test-IdentityProbationExpiry {
+    # Never throws. A switch nobody confirmed within the window is undone.
+    param([DateTime]$Now = (Get-Date).ToUniversalTime())
+    try {
+        $p = Get-IdentityProbation
+        if ($null -eq $p) { return }
+        $since = [DateTime]::MinValue
+        $raw = Get-PropValue $p "sinceUtc" $null
+        if ($raw -is [DateTime]) { $since = $raw.ToUniversalTime() }
+        elseif (-not [DateTime]::TryParse([string]$raw, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$since)) {
+            # An unreadable start is treated as expired: a probation that cannot say when it began cannot be kept open.
+            $since = [DateTime]::MinValue
+        }
+        if ($since.AddHours($IdentityProbationMaxHours) -lt $Now) {
+            [void](Invoke-IdentityRevert -Reason ("auto: not confirmed within {0} hours" -f $IdentityProbationMaxHours))
+        }
+    } catch {
+        Write-Log ("[IDENTITY] probation expiry check failed: {0}" -f $_.Exception.Message) "ERROR"
+    }
+}
+
+function Invoke-IdentityRevert {
+    # Go back to the credential in force before the switch. Returns $true when it did. A corrupt state file is never
+    # rewritten (Update-CredentialState refuses), so a revert that cannot be recorded does not happen and says so.
+    param([Parameter(Mandatory=$true)][string]$Reason)
+    $p = Get-IdentityProbation
+    if ($null -eq $p) { return $false }
+    if ($Global:CredentialStateCorrupt) {
+        Write-Log "[IDENTITY] cannot revert: credential.json is corrupt. Recover it from the .bak first." "ERROR"
+        return $false
+    }
+    $fromTp = Get-ActiveCertThumbprint
+    $fromClient = Get-ActiveClientId
+    $prevTp = $null
+    try { $prevTp = Normalize-Thumbprint ([string](Get-PropValue $p "previousThumbprint" "")) } catch { $prevTp = $null }
+    $prevClient = ConvertTo-AgentGuid ([string](Get-PropValue $p "previousClientId" ""))
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    # The certificate being left keeps a record, so its private key can still be retired later.
+    $sup = @()
+    $priorSup = Get-PropValue (Read-CredentialState) "superseded" $null
+    if ($priorSup) { $sup = @($priorSup) }
+    if ($fromTp -and ($sup -notcontains $fromTp) -and ($fromTp -ne $prevTp)) { $sup += $fromTp }
+
+    Update-CredentialState @{
+        activeThumbprint  = $prevTp
+        activeClientId    = $prevClient
+        identityProbation = $null
+        superseded        = $sup
+        identityReverted  = [ordered]@{ utc = $nowStr; reason = $Reason; fromClientId = $fromClient; fromThumbprint = $fromTp }
+    } | Out-Null
+    Set-Variable -Name AccessToken -Scope Global -Value $null
+    $Global:TokenExpiresUtc = [DateTime]::MinValue
+    $Global:IdentityProbationFailures = 0
+    Write-Log ("[IDENTITY] REVERTED from app {0} to {1}: {2}" -f $fromClient, $(if ($prevTp) { "certificate $prevTp" } else { "the configured credential" }), $Reason) "ERROR"
+    return $true
+}
+
+function Test-IdentityCandidate {
+    # PROVE a new identity before switching to it, against the things that would strand the bay if they refused it:
+    # a token mint, Dataverse (WhoAmI), this bay's own row (read and the heartbeat write), and the COMMAND GUARD (an
+    # execution-field write on the command being run, which the guard refuses to anyone but the bay agent user). Throws
+    # a sentence naming the first refusal; nothing has been switched when it throws.
+    param(
+        [Parameter(Mandatory=$true)][string]$Thumbprint,
+        [Parameter(Mandatory=$true)][string]$ForClientId
+    )
+    $cmdId = [string]$Global:CurrentCommandId
+    if ([string]::IsNullOrWhiteSpace($cmdId)) { throw "activate: an identity switch runs only as a CredentialRotate command (the command it runs on is the command-guard probe)" }
+
+    $j = $null
+    try { $j = Acquire-TokenWithCertificate -Thumbprint $Thumbprint -ForClientId $ForClientId }
+    catch { throw ("activate refused: certificate {0} cannot sign in as app {1}: {2}" -f $Thumbprint, $ForClientId, $_.Exception.Message) }
+    $tok = [string]$j.access_token
+    $h = New-DvHeaders $tok
+
+    $who = $null
+    try { $who = Invoke-DvSafe -Method GET -Uri "$OrgUrl/api/data/v9.2/WhoAmI()" -Headers $h }
+    catch { throw ("activate refused: Dataverse refuses app {0} (is its application user missing or disabled?): {1}" -f $ForClientId, $_.Exception.Message) }
+
+    try { [void](Invoke-DvSafe -Method GET -Uri "$OrgUrl/api/data/v9.2/$BayEntitySet($BayId)?`$select=build_bayid" -Headers $h) }
+    catch { throw ("activate refused: app {0} cannot read this bay's row (its role?): {1}" -f $ForClientId, $_.Exception.Message) }
+
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    try { Patch-Row $tok $BayEntitySet $BayId @{ $Col_Heartbeat = $nowStr } "*" }
+    catch { throw ("activate refused: app {0} cannot write this bay's heartbeat: {1}" -f $ForClientId, $_.Exception.Message) }
+
+    try { Patch-Row $tok $BayCommandEntitySet $cmdId @{ $Col_Result = '{"stage":"identity-probe"}' } "*" }
+    catch { throw ("activate refused: the command guard refuses app {0}, so this bay could not run its commands on it: {1}" -f $ForClientId, $_.Exception.Message) }
+
+    return [ordered]@{ mintedWithCertificate = $true; userId = [string](Get-PropValue $who "UserId" ""); bayRead = $true; bayWrite = $true; commandGuard = $true }
+}
+
+# ---------------- A0.456: the bay's own short-lived wall pass ----------------
+# The bay fetches the pass for ITS OWN wall with its own identity (POST /api/v1/bay/display-pass) and refreshes it; nothing
+# long-lived is stored. WHERE it asks is fixed in this signed file, keyed by this bay's own Dataverse org: no platform row,
+# config item or command can point the bay (or its token) at another host. "off" until a release turns it on.
+$DisplayPassReleaseMode = "off"
+$DisplayPassSites = @{
+    "builds-apps-dev.crm.dynamics.com" = @{ site = "https://testclub.dev.aceofclubs.golf"; apiAppId = "e7e1a2d5-4612-4e3f-9c58-5618ec7e0454" }
+}
+$DisplayPassWallPath  = "/bay-display.html"
+# The wall page's query parameter that carries the pass (web/src/pages/bay-display.ts reads it).
+$DisplayPassQueryName = "token"
+$DisplayPassRoute     = "/api/v1/bay/display-pass"
+$DisplayPassStatePath = Join-Path $BaseDir "state\display-pass.json"
+$Global:DisplayPassNextAttemptUtc = [DateTime]::MinValue
+$Global:DisplayPassBackoffSec     = 60
+$Global:DisplayPassLast           = [ordered]@{ attemptUtc = $null; result = $null; status = $null }
+
+function Get-DisplayPassEndpoint {
+    # The pinned site and API app for this bay's own org, or $null.
+    $orgHost = $null
+    try { $orgHost = ([uri]$OrgUrl).Host.ToLowerInvariant() } catch { return $null }
+    if (-not $DisplayPassSites.ContainsKey($orgHost)) { return $null }
+    $e = $DisplayPassSites[$orgHost]
+    $site = [string]$e.site
+    $api = ConvertTo-AgentGuid ([string]$e.apiAppId)
+    if (-not $api) { return $null }
+    $u = $null
+    if (-not [uri]::TryCreate($site, [UriKind]::Absolute, [ref]$u)) { return $null }
+    if ($u.AbsolutePath -ne "/" -or $u.Query -or $u.UserInfo) { return $null }
+    if ($u.Scheme -ne "https" -and -not ($u.Scheme -eq "http" -and $u.IsLoopback)) { return $null }
+    return [ordered]@{ site = $site.TrimEnd("/"); apiAppId = $api }
+}
+
+function ConvertTo-DisplayPassUtc($Value) {
+    # A zoned instant as UTC, or $null. PowerShell 7 hands back DateTime for ISO text (Kind Utc when the text carried a
+    # zone, Unspecified when it did not); 5.1 hands back text. A zone-less value is refused on both.
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return $null }
+        return $Value.ToUniversalTime()
+    }
+    $s = [string]$Value
+    if ($s -notmatch '(Z|[+-]\d\d:\d\d)$') { return $null }
+    $d = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$d)) { return $null }
+    return $d.UtcDateTime
+}
+
+function Test-DisplayPassShape {
+    # The pass as the bay keeps it. Every field checked; any failure is "no pass". Returns the normalized record or $null.
+    param($Obj, [DateTime]$Now = (Get-Date).ToUniversalTime())
+    if ($null -eq $Obj) { return $null }
+    $bay = ConvertTo-AgentGuid ([string](Get-PropValue $Obj "bayId" ""))
+    if ($bay -ne (ConvertTo-AgentGuid $BayId)) { return $null }
+    $ref = [string](Get-PropValue $Obj "bayRef" "")
+    if ($ref -notmatch '^[A-Za-z0-9._-]{1,64}$') { return $null }
+    $pass = [string](Get-PropValue $Obj "pass" "")
+    if ($pass.Length -gt 2048 -or $pass -notmatch '^BAYD1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$') { return $null }
+    if ([string](Get-PropValue $Obj "wallPath" "") -ne $DisplayPassWallPath) { return $null }
+    $exp = ConvertTo-DisplayPassUtc (Get-PropValue $Obj "expiresUtc" $null)
+    $refresh = ConvertTo-DisplayPassUtc (Get-PropValue $Obj "refreshAfterUtc" $null)
+    if ($null -eq $exp -or $null -eq $refresh) { return $null }
+    if ($exp -le $Now -or $exp -gt $Now.AddHours(25) -or $refresh -gt $exp) { return $null }
+    return [ordered]@{
+        bayId = $bay; bayRef = $ref; pass = $pass; wallPath = $DisplayPassWallPath
+        expiresUtc = $exp.ToString("yyyy-MM-ddTHH:mm:ssZ"); refreshAfterUtc = $refresh.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+}
+
+function Read-DisplayPassState {
+    # Strict: absent, unreadable, unparseable or out of shape are all "no pass".
+    param([DateTime]$Now = (Get-Date).ToUniversalTime())
+    if (-not (Test-Path -LiteralPath $DisplayPassStatePath)) { return $null }
+    try {
+        $raw = [IO.File]::ReadAllText($DisplayPassStatePath)
+        $obj = $raw | ConvertFrom-Json
+        return (Test-DisplayPassShape -Obj $obj -Now $Now)
+    } catch { return $null }
+}
+
+function Write-DisplayPassState($Record) {
+    $dir = Split-Path -Parent $DisplayPassStatePath
+    if (!(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $tmp = "$DisplayPassStatePath.tmp"
+    [IO.File]::WriteAllText($tmp, ($Record | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $DisplayPassStatePath -Force
+}
+
+function Invoke-DisplayPassFetch {
+    # One fetch. Returns a short result code; writes the pass only when its shape holds. Never logs the pass.
+    param([DateTime]$Now = (Get-Date).ToUniversalTime())
+    $ep = Get-DisplayPassEndpoint
+    if ($null -eq $ep) { return "no_pinned_site" }
+    if (-not (Test-OwnIdentityActive)) { return "not_own_identity" }
+    $tp = Get-ActiveCertThumbprint
+    $j = $null
+    try { $j = Acquire-TokenWithCertificate -Thumbprint $tp -ForClientId (Get-ActiveClientId) -Scope ("{0}/.default" -f $ep.apiAppId) }
+    catch {
+        Register-IdentityProbationFailure ("pass mint: " + $_.Exception.Message)
+        return ("mint_failed:" + (Get-AadstsCode $_.Exception.Message))
+    }
+    $headers = @{ "X-Bay-Identity-Authorization" = ("Bearer " + [string]$j.access_token); Accept = "application/json"; "User-Agent" = "ABG-BayAgent/$AgentVersion" }
+    $body = (@{ bayId = (ConvertTo-AgentGuid $BayId) } | ConvertTo-Json -Compress)
+    $resp = $null
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri ($ep.site + $DisplayPassRoute) -Headers $headers -ContentType "application/json" -Body $body -TimeoutSec 20 -ErrorAction Stop
+    } catch {
+        $errRec = $_
+        $code = $null
+        try { $code = ([string]$errRec.ErrorDetails.Message | ConvertFrom-Json).error.code } catch { }
+        $status = $null
+        try { $status = [int]$errRec.Exception.Response.StatusCode } catch { }
+        $Global:DisplayPassLast.status = $status
+        return ("refused:" + $(if ($code) { $code } elseif ($status) { "http_$status" } else { "unreachable" }))
+    }
+    $record = Test-DisplayPassShape -Obj $resp -Now $Now
+    if ($null -eq $record) { return "bad_shape" }
+    Write-DisplayPassState $record
+    $back = Read-DisplayPassState -Now $Now
+    if ($null -eq $back -or $back.pass -ne $record.pass) { return "write_not_read_back" }
+    return "ok"
+}
+
+function Update-DisplayPassIfDue {
+    # Called every main-loop pass; does nothing until the pass is due or missing. Never throws.
+    param([DateTime]$Now = (Get-Date).ToUniversalTime())
+    try {
+        if ($DisplayPassReleaseMode -ne "on") { return }
+        if ($Now -lt $Global:DisplayPassNextAttemptUtc) { return }
+        $have = Read-DisplayPassState -Now $Now
+        if ($null -ne $have) {
+            $refresh = ConvertTo-DisplayPassUtc $have.refreshAfterUtc
+            if ($null -ne $refresh -and $Now -lt $refresh) { return }
+        }
+        $Global:DisplayPassLast.attemptUtc = $Now.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $result = Invoke-DisplayPassFetch -Now $Now
+        $Global:DisplayPassLast.result = $result
+        if ($result -eq "ok") {
+            $Global:DisplayPassBackoffSec = 60
+            $Global:DisplayPassNextAttemptUtc = $Now.AddSeconds(60)
+            Write-Log "[DISPLAY-PASS] fetched a new wall pass" "INFO"
+        } else {
+            $Global:DisplayPassNextAttemptUtc = $Now.AddSeconds($Global:DisplayPassBackoffSec)
+            $Global:DisplayPassBackoffSec = [Math]::Min(1800, [int]$Global:DisplayPassBackoffSec * 2)
+            Write-Log ("[DISPLAY-PASS] no new pass: {0}" -f $result) "WARN"
+        }
+    } catch {
+        $Global:DisplayPassLast.result = "error:" + $_.Exception.GetType().Name
+        Write-Log ("[DISPLAY-PASS] refresh failed: {0}" -f $_.Exception.Message) "WARN"
+    }
+}
+
+function Get-DisplayPassWallUrl {
+    # THE SEAM for whatever opens the wall (Start-SessionDisplay / the kiosk shell): the wall address for this bay's own
+    # pinned site with a valid pass, or $null (then the caller keeps its existing display). The pass must outlive the
+    # next two minutes.
+    param([DateTime]$Now = (Get-Date).ToUniversalTime())
+    if ($DisplayPassReleaseMode -ne "on") { return $null }
+    $ep = Get-DisplayPassEndpoint
+    if ($null -eq $ep) { return $null }
+    $p = Read-DisplayPassState -Now $Now.AddMinutes(2)
+    if ($null -eq $p) { return $null }
+    return ("{0}{1}?bay={2}&{3}={4}" -f $ep.site, $p.wallPath, [uri]::EscapeDataString($p.bayRef), $DisplayPassQueryName, [uri]::EscapeDataString($p.pass))
+}
+
+function Get-DisplayPassTelemetry {
+    # Never the pass.
+    $ep = Get-DisplayPassEndpoint
+    $p = Read-DisplayPassState
+    return [ordered]@{
+        mode            = $DisplayPassReleaseMode
+        sitePinned      = ($null -ne $ep)
+        site            = $(if ($ep) { $ep.site } else { $null })
+        ownIdentity     = (Test-OwnIdentityActive)
+        hasValidPass    = ($null -ne $p)
+        bayRef          = $(if ($p) { $p.bayRef } else { $null })
+        expiresUtc      = $(if ($p) { $p.expiresUtc } else { $null })
+        refreshAfterUtc = $(if ($p) { $p.refreshAfterUtc } else { $null })
+        lastAttemptUtc  = $Global:DisplayPassLast.attemptUtc
+        lastResult      = $Global:DisplayPassLast.result
+    }
 }
 
 
@@ -1733,6 +2133,8 @@ function Build-AgentCapabilitiesJson {
         install         = (Invoke-ReportPart { Get-AgentInstallFacts })
         localConfig     = (Invoke-ReportPart { Get-LocalConfigFacts })
         display         = (Invoke-ReportPart { Get-DisplayReport })
+        # A0.456: the wall pass's state (its expiry and the last fetch's result; never the pass itself).
+        displayPass     = (Invoke-ReportPart { Get-DisplayPassTelemetry })
     }
 
     # The column holds 30000 characters (measured in Dev, 2026-10-07). Drop the bulkiest optional parts first, and
@@ -3814,9 +4216,11 @@ function Invoke-CredentialTest($payloadObj) {
     $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
     $res = [ordered]@{ ok = $false; action = "test"; certificate = $null; secret = $null }
+    # A0.458: clientId tests the certificate against the bay's own app (a GUID, or nothing).
+    $testClient = ConvertTo-AgentGuid ([string](Get-PropValue $payloadObj "clientId" ""))
     if ($tp) {
         try {
-            $j = Acquire-TokenWithCertificate -Thumbprint $tp
+            $j = Acquire-TokenWithCertificate -Thumbprint $tp -ForClientId $(if ($testClient) { $testClient } else { "" })
             $res.certificate = [ordered]@{ ok = $true; thumbprint = $tp; expiresIn = $j.expires_in }
         } catch {
             $res.certificate = [ordered]@{ ok = $false; thumbprint = $tp; error = $_.Exception.Message }
@@ -3849,34 +4253,94 @@ function Invoke-CredentialActivate($payloadObj) {
     if (-not $tp) { $tp = Get-PendingCertThumbprint }
     if (-not $tp) { throw "activate: no thumbprint given and no pending certificate enrolled" }
 
+    # A0.458: clientId names the bay's OWN app the certificate signs in as. Absent = the app already in force.
+    $rawClient = [string](Get-PropValue $payloadObj "clientId" "")
+    $newClient = $null
+    if (-not [string]::IsNullOrWhiteSpace($rawClient)) {
+        $newClient = ConvertTo-AgentGuid $rawClient
+        if (-not $newClient) { throw "activate: clientId must be a GUID (got '$rawClient')" }
+    }
+    $prevClient = Get-ActiveClientId
+    $switching = ($null -ne $newClient) -and ($newClient -ne $prevClient)
+    $mintClient = $(if ($newClient) { $newClient } else { $prevClient })
+
     $cert = Find-ClientCertificate $tp
     if (-not $cert) { throw "activate: certificate $tp with a private key not found in $((Get-CertStoreSearchOrder) -join ', ')" }
 
     # PROVE before switching. A real token mint with the candidate; if this throws nothing below runs and the
     # active credential is untouched (Process-Command marks the command Failed with the AADSTS code).
-    $j = Acquire-TokenWithCertificate -Thumbprint $tp
+    # An identity SWITCH is proven further: Dataverse, this bay's row and the command guard must all accept it, or the bay
+    # would be left on an identity that cannot run its commands (Test-IdentityCandidate).
+    $proofDetail = $null
+    if ($switching) {
+        if ($Global:CredentialStateCorrupt) { throw "activate: credential.json is corrupt; an identity switch is never recorded over it" }
+        if ($null -ne (Get-IdentityProbation)) { throw "activate: an identity switch is already on probation; confirm or revert it first" }
+        $proofDetail = Test-IdentityCandidate -Thumbprint $tp -ForClientId $newClient
+        $j = [pscustomobject]@{ expires_in = $null }
+    } else {
+        $j = Acquire-TokenWithCertificate -Thumbprint $tp -ForClientId $mintClient
+    }
 
     $prevActive = Get-ActiveCertThumbprint
     $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $changes = @{ activeThumbprint = $tp; activatedUtc = $nowStr }
     if ((Get-PendingCertThumbprint) -eq $tp) { $changes.pendingThumbprint = $null }
     if ($prevActive -and $prevActive -ne $tp) { $changes.previousThumbprint = $prevActive }
+    if ($switching) {
+        $changes.activeClientId = $newClient
+        $changes.identityProbation = [ordered]@{
+            clientId           = $newClient
+            sinceUtc           = $nowStr
+            previousThumbprint = $prevActive
+            previousClientId   = $(if ($prevClient -ne (ConvertTo-AgentGuid $ClientId)) { $prevClient } else { $null })
+        }
+        $changes.identityReverted = $null
+    }
     Update-CredentialState $changes | Out-Null
+    $Global:IdentityProbationFailures = 0
 
     # Drop the cached token so the very next loop iteration mints with the new certificate.
     $Global:AccessToken = $null
     $Global:TokenExpiresUtc = [DateTime]::MinValue
 
-    Write-Log ("Credential activated: certificate {0} is now the active credential (previous: {1})" -f $tp, $(if ($prevActive) { $prevActive } else { "secret" })) "INFO"
+    Write-Log ("Credential activated: certificate {0} is now the active credential (previous: {1}){2}" -f $tp, $(if ($prevActive) { $prevActive } else { "secret" }), $(if ($switching) { " signing in as the bay's own app $newClient, ON PROBATION" } else { "" })) "INFO"
     return [ordered]@{
         ok                 = $true
         action             = "activate"
         activeThumbprint   = $tp
+        activeClientId     = (Get-ActiveClientId)
+        identitySwitched   = $switching
         previousThumbprint = $prevActive
         notAfterUtc        = $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        proof              = [ordered]@{ mintedWithCertificate = $true; expiresIn = $j.expires_in }
-        next               = "Wait for a heartbeat showing credential.lastMintMode = certificate, THEN delete the old secret/certificate on the Entra app, THEN send action=retire"
+        proof              = $(if ($switching) { $proofDetail } else { [ordered]@{ mintedWithCertificate = $true; expiresIn = $j.expires_in } })
+        next               = $(if ($switching) { "On probation: the agent goes back on its own if this identity is refused, or if nobody confirms within $IdentityProbationMaxHours h. After the next heartbeat run the operator ladder's activate; after a day of normal running send action=confirm." } else { "Wait for a heartbeat showing credential.lastMintMode = certificate, THEN delete the old secret/certificate on the Entra app, THEN send action=retire" })
     }
+}
+
+function Invoke-CredentialConfirm {
+    # A0.458: end the probation of an identity switch. Running at all proves the new identity can claim a command (the
+    # claim is the command guard's agent-only write); a live mint is proven again here.
+    $p = Get-IdentityProbation
+    if ($null -eq $p) { throw "confirm: no identity switch is on probation" }
+    if (-not (Test-OwnIdentityActive)) { throw "confirm: the active credential is not the bay's own identity" }
+    $tp = Get-ActiveCertThumbprint
+    $client = Get-ActiveClientId
+    $null = Acquire-TokenWithCertificate -Thumbprint $tp -ForClientId $client
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    Update-CredentialState @{ identityProbation = $null; identityConfirmedUtc = $nowStr; identityConfirmedClientId = $client } | Out-Null
+    $Global:IdentityProbationFailures = 0
+    Write-Log ("[IDENTITY] confirmed: app {0} with certificate {1}" -f $client, $tp) "INFO"
+    return [ordered]@{
+        ok = $true; action = "confirm"; activeClientId = $client; activeThumbprint = $tp
+        next = "The switch is final. Retire the shared secret on this bay (action=retire with the secret flag) once the operator is ready; revoking this bay is then complete without touching the shared app."
+    }
+}
+
+function Invoke-CredentialRevert {
+    # A0.458: undo an identity switch still on probation, on an operator's word.
+    if ($null -eq (Get-IdentityProbation)) { throw "revert: no identity switch is on probation (a confirmed identity changes only by a new activate)" }
+    if (-not (Invoke-IdentityRevert -Reason "operator: CredentialRotate action=revert")) { throw "revert: the switch could not be undone (see the agent log)" }
+    return [ordered]@{ ok = $true; action = "revert"; activeClientId = (Get-ActiveClientId); activeThumbprint = (Get-ActiveCertThumbprint) }
 }
 
 function Test-IsAgentOwnedCertificate {
@@ -4082,7 +4546,9 @@ function Invoke-CredentialRotate($payloadObj) {
         "test"     { return (Invoke-CredentialTest $payloadObj) }
         "activate" { return (Invoke-CredentialActivate $payloadObj) }
         "retire"   { return (Invoke-CredentialRetire $payloadObj) }
-        default    { throw "CredentialRotate: unknown action '$action' (status | enroll | test | activate | retire)" }
+        "confirm"  { return (Invoke-CredentialConfirm) }
+        "revert"   { return (Invoke-CredentialRevert) }
+        default    { throw "CredentialRotate: unknown action '$action' (status | enroll | test | activate | retire | confirm | revert)" }
     }
 }
 
@@ -4670,6 +5136,8 @@ function Process-Command {
     }
     catch {
         Write-Log "Failed to lock command $cmdId (likely already taken). Skipping." "WARN"
+        # A0.458: on probation, the command guard refusing the bay's own identity is a refusal, not a lost race.
+        Register-IdentityProbationFailure ("command lock: " + $_.Exception.Message)
         return
     }
 
@@ -4700,7 +5168,13 @@ if ($op.Blocked -and -not (Is-CommandAllowedInMode -CommandType $type -OpState $
 
         
 $bayLabelFromCmd = Get-BayLabelFromCommandRow $cmd
-$resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel $bayLabelFromCmd
+# A0.458: an identity switch probes the command guard on the command it runs on (Test-IdentityCandidate).
+$Global:CurrentCommandId = $cmdId
+try {
+    $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel $bayLabelFromCmd
+} finally {
+    $Global:CurrentCommandId = $null
+}
         # Dataverse text columns (e.g., build_resultjson) require a STRING.
         # The baseline Step 1 agent returned JSON strings; we preserve that behavior here.
         # Limit-ResultJson, not a bare ConvertTo-Json: build_resultjson is capped at 2000 chars and an
@@ -5842,6 +6316,10 @@ while ($true) {
         # Update heartbeat on a timer, even if there are no commands
         Send-HeartbeatIfDue $token
 
+        # A0.456: the bay's own wall pass, fetched and refreshed with its own identity. Off unless the release turns it on;
+        # never throws.
+        Update-DisplayPassIfDue -Now ((Get-Date).ToUniversalTime())
+
         # A0.327 Phase 2: deliver queued self-heal reports into the diagnostic pipe (no-op when self-heal is off)
         try { Send-SelfHealOutboxIfDue -token $token -Now ((Get-Date).ToUniversalTime()) }
         catch { Write-Log ("[SELFHEAL] report delivery failed: {0}" -f $_.Exception.Message) "WARN" }
@@ -5850,6 +6328,8 @@ while ($true) {
         # The poll succeeded (it throws otherwise): with an accepted heartbeat, that is this agent "back" for the
         # update rollback guard. Never throws.
         Update-AgentAliveRecord -Now ((Get-Date).ToUniversalTime())
+        # A0.458: the identity in force was accepted on this pass.
+        Clear-IdentityProbationFailures
         if ($cmd) {
             Process-Command $token $cmd
         } else {
@@ -5858,7 +6338,12 @@ while ($true) {
     }
     catch {
         Write-Log "Top-level exception: $($_.Exception.Message)" "ERROR"
+        # A0.458: on probation, a refusal of the bay's own identity counts toward going back (an outage does not).
+        Register-IdentityProbationFailure ("poll: " + $_.Exception.Message)
     }
+
+    # A0.458: an identity switch nobody confirmed within the window is undone. Never throws.
+    Test-IdentityProbationExpiry -Now ((Get-Date).ToUniversalTime())
 
     if ($Once) { break }
 

@@ -35,7 +35,11 @@ $wanted = @(
     "Write-CredentialStartupSummary","Get-AccessToken","New-BayClientCertificate","Export-PublicCertificate",
     "Build-CredentialEnrollResult","Invoke-CredentialEnroll","Invoke-CredentialTest","Invoke-CredentialActivate",
     "Invoke-CredentialRetire","Invoke-CredentialStatus","Invoke-CredentialRotate","Limit-ResultJson",
-    "Test-IsAgentOwnedCertificate","Sync-FallbackTelemetry","Test-HasUsableSecret","Read-LastUpdateResult"
+    "Test-IsAgentOwnedCertificate","Sync-FallbackTelemetry","Test-HasUsableSecret","Read-LastUpdateResult",
+    # A0.458: the identity helpers the token path and activate now reach.
+    "ConvertTo-AgentGuid","Get-ActiveClientId","Test-OwnIdentityActive","Get-IdentityProbation","Test-IdentityRefusal",
+    "Register-IdentityProbationFailure","Clear-IdentityProbationFailures","Invoke-IdentityRevert","Test-IdentityCandidate",
+    "Invoke-CredentialConfirm","Invoke-CredentialRevert"
 )
 $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in $wanted) {
@@ -68,6 +72,9 @@ $Secret = $null; $SecretPath = $null; $SecretPathCfg = $null; $HasSecretCredenti
 $Global:AccessToken = $null; $Global:TokenExpiresUtc = [DateTime]::MinValue
 $Global:CredentialTelemetry = @{ lastMintMode=$null; lastMintUtc=$null; lastCertMintUtc=$null; lastSecretMintUtc=$null
     lastCertError=$null; lastSecretError=$null; fallbackCount=0; fallbackFlushed=0; lastFallbackUtc=$null; lastTest=$null }
+# A0.458 script state the identity helpers read (mirrors BayAgent.ps1).
+$IdentityProbationMaxFailures = 5; $IdentityProbationMaxHours = 72
+$Global:IdentityProbationFailures = 0; $Global:CurrentCommandId = $null; $Global:LastDvErrorBody = $null
 $script:MadeCerts = New-Object System.Collections.ArrayList
 
 # ---------------------------------------------------------------- mock token endpoint
