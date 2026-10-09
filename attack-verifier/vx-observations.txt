@@ -1,0 +1,53 @@
+X0 | control: s-x0 ACTIVE, cancel Reset: reset=False skipped=True why=[session 's-x0' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone] display calls=0 facility=[] wall now ACTIVE/s-x0
+X1 | Start -> ACTIVE/s-x1; e-stop engage -> STOP/s-x1; clear -> STOP/s-x1 (engaged=False); cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; intent wanted=False closed=False sid=s-x1
+X1b | Q playing, intent file wanted=False closed=True sid=s-P; after Q Start: wall ACTIVE/s-Q shell=held; after e-stop engage+clear: wall STOP/s-Q shell=held; cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; shell verdict on Q's running launcher=close
+X2 | A2 playing, B2 Prep -> wall PREP/s-B2; B2's cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; intent wanted=True closed=False sid=s-A2
+X2b | A2b playing (intent write pending), before Prep shell=held; after B2b's Prep: wall PREP/s-B2b shell=close (no Reset involved)
+X3 | B3 playing, A3's End after B3's Start -> wall ENDED/s-A3 (launcher: late_old_session_skip); a cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; intent wanted=True closed=False sid=s-B3
+X4-16 | ACTIVE, session.json end 16 min ago: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>
+X4-14 | ACTIVE, session.json end 14 min ago: reset=False skipped=True why=[session 's-x4' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone] display calls=0 facility=[] wall now ACTIVE/s-x4
+X5 | session.json = valid ACTIVE: gate Proceed=False why=[session 's-x5' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X5 | session.json = BOM + valid ACTIVE: gate Proceed=False why=[session 's-x5' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X5 | session.json = 0 bytes: gate Proceed=True why=[no session.json]
+X5 | session.json = whitespace: gate Proceed=True why=[no session.json]
+X5 | session.json = NUL x 64 (power loss): gate Proceed=True why=[no session.json]
+X5 | session.json = BOM only: gate Proceed=True why=[no session.json]
+X5 | session.json = null: gate Proceed=True why=[no session.json]
+X5 | session.json = {}: gate Proceed=True why=[no session running (status )]
+X5 | session.json = []: gate Proceed=True why=[no session.json]
+X5 | session.json = truncated mid-write: gate Proceed=True why=[no session.json]
+X5 | session.json = status lowercase: gate Proceed=True why=[no session running (status active)]
+X5 | session.json = status trailing space: gate Proceed=True why=[no session running (status ACTIVE )]
+X5 | session.json = status array: gate Proceed=False why=[session 's-x5' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X5 | session.json = duplicate status key: gate Proceed=True why=[no session running (status READY)]
+X5 | session.json = UTF-16LE ACTIVE: gate Proceed=True why=[no session.json]
+X5 | session.json = STOP (e-stop wrote it): gate Proceed=True why=[no session running (status STOP)]
+X6 | payload {"force":"false"}: Proceed=True why=[force]
+X6 | payload {"force":"0"}: Proceed=True why=[force]
+X6 | payload {"force":"no"}: Proceed=True why=[force]
+X6 | payload {"force":0}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X6 | payload {"force":false}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X6 | payload {"Force":true}: Proceed=True why=[force]
+X6 | payload {"FORCE":"x"}: Proceed=True why=[force]
+X6 | payload {"force":null}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X6 | payload {"force":[]}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X6 | payload {"force":[false]}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+X6 | payload {"force":{}}: Proceed=True why=[force]
+X6 | payload {"force":true}: Proceed=True why=[force]
+X7 | payload id [8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b]: Proceed=True
+X7 | payload id [8A4F2C10-1D2E-4F50-9A6B-7C8D9E0F1A2B]: Proceed=False
+X7 | payload id [{8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b}]: Proceed=False
+X7 | payload id [ 8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b]: Proceed=False
+X7 | payload id [8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b ]: Proceed=False
+X7 | payload id [8a4f2c101d2e4f509a6b7c8d9e0f1a2b]: Proceed=False
+X7 | payload id []: Proceed=False
+X7 | payload id [ ]: Proceed=False
+X7 | key BAYSESSIONID (other case): Proceed=True
+X7 | running session with NO id, Reset with empty id: Proceed=False
+X8 | bay clock +10 min, 4 real min left: Proceed=False
+X8 | bay clock +16 min, 4 real min left: Proceed=False
+X8 | bay clock +20 min, 4 real min left: Proceed=True
+X8 | bay clock +80 min, 4 real min left: Proceed=True
+X8 | bay clock +76 min at the START of a 60-min session: Proceed=True
+X9 | Reset before End: first Reset reset=False skipped=True; after the End the wall is ENDED/s-x9 (no retry of the skipped Reset)
+X10 | running booking canceled mid-play (its End canceled by the platform): reset=False skipped=True why=[session 's-x10' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone] display calls=0 facility=[] wall now ACTIVE/s-x10; intent wanted=True closed=False sid=s-x10 (nothing else is queued to end it)

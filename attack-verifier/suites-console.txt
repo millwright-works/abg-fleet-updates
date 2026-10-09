@@ -1,0 +1,15 @@
+BayAgent.Credential.Tests.ps1 | exit 0 | 16s | RESULT: 227 passed, 0 failed
+BayAgent.EStopPersist.Tests.ps1 | exit 0 | 34s | RESULT: 131 passed, 0 failed
+BayAgent.EStopRouting.Tests.ps1 | exit 0 | 18s | RESULT: 72 passed, 0 failed
+BayAgent.Kiosk.Tests.ps1 | exit 0 | 13s | RESULT: 365 passed, 0 failed
+BayAgent.KioskPackage.Tests.ps1 | exit 0 | 35s | RESULT: 27 passed, 0 failed
+BayAgent.KioskShell.Live.Tests.ps1 | exit 0 | 283s | RESULT: 63 passed, 0 failed
+BayAgent.Launch.Tests.ps1 | exit 0 | 23s | RESULT: 71 passed, 0 failed
+BayAgent.PidParam.Tests.ps1 | exit 0 | 7s | RESULT: 34 passed, 0 failed
+BayAgent.RemoteReport.Tests.ps1 | exit 0 | 15s | RESULT: 55 passed, 0 failed
+BayAgent.SelfHeal.Live.Tests.ps1 | exit 0 | 101s | RESULT: 13 passed, 0 failed
+BayAgent.SelfHeal.Tests.ps1 | exit 0 | 25s | RESULT: 201 passed, 0 failed
+BayAgent.SetupShell.Tests.ps1 | exit 0 | 1s | RESULT: 21 passed, 0 failed
+BayAgent.StartupOrder.Tests.ps1 | exit 0 | 12s | RESULT: 28 passed, 0 failed
+BayAgent.UpdateGuard.Tests.ps1 | exit 0 | 293s | RESULT: 70 passed, 0 failed
+suites exit 0

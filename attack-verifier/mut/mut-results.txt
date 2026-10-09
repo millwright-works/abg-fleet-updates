@@ -1,0 +1,12 @@
+M00 baseline (no change): RESULT: 365 passed, 0 failed :: 
+G10 handler passes no model: RESULT: 359 passed, 6 failed ::   FAIL  R7 Reset (BookingCanceled, no session id) while s-r7 plays: skipped, and the result says who is running |   FAIL  R7 the wall's session.json is byte for byte unchanged (still ACTIVE s-r7, not READY)
+G1 running always proceeds: RESULT: 354 passed, 11 failed ::   FAIL  R7 Reset (BookingCanceled, no session id) while s-r7 plays: skipped, and the result says who is running |   FAIL  R7 the wall's session.json is byte for byte unchanged (still ACTIVE s-r7, not READY)
+G2 ENDING not running: RESULT: 364 passed, 1 failed ::   FAIL  gate: ENDING, no id: hold
+G3 name-the-session proceed removed: RESULT: 364 passed, 1 failed ::   FAIL  R7 a Reset naming the running session itself proceeds (the wall goes READY)
+G4 id compare case-insensitive: RESULT: 364 passed, 1 failed ::   FAIL  gate: id compared case-sensitively: hold
+G5 stale proceed removed: RESULT: 364 passed, 1 failed ::   FAIL  gate: ACTIVE 20 minutes past its end and no End ever: proceed (the bay is recoverable)
+G6 stale threshold zero: RESULT: 355 passed, 10 failed ::   FAIL  R7 Reset (BookingCanceled, no session id) while s-r7 plays: skipped, and the result says who is running |   FAIL  R7 the wall's session.json is byte for byte unchanged (still ACTIVE s-r7, not READY)
+G7 force removed: RESULT: 364 passed, 1 failed ::   FAIL  R7 an operator's force=true Reset proceeds
+G8 handler ignores gate: RESULT: 359 passed, 6 failed ::   FAIL  R7 Reset (BookingCanceled, no session id) while s-r7 plays: skipped, and the result says who is running |   FAIL  R7 the wall's session.json is byte for byte unchanged (still ACTIVE s-r7, not READY)
+G9 missing session.json holds: RESULT: 364 passed, 1 failed ::   FAIL  gate: no session.json: proceed
+runner exit 0

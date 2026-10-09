@@ -1,0 +1,468 @@
+
+== K-PARITY the agent and the shell decide the same way (shared functions byte-identical)
+  PASS  Get-KioskProp is identical in BayAgent.ps1 and ABG.KioskShell.ps1
+  PASS  Read-KioskJsonFile is identical in BayAgent.ps1 and ABG.KioskShell.ps1
+  PASS  ConvertTo-KioskUtc is identical in BayAgent.ps1 and ABG.KioskShell.ps1
+  PASS  Get-KioskPolicyDecision is identical in BayAgent.ps1 and ABG.KioskShell.ps1
+  PASS  Get-KioskLauncherWanted is identical in BayAgent.ps1 and ABG.KioskShell.ps1
+
+== K1 policy: everything but an exact, implemented policy is explorer
+  PASS  absent: explorer (reason: policy unreadable (empty))
+  PASS  empty file: explorer (reason: policy unreadable (empty))
+  PASS  whitespace: explorer (reason: policy unreadable (empty))
+  PASS  null: explorer (reason: policy unreadable (not a JSON object))
+  PASS  an array: explorer (reason: policy unreadable (not a JSON object))
+  PASS  a policy wrapped in an array: explorer (reason: policy unreadable (not a JSON object))
+  PASS  an empty object: explorer (reason: policy schema missing or not a positive integer)
+  PASS  a number: explorer (reason: policy unreadable (not a JSON object))
+  PASS  a bare string: explorer (reason: policy unreadable (not a JSON object))
+  PASS  no schema: explorer (reason: policy schema missing or not a positive integer)
+  PASS  schema as text: explorer (reason: policy schema missing or not a positive integer)
+  PASS  schema 0: explorer (reason: policy schema missing or not a positive integer)
+  PASS  schema not an integer: explorer (reason: policy schema missing or not a positive integer)
+  PASS  schema true: explorer (reason: policy schema missing or not a positive integer)
+  PASS  no mode: explorer (reason: policy mode missing or not text)
+  PASS  mode null: explorer (reason: policy mode missing or not text)
+  PASS  mode in another case: explorer (reason: policy mode 'Companion' is unknown)
+  PASS  mode with a space: explorer (reason: policy mode ' companion' is unknown)
+  PASS  mode as an array: explorer (reason: policy mode missing or not text)
+  PASS  an unknown mode: explorer (reason: policy mode 'kiosk' is unknown)
+  PASS  shell mode (designed, not implemented): explorer (reason: policy mode 'shell' is not implemented by this release)
+  PASS  minShellBytes omitted takes the 4096 default: companion (reason: policy)
+  PASS  minShellBytes under 1024: explorer (reason: policy minShellBytes missing or outside 1024..1048576)
+  PASS  minShellBytes over 1 MB: explorer (reason: policy minShellBytes missing or outside 1024..1048576)
+  PASS  minShellBytes as text: explorer (reason: policy minShellBytes missing or outside 1024..1048576)
+  PASS  truncated JSON: explorer (reason: policy unreadable (not valid JSON))
+  PASS  explorer (the dormant release): explorer (reason: policy)
+  PASS  companion: companion (reason: policy)
+  PASS  a newer schema with the same fields (forward compatible): companion (reason: policy)
+  PASS  BOM only: explorer
+  PASS  NUL bytes: explorer
+  PASS  a BOM before a valid policy is read (Notepad saves one)
+  PASS  a policy larger than 4096 bytes: explorer
+  PASS  kill switch beats a valid companion policy
+  PASS  the mode list is the gate: a release that implements shell can name it (proves the refusal above is the list, not the parser)
+  PASS  minShellBytes is carried to the verifier
+
+== K2 intent: only an exact, zoned, future 'wanted' is wanted
+  PASS  empty object: wanted=False (intent schema missing or not a positive integer)
+  PASS  null: wanted=False (intent unreadable (not a JSON object))
+  PASS  array: wanted=False (intent unreadable (not a JSON object))
+  PASS  no schema: wanted=False (intent schema missing or not a positive integer)
+  PASS  Wanted in another case: wanted=False (intent says not wanted)
+  PASS  launcher true (a boolean): wanted=False (intent says not wanted)
+  PASS  no untilUtc: wanted=False (intent untilUtc missing or without a zone)
+  PASS  untilUtc null: wanted=False (intent untilUtc missing or without a zone)
+  PASS  untilUtc without a zone: wanted=False (intent untilUtc missing or without a zone)
+  PASS  untilUtc garbage: wanted=False (intent untilUtc missing or without a zone)
+  PASS  untilUtc a number: wanted=False (intent untilUtc missing or without a zone)
+  PASS  expired a second ago: wanted=False (intent expired)
+  PASS  expires exactly now: wanted=False (intent expired)
+  PASS  not_wanted with a future time: wanted=False (intent says not wanted)
+  PASS  wanted, one second left: wanted=True (intent wanted)
+  PASS  wanted with an offset (13:00:30Z): wanted=True (intent wanted)
+  PASS  a newer schema with the same fields: wanted=True (intent wanted)
+  PASS  absent intent: not wanted
+  PASS  a DateTime value (what PowerShell 7's ConvertFrom-Json produces) is read
+  PASS  closed with a writtenUtc: closed=True (intent closed (no session))
+  PASS  closed without a writtenUtc: hands off: closed=False (intent closed without a readable writtenUtc (left alone))
+  PASS  closed whose writtenUtc has no zone: hands off: closed=False (intent closed without a readable writtenUtc (left alone))
+  PASS  Closed in another case: hands off: closed=False (intent says not wanted)
+  PASS  closed without a schema: hands off: closed=False (intent schema missing or not a positive integer)
+  PASS  unmanaged: closed=False (intent says not wanted)
+  PASS  not_wanted (an older value): hands off: closed=False (intent says not wanted)
+  PASS  closed inside an array: hands off: closed=False (intent says not wanted)
+  PASS  closed carries when it was written (the shell's grace runs from it)
+
+== K3 ConvertTo-KioskUtc
+  PASS  Z text
+  PASS  offset text converts to UTC
+  PASS  text without a zone is refused
+  PASS  a culture-shaped date is refused
+  PASS  a number is refused
+  PASS  a Local DateTime is converted, not relabeled
+  PASS  an Unspecified DateTime (PowerShell 7's reading of zone-less text) is refused
+
+== K4 what each command does to the intent
+  PASS  Start: wanted until playEndUtc + 2 min (got wanted until 2026-10-08T12:57:00.0000000Z)
+  PASS  Start without playEndUtc falls back to endUtc
+  PASS  Start without a readable end: unmanaged (the agent starts the launcher itself; the shell neither restarts nor closes it)
+  PASS  Start whose end has no zone: unmanaged
+  PASS  Start with the emergency stop engaged: unmanaged
+  PASS  Prep of the NEXT booking while this one plays: no change (it must not close or stop restarting the current game)
+  PASS  Prep after an End: no change (stays closed)
+  PASS  Start with launcher.startOnStart=false: unmanaged
+  PASS  EndSession of the current session: closed (no free play after the end)
+  PASS  a late EndSession for an older session leaves the intent alone
+  PASS  Reset over nothing on disk: no change, never closed (RF1)
+  PASS  Reset over a wanted session: no change, never closed (RF1)
+  PASS  Reset over a paid session left unmanaged by an emergency stop or Maintenance: no change, never closed (RF1)
+  PASS  Reset over a paid extension whose display command was lost (intent expired): no change, never closed (RF1)
+  PASS  Reset over closed: no change, never closed (RF1)
+  PASS  an EndSession that names no session: no closed (it cannot prove it ends the running one)
+  PASS  ...also when no intent names a session at all (attack E6)
+  PASS  an EndSession of s-1 while the intent names s-B: no closed
+  PASS  the EndSession of s-1 after an emergency stop (intent unmanaged, s-1): closed
+  PASS  emergency stop during a session: unmanaged (no restarts; closes nothing)
+  PASS  emergency stop with no session: no change (stays closed)
+  PASS  emergency stop clear: no change (clearing never makes the launcher wanted)
+  PASS  HealthCheck: no change
+  PASS  UpdateSessionDisplay with a later end for the SAME session extends the intent
+  PASS  ...not for another session
+  PASS  ...not to an earlier end
+  PASS  ...and never creates a wanted intent
+
+== K5 the intent writer reads back through the shell's own reader
+  PASS  Write-KioskIntent returned true
+  PASS  the shell's reader sees wanted until 12:57:00Z for s-1
+  PASS  no temporary file left behind
+  PASS  untilUtc is stored as zoned text
+  PASS  unmanaged round-trips (neither wanted nor closed)
+  PASS  closed round-trips with its writtenUtc
+
+== K6 the intent at agent start: a readable one is kept; an absent one is derived, never as closed
+  PASS  no intent, ACTIVE with a future end: wanted (an agent restart mid-session keeps the member playing)
+  PASS  no intent, ENDED: unmanaged, never closed (session.json can be rewritten by a late EndSession of an older session)
+  PASS  no intent, ENDED with an end still ahead: not wanted (only ACTIVE or ENDING is a running session)
+  PASS  no intent, ACTIVE whose end passed more than the grace ago: not wanted
+  PASS  no intent and no session.json: unmanaged, written
+  PASS  a wanted intent backed by session.json (same session, until within its end + grace) is kept
+  PASS  a 'wanted until 2099' found at start (written while the agent was down): unmanaged (R1)
+  PASS  a wanted intent session.json does not show running: unmanaged, never closed
+  PASS  a readable closed intent is kept
+  PASS  an unreadable intent is derived again (ACTIVE: wanted)
+  PASS  an engaged emergency stop at start turns wanted into unmanaged
+  PASS  ...and leaves closed closed
+
+== K7 the activation verifier refuses every shape but a verified file, in order
+  PASS  a parsed, big enough, Valid, timestamped file signed by the agent's certificate: verified
+  PASS  ...and its sha256 is reported
+  PASS  missing file: refused
+  PASS  a good file OUTSIDE this version's release folder (current\kiosk): refused (version-pinned path)
+  PASS  a path with .. that resolves inside the folder is judged on its full path
+  PASS  a path with .. that resolves outside the folder: refused
+  PASS  a tiny file (a truncated download): refused by size
+  PASS  0 bytes: refused
+  PASS  a big file that does not parse: refused
+  PASS  order: the size check runs before the parse check
+  PASS  signature NotSigned: refused
+  PASS  signature HashMismatch: refused
+  PASS  signature UnknownError: refused
+  PASS  signature NotTrusted: refused
+  PASS  Valid but untimestamped: refused
+  PASS  Valid, timestamped, signed by ANOTHER certificate: refused
+  PASS  no known agent signer (an unsigned agent) and an unsigned-thumbprint file: refused, never matched on empty
+  PASS  thumbprints compare without case
+
+== K8 shell liveness and the command-line match
+  PASS  the command line the agent builds is recognized
+  PASS  an older version's shell of this install is recognized (it keeps running after an update)
+  PASS  a shell file under another root is not this install's
+  PASS  the current\ copy is not a release-folder shell
+  PASS  an unrelated program is not
+  PASS  an unreadable command line is not
+  PASS  no heartbeat: absent
+  PASS  fresh heartbeat of a shell process: alive
+  PASS  fresh heartbeat but the process is gone: absent
+  PASS  the pid now belongs to another program: foreign (never stopped)
+  PASS  90 s old: stale (wait)
+  PASS  200 s old with the shell process still there: hung
+  PASS  200 s old but the pid is another program: foreign, not hung
+  PASS  an unreadable lastLoopUtc on a live shell process: hung
+  PASS  a pid as text: absent
+  PASS  degraded is read
+
+== K9 the reconciler (injected start and stop)
+  PASS  precondition: Explorer runs in this test's session (the companion needs the desktop)
+
+== K15 authority: a companion policy file in a release built dormant grants nothing, and is reported
+  PASS  precondition: the shipped BayAgent.ps1 is built dormant ($KioskReleaseMode = explorer)
+  PASS  an edited policy file saying companion: explorer, and the disagreement is named (the policy file says 'companion' but this release was built 'explorer' (changed outside a release?): policy mode 'companion' is not implemented by this release)
+  PASS  ...the reconciler starts no shell and reports policyMatchesRelease=false
+  PASS  ...and the agent hands neither the launcher nor the wall to a shell
+  PASS  a release built companion with a companion policy: companion
+  PASS  a release built companion whose policy file says explorer: explorer (the file may only turn it off), reported
+  PASS  a release constant naming a mode this code does not implement: explorer
+
+== K9 (continued) the reconciler under a companion release
+  PASS  explorer policy (the dormant release): nothing started, nothing stopped
+  PASS  ...and the report still says the shell file arrived verified (remote proof of the package)
+  PASS  ...and carries the Winlogon Shell values, read only
+  PASS  companion, verified file, no live shell: one start
+  PASS  ...with System32 Windows PowerShell
+  PASS  ...and exactly the argument list Get-KioskShellArgumentList builds for the version-pinned path
+  PASS  ...which carries no execution-policy override and no inline command
+  PASS  the start time is persisted in state\kiosk-reconcile.json
+  PASS  a live shell: nothing started, nothing stopped
+  PASS  a stale (90 s) shell: wait, no second copy
+  PASS  a hung shell is stopped by the pid in its heartbeat
+  PASS  ...and a fresh one started
+  PASS  an old heartbeat whose pid is now ANOTHER program: nothing is stopped
+  PASS  ...and a shell is started
+  PASS  explorer policy with a hung shell left over: it is stopped, none is started
+  PASS  kill switch present: nothing started, the report says why
+  PASS  companion with an unsigned shell file: not started, and the action says the signature
+  PASS  companion with no Explorer in the session: not started (a companion needs the Windows desktop)
+  PASS  companion while the agent's own signer is unknown: not started
+  PASS  a shell that keeps dying is started at most 6 times an hour (got 6 of 8 ticks)
+  PASS  the 6 starts survive an agent restart (read back from the reconcile file)
+  PASS  ...so the restarted agent still holds
+  PASS  an hour after the first start, one more is allowed
+  PASS  an unreadable reconcile file reads as the cap spent (fail toward not starting)
+  PASS  an absent reconcile file reads as no starts
+  PASS  Maintenance mode turns a wanted intent into unmanaged (no restarts; never closed)
+  PASS  Maintenance mode lifts closed too (staff on the bay can run the launcher)
+  PASS  ...and only in Maintenance/Offline (Online leaves closed as it is)
+  PASS  the kiosk capability block is small (1138 chars)
+  PASS  ...and carries the shell file, the intent and the Winlogon reads
+
+== K10 the launcher deferral at StartSession Start
+  PASS  explorer policy: the agent starts the launcher itself
+  PASS  companion + wanted + a live supervising shell: the shell starts it
+  PASS  ...not when the shell process is gone
+  PASS  ...not to a shell whose heartbeat is 90 s old, even though it says supervising
+  PASS  wall: not to a shell whose heartbeat is 90 s old, even though it says supervising
+  PASS  ...not when the shell says it is not supervising
+  PASS  ...not when the shell is degraded
+  PASS  ...not when the intent is unmanaged (a Start with no end time)
+  PASS  ...not with the kill switch present
+  PASS  wall: not with the kill switch present
+  PASS  wall: a live supervising companion shell owns the wall whatever the intent
+  PASS  wall: not when the shell process is gone
+  PASS  wall: not when the shell is degraded
+  PASS  wall: not when the shell is not supervising
+  PASS  wall: not under an explorer policy
+
+== K11 the shell's own decisions
+  PASS  over all 384 combinations: start needs wanted+absent 2 ticks+allowed+path; close needs closed+running+15 s; nothing else acts
+  PASS  closed for 15 s and a launcher running (a member relaunched it after End): close
+  PASS  closed for 14 s: not yet (EndSession closes it first)
+  PASS  unmanaged with a launcher running: hands off
+  PASS  not wanted, absent: nothing (no free play after End)
+  PASS  wanted, absent one tick: wait
+  PASS  wanted, absent two ticks: start
+  PASS  wanted but the start cap is spent: held
+  PASS  wanted and running: nothing
+  PASS  two screens: the wall shows
+  PASS  one screen and the member needs the launcher: the wall stands aside
+  PASS  one screen, no session: the wall shows on it
+  PASS  no screen at all (TV off and touchscreen gone): start nothing
+  PASS  wall switched off locally: nothing
+  PASS  floor: supervising companion supervises
+  PASS  floor: a companion the policy no longer wants exits (Explorer is the desktop)
+  PASS  floor: never exit with no Explorer; start one
+  PASS  floor: a degraded companion the policy still wants idles (not restarted by the agent)
+  PASS  floor: not started as the companion: never exits
+  PASS  floor: not the companion and no Explorer: start Explorer
+  PASS  supervision: companion + companion policy
+  PASS  supervision: never without the companion role (this release has no shell mode)
+  PASS  supervision: never once degraded
+  PASS  supervision: never under an explorer policy
+  PASS  supervision: never without a policy decision
+  PASS  Bay 1 shape, no selectors: control = the primary touchscreen, session = the TV
+  PASS  the template's DISPLAY3 (absent on Bay 1): session falls to the other screen
+  PASS  renumbered DISPLAYn (two GPUs): roles follow the primary flag, not the number
+  PASS  monitor-name selectors match without case
+  PASS  a session selector naming the control screen is not used: the wall never covers the launcher
+  PASS  touchscreen unplugged (only the TV): both roles are the TV, and the wall plan decides who uses it
+  PASS  no screen: no roles, nothing to place
+  PASS  three screens: session is the last non-control
+  PASS  numeric selectors are indexes
+  PASS  no primary flag anywhere: control is the first
+  PASS  the topology signature does not depend on enumeration order
+  PASS  ...and changes when a screen goes
+  PASS  4 launcher starts in 2 minutes: the 5th is held
+  PASS  ...and allowed once the oldest leaves the window
+  PASS  5 failures in 10 minutes: degraded
+  PASS  4 failures: not degraded
+  PASS  a failure older than the window does not count
+  PASS  no agent-config.json: defaults, and it says so
+  PASS  the local config is read field by field (name without .exe, selectors, wall switch)
+  PASS  a wrong-typed path keeps the default; routing disabled drops the selectors
+
+== K12 censuses
+  PASS  the shell calls no registry-writing command
+  PASS  BayAgent calls no registry-writing command anywhere
+  PASS  no .NET registry write (SetValue, CreateSubKey, DeleteValue, OpenSubKey for write) in either file
+  PASS  BayAgent's code names a registry hive in exactly two strings, both inside Get-KioskWinlogonFacts (found 2, 2 there)
+  PASS  ...and both are arguments of Get-ItemProperty (a read)
+  PASS  the shell's code names no registry hive at all
+  PASS  the shell stops no process (and never signs out or restarts)
+  PASS  the shell ends a process in exactly one place: one CloseMainWindow and one Kill, both inside Close-KioskLauncher
+  PASS  ...reached only from the launcher action switch, and only when the session.json guard allows it
+  PASS  ...and it re-checks name, path, session and start time before asking and before ending
+  PASS  the shell's only Remove-Item is the 14-day log retention
+  PASS  the shell reads nothing from the platform (I6)
+  PASS  the shell has exactly one install-path literal (the launch test repoints only it)
+  PASS  no call wraps Get-KioskProp in @() (it returns an array as one object; @() would nest it)
+  PASS  the agent's kiosk code stops a process in exactly one place, by id, in the reconciler
+  PASS  ...and only on the hung branch
+  PASS  the shell's command line carries no execution-policy override (AllSigned applies)
+  PASS  ...and is exactly the documented one
+  PASS  StartSession writes the intent BEFORE anything starts the launcher
+  PASS  EndSession writes 'not wanted' BEFORE it closes the launcher
+  PASS  Reset, emergency stop and UpdateSessionDisplay each reach the intent
+  PASS  the deferral is decided before the agent's own launcher start
+
+== K13 the command handlers reach the intent and the deferral (Execute-Command run with stubs)
+  PASS  explorer policy, Start: intent wanted, and the agent started the launcher itself (as before)
+  PASS  ...and the command result says the intent was written
+  PASS  companion with a live supervising shell, Start: the agent does NOT start the launcher; the shell does
+  PASS  ...and the result reports the shell's launcher running
+  PASS  Start-SessionDisplay leaves the wall to the live supervising shell (got: kiosk_shell_owns_wall)
+  PASS  Start with launcher.startOnStart=false: unmanaged, so the shell neither starts nor closes what the agent left alone
+  PASS  Prep: the intent is not touched
+  PASS  Start again: wanted
+  PASS  a late EndSession for an OLDER session leaves the current session wanted
+  PASS  EndSession of the current session: closed
+  PASS  Reset while s-2 plays (a canceled other booking): s-2 stays wanted
+  PASS  EndSession s-2: closed
+  PASS  Reset after an End: no change (stays closed)
+
+== K18 attack RF1/RF2: no Reset and no failed write ever turns a paying session into a close
+  PASS  E2 e-stop engage, clear, then a canceled booking's Reset: not closed (shell: none)
+  PASS  E3 Maintenance on and off mid-session, then a Reset: not closed
+  PASS  E4 extension with a lost display command, then a Reset: not closed
+  PASS  E5 precondition: A's End wrote closed
+  PASS  E5 B's Start: the intent write failed (file held open), and the result says so
+  PASS  E5 precondition: A's closed is still on disk
+  PASS  E5 the shell holds: session.json shows B running, so A's closed is not acted on
+  PASS  E5 the report says an intent is pending
+  PASS  E5 a later command decides from B's pending wanted, not A's closed left on disk (an extension of B is still applied)
+  PASS  E5 while still held, the retry cannot land (and nothing worse happens)
+  PASS  E5 once released, the next main-loop pass lands B's wanted, and pending clears
+  PASS  E5 a landed pending write is not counted as tampering
+  PASS  B's own End: closed
+
+== K18b R7/RR1: a Reset for another booking leaves a running session's wall, display and facility alone
+  PASS  R7 Reset (BookingCanceled, no session id) while s-r7 plays: skipped, and the result says who is running
+  PASS  R7 the wall's session.json is byte for byte unchanged (still ACTIVE s-r7, not READY)
+  PASS  R7 no display stop/start and no facility change
+  PASS  R7 the launcher signal (intent) still wanted for s-r7
+  PASS  R7 a Reset naming a DIFFERENT session: skipped
+  PASS  R7 a Reset naming the running session itself proceeds (the wall goes READY)
+  PASS  R7 an operator's force=true Reset proceeds
+  PASS  R7 a canceled booking's Reset when nobody plays (after an End): still resets the wall to READY
+  PASS  RR1 L3 the Reset during a failing intent write leaves session.json ACTIVE s-LB (not READY)
+  PASS  RR1 L3 the shell holds A's stale closed (B plays): B's game is not ended
+  PASS  gate: no session.json: proceed
+  PASS  gate: ENDING, no id: hold
+  PASS  gate: ACTIVE 5 minutes past its end (End late): hold
+  PASS  gate: ACTIVE 20 minutes past its end and no End ever: proceed (the bay is recoverable)
+  PASS  gate: ACTIVE with no readable end: hold
+  PASS  gate: PREP: proceed
+  PASS  gate: another session named: hold
+  PASS  gate: id compared case-sensitively: hold
+
+== VX verifier attack on the Reset gate (observations)
+  VX X0 | control: s-x0 ACTIVE, cancel Reset: reset=False skipped=True why=[session 's-x0' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone] display calls=0 facility=[] wall now ACTIVE/s-x0
+  VX X1 | Start -> ACTIVE/s-x1; e-stop engage -> STOP/s-x1; clear -> STOP/s-x1 (engaged=False); cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; intent wanted=False closed=False sid=s-x1
+  VX X1b | Q playing, intent file wanted=False closed=True sid=s-P; after Q Start: wall ACTIVE/s-Q shell=held; after e-stop engage+clear: wall STOP/s-Q shell=held; cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; shell verdict on Q's running launcher=close
+  VX X2 | A2 playing, B2 Prep -> wall PREP/s-B2; B2's cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; intent wanted=True closed=False sid=s-A2
+  VX X2b | A2b playing (intent write pending), before Prep shell=held; after B2b's Prep: wall PREP/s-B2b shell=close (no Reset involved)
+  VX X3 | B3 playing, A3's End after B3's Start -> wall ENDED/s-A3 (launcher: late_old_session_skip); a cancel Reset: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>; intent wanted=True closed=False sid=s-B3
+  VX X4-16 | ACTIVE, session.json end 16 min ago: reset=True skipped= why=[] display calls=2 facility=[Idle] wall now READY/<none>
+  VX X4-14 | ACTIVE, session.json end 14 min ago: reset=False skipped=True why=[session 's-x4' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone] display calls=0 facility=[] wall now ACTIVE/s-x4
+  VX X5 | session.json = valid ACTIVE: gate Proceed=False why=[session 's-x5' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X5 | session.json = BOM + valid ACTIVE: gate Proceed=False why=[session 's-x5' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X5 | session.json = 0 bytes: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = whitespace: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = NUL x 64 (power loss): gate Proceed=True why=[no session.json]
+  VX X5 | session.json = BOM only: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = null: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = {}: gate Proceed=True why=[no session running (status )]
+  VX X5 | session.json = []: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = truncated mid-write: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = status lowercase: gate Proceed=True why=[no session running (status active)]
+  VX X5 | session.json = status trailing space: gate Proceed=True why=[no session running (status ACTIVE )]
+  VX X5 | session.json = status array: gate Proceed=False why=[session 's-x5' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X5 | session.json = duplicate status key: gate Proceed=True why=[no session running (status READY)]
+  VX X5 | session.json = UTF-16LE ACTIVE: gate Proceed=True why=[no session.json]
+  VX X5 | session.json = STOP (e-stop wrote it): gate Proceed=True why=[no session running (status STOP)]
+  VX X6 | payload {"force":"false"}: Proceed=True why=[force]
+  VX X6 | payload {"force":"0"}: Proceed=True why=[force]
+  VX X6 | payload {"force":"no"}: Proceed=True why=[force]
+  VX X6 | payload {"force":0}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X6 | payload {"force":false}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X6 | payload {"Force":true}: Proceed=True why=[force]
+  VX X6 | payload {"FORCE":"x"}: Proceed=True why=[force]
+  VX X6 | payload {"force":null}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X6 | payload {"force":[]}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X6 | payload {"force":[false]}: Proceed=False why=[session 's-x6' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone]
+  VX X6 | payload {"force":{}}: Proceed=True why=[force]
+  VX X6 | payload {"force":true}: Proceed=True why=[force]
+  VX X7 | payload id [8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b]: Proceed=True
+  VX X7 | payload id [8A4F2C10-1D2E-4F50-9A6B-7C8D9E0F1A2B]: Proceed=False
+  VX X7 | payload id [{8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b}]: Proceed=False
+  VX X7 | payload id [ 8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b]: Proceed=False
+  VX X7 | payload id [8a4f2c10-1d2e-4f50-9a6b-7c8d9e0f1a2b ]: Proceed=False
+  VX X7 | payload id [8a4f2c101d2e4f509a6b7c8d9e0f1a2b]: Proceed=False
+  VX X7 | payload id []: Proceed=False
+  VX X7 | payload id [ ]: Proceed=False
+  VX X7 | key BAYSESSIONID (other case): Proceed=True
+  VX X7 | running session with NO id, Reset with empty id: Proceed=False
+  VX X8 | bay clock +10 min, 4 real min left: Proceed=False
+  VX X8 | bay clock +16 min, 4 real min left: Proceed=False
+  VX X8 | bay clock +20 min, 4 real min left: Proceed=True
+  VX X8 | bay clock +80 min, 4 real min left: Proceed=True
+  VX X8 | bay clock +76 min at the START of a 60-min session: Proceed=True
+  VX X9 | Reset before End: first Reset reset=False skipped=True; after the End the wall is ENDED/s-x9 (no retry of the skipped Reset)
+  VX X10 | running booking canceled mid-play (its End canceled by the platform): reset=False skipped=True why=[session 's-x10' is running (ACTIVE) and this Reset does not name it: the wall, display and facility are left alone] display calls=0 facility=[] wall now ACTIVE/s-x10; intent wanted=True closed=False sid=s-x10 (nothing else is queued to end it)
+
+== K19 the shell's second check: session.json must not show another session running
+  PASS  session.json absent or unreadable: hold (cannot tell)
+  PASS  no status: hold
+  PASS  ENDED: allow
+  PASS  READY (after a Reset): allow
+  PASS  ACTIVE even for the session the intent says ended: hold (the two sources disagree; fail-open review)
+  PASS  ACTIVE for ANOTHER session still within its time: hold
+  PASS  ENDING (last five minutes) for another session: hold
+  PASS  a closed intent naming no session, another running: hold
+  PASS  ACTIVE for another session with no readable end: hold
+  PASS  ACTIVE for another session past its end (no End arrived, or an extension the agent never heard of): hold
+  PASS  an unknown status (here lower case) for another session within its time: hold
+  PASS  STOP (the emergency-stop banner) over another session within its time: hold
+  PASS  PREP of the next booking (nobody plays before Start): allow
+  PASS  a status that is not text: hold
+
+== K20 a restart needs session.json to run the wanted session (security review: source divergence)
+  PASS  ACTIVE, same session: restart allowed
+  PASS  ENDING (last five minutes), same session: restart allowed
+  PASS  ENDED for the wanted session (its End's intent write failed): no restart
+  PASS  ACTIVE for ANOTHER session: no restart for this one
+  PASS  session.json unreadable: no restart
+  PASS  an intent naming no session: no restart
+  PASS  session.json naming no session: no restart
+  PASS  an unknown status: no restart
+  PASS  STOP: no restart
+  PASS  UpdateSessionDisplay with a later end for the same session extends the intent
+  PASS  emergency stop during a session: unmanaged (no restarts, closes nothing)
+  PASS  Start while the stop is engaged: refused, unmanaged
+
+== K16 a verified shell file replaced with the same size and write time is verified again (content-keyed cache)
+  PASS  precondition: the signed file verified and a shell was started
+  PASS  precondition: same size, same write time, different bytes
+  PASS  the replaced file is verified again and refused (no stale 'verified')
+
+== K17 an intent edited behind the agent's back is put back before anything acts on it
+  PASS  an edited intent (free play until 2099) is detected
+  PASS  ...restored to what the agent wrote (closed), and counted
+  PASS  an untouched intent: nothing to restore
+  PASS  a deleted intent is restored too
+  PASS  the main-loop check restores it every pass, even when the reconcile is not due
+  PASS  a command decides from the restored intent, not the edited one (Reset after an edit to 'wanted' still closes)
+  PASS  the capability report carries the restore count
+  PASS  the report says the agent and the shell read the same session.json
+  PASS  ...and says so when a platform overlay moved the agent's (the shell would then neither restart nor close)
+
+== K14 the shell's one closer ends only the process it began to close (real process, injected clock)
+  PASS  first pass: asked to close (no window here), recorded, not ended
+  PASS  5 s later: not ended yet (the polite close gets 8 s)
+  PASS  a different start time than recorded (a reused id): NOT ended, and forgotten
+  PASS  a process that is not the configured launcher: NOT ended
+  PASS  a process in another session: NOT ended
+  PASS  the configured NAME but another PATH (attack R2: a bare name in the bay-writable config): NOT ended, never even asked
+  PASS  a config naming powershell or pwsh (this test's own process, exact path): never a launcher
+  PASS  the configured launcher, same session, same start, 9 s after the polite close: ended
+
+RESULT: 365 passed, 0 failed
