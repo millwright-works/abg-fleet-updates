@@ -21,8 +21,8 @@ WHAT THIS RELEASE DOES AND DOES NOT DO
 RULES IT KEEPS (each one is a test)
   - It restarts the launcher only while state\kiosk-intent.json says "wanted" AND the time is before its untilUtc.
   - It closes a launcher ONLY under an explicit "closed" intent (written only by the EndSession of the running session),
-    15 s after it was written (EndSession closes the launcher itself first), AND only while session.json shows no other
-    session running: the backstop for a member who relaunches the launcher from the desktop after the end (bench Part B
+    15 s after it was written (EndSession closes the launcher itself first), AND only while session.json shows that same
+    session ENDED: the backstop for a member who relaunches the launcher from the desktop after the end (bench Part B
     Test 11; A0.360 "the launcher appears only from session start to play end"). By process id, only the configured
     launcher (name and path) in this session.
   - Anything unreadable, absent, expired, "unmanaged" or unknown means hands off: never restart, never close. It stops
@@ -228,10 +228,11 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
 }
 
 function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime]$NowUtc, [int]$GraceSeconds = 120) {
-    # The SECOND source a close needs (attack RF1/RF2, 2026-10-08): session.json, which BayAgent writes at every session
-    # command, must not show a DIFFERENT session still running. A closed intent left over from session A while session B
-    # plays (a failed intent write, an event that moved B off "wanted") is then never acted on. Unreadable, absent or
-    # without a status: cannot tell, nothing is closed (toward free play, never toward ending a game). @{ AllowClose; Why }
+    # The SECOND source a close needs (attack RF1/RF2, 2026-10-08; RF-K2, 2026-10-09): session.json, which BayAgent writes
+    # at every session command, must show the closed intent's own session ENDED. A closed intent left over from session A
+    # while session B plays (a failed intent write) is then never acted on, whatever else rewrote session.json since.
+    # Unreadable, absent or without a status: cannot tell, nothing is closed (toward free play, never toward ending a
+    # game). @{ AllowClose; Why }
     if ($null -eq $SessionRead -or -not $SessionRead.Ok) {
         $why = $(if ($null -ne $SessionRead) { [string]$SessionRead.Why } else { "no read" })
         return @{ AllowClose = $false; Why = "session.json unreadable ($why): cannot tell, nothing closed" }
@@ -239,12 +240,17 @@ function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime
     $o = $SessionRead.Obj
     $status = Get-KioskProp $o "status" $null
     if ($status -isnot [string]) { return @{ AllowClose = $false; Why = "session.json has no status: cannot tell, nothing closed" } }
-    # ALLOWLIST (security review "fail-open guard", 2026-10-08): only the statuses BayAgent writes when nobody plays allow
-    # a close. Anything else holds: ACTIVE or ENDING (whichever session, even the one the intent says ended, even past
-    # its end: the two sources disagree, so neither is trusted to end a game), STOP, or an unknown value.
-    if ($status -cin @("ENDED", "READY", "PREP")) { return @{ AllowClose = $true; Why = "no session running (status $status)" } }
+    # POSITIVE EVIDENCE ONLY (RF-K2, attack 2026-10-09): a close needs session.json to say ENDED for the very session the
+    # closed intent names. EndSession writes exactly that BEFORE it writes "closed", and every StartSession Start writes its
+    # own ACTIVE before its intent, so a "closed" left on disk by a failed intent write (a later session is playing) never
+    # meets ENDED for its own session. READY, PREP and STOP no longer allow a close: Prep of the next booking, a Reset and
+    # an emergency stop all write them while a member can still be playing (X2b: a stale closed plus the next Prep ended
+    # a paying game 15 minutes early). Anything else holds: ACTIVE, ENDING, ENDED for another session, unknown values.
     $sid = Get-KioskProp $o "baySessionId" $null
-    return @{ AllowClose = $false; Why = ("session.json says '{0}' (session '{1}'): the closed intent (session '{2}') is not acted on" -f $status, $sid, $ClosedSessionId) }
+    if ($status -ceq "ENDED" -and $sid -is [string] -and -not [string]::IsNullOrWhiteSpace($sid) -and $sid -ceq $ClosedSessionId) {
+        return @{ AllowClose = $true; Why = "session.json says session '$sid' ENDED, the session the closed intent names" }
+    }
+    return @{ AllowClose = $false; Why = ("session.json says '{0}' (session '{1}'), not ENDED for the closed intent's session '{2}': nothing closed" -f $status, $sid, $ClosedSessionId) }
 }
 
 function Get-KioskSessionBacksWanted($SessionRead, [string]$WantedSessionId) {
@@ -888,7 +894,7 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
     if ($action -ne "close" -and $S.Closing.Count -gt 0) { $S.Closing.Clear() }
     switch ($action) {
         "close" {
-            # Two sources must agree before a game is ended: the closed intent AND session.json showing no other session.
+            # Two sources must agree before a game is ended: the closed intent AND session.json showing that session ENDED.
             $guard = Get-KioskSessionGuard -SessionRead (Read-KioskJsonFile -Path $S.Cfg.SessionJsonPath -MaxBytes 262144) -ClosedSessionId ([string]$S.Wanted.SessionId) -NowUtc $NowUtc
             $S.CloseHeld = $(if ($guard.AllowClose) { $null } else { $guard.Why })
             if ($guard.AllowClose) { Close-KioskLauncher -S $S -Procs $procs -NowUtc $NowUtc }

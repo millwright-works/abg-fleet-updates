@@ -399,6 +399,9 @@ if ($cfg -and ($cfg.PSObject.Properties.Name -contains "resultJsonMaxChars")) {
 # Lookup logical name for Bay lookup in BayCommand (Web API filter uses _{lookup}_value)
 $Lookup_Bay      = "build_bay"
 $Lookup_BayValue = "_{0}_value" -f $Lookup_Bay
+# The bay session a command row is bound to (the platform binds a canceled booking's Reset to that booking's session,
+# build_BaySession@odata.bind). In the core solution; measured on Dev 2026-10-09 as a lower-case GUID string.
+$Lookup_BaySessionValue = "_build_baysession_value"
 
 # Bay columns (logical names)
 $Col_Heartbeat = "build_lastheartbeat"
@@ -410,6 +413,8 @@ $STATUS_PENDING    = 100000000
 $STATUS_INPROGRESS = 100000001
 $STATUS_SUCCEEDED  = 100000002
 $STATUS_FAILED     = 100000003
+# Pending -> Skipped is the one close-out the guard plugin allows WITHOUT execution fields (no result, no error text).
+$STATUS_SKIPPED    = 100000005
 
 
 # Bay Agent status values (build_agentstatus)
@@ -2330,7 +2335,7 @@ function Get-NextPendingCommand {
     param([Parameter(Mandatory=$true)][string]$token)
 
     $nowUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $selectClause = "$Col_CommandId,$Col_Status,$Col_CommandType,$Col_Payload,$Col_AttemptCount,$Col_NotBefore,createdon,$Lookup_BayValue"
+    $selectClause = "$Col_CommandId,$Col_Status,$Col_CommandType,$Col_Payload,$Col_AttemptCount,$Col_NotBefore,createdon,$Lookup_BayValue,$Lookup_BaySessionValue"
 
     $filterClause = "$Lookup_BayValue eq $BayId and $Col_Status eq $STATUS_PENDING and ($Col_NotBefore eq null or $Col_NotBefore le $nowUtc)"
 
@@ -4565,7 +4570,9 @@ function Execute-Command {
     param(
         [Parameter(Mandatory=$true)][int]$CommandType,
         [string]$PayloadJson,
-        [string]$BayLabel
+        [string]$BayLabel,
+        # The session the command ROW is bound to ($Lookup_BaySessionValue); "" when it names none.
+        [string]$BoundSessionId = ""
     )
     $payloadObj = Try-ParseJson $PayloadJson
 
@@ -4749,6 +4756,8 @@ $CMD_EMERGENCY_STOP {
 
             $model = Normalize-SessionModel $model
             $paths = Write-SessionFiles $model
+            # RF-K1: a later end for the running session also moves the running-session record's end.
+            $null = Set-RunningSessionForCommand -CommandType $CMD_UPDATESESSIONDISPLAY -Mode ([string](Get-PropValue $payloadObj "mode" "")) -Payload $payloadObj
 
             # Make sure the display is up (no duplicates).
             $display = Start-SessionDisplay $payloadObj
@@ -4842,6 +4851,8 @@ $CMD_EMERGENCY_STOP {
 
             $model = Normalize-SessionModel $model
             $paths = Write-SessionFiles $model
+            # RF-K1: Start makes this session the running-session record (Prep changes nothing).
+            $null = Set-RunningSessionForCommand -CommandType $CMD_STARTSESSION -Mode $mode -Payload $payloadObj
 
             # Ensure the Session Display is running (no duplicates).
             $display = Start-SessionDisplay $payloadObj
@@ -5018,6 +5029,8 @@ $CMD_EMERGENCY_STOP {
 
             $model = Normalize-SessionModel $model
             $paths = Write-SessionFiles $model
+            # RF-K1: only the End that names the running-session record clears it (a late End of an older booking does not).
+            $null = Set-RunningSessionForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payloadObj
 
             $apps = Stop-AppsIfRequested $payloadObj
 
@@ -5083,6 +5096,24 @@ $CMD_EMERGENCY_STOP {
             # Reset to a known-good "READY" state.
             # Default behavior: keep the Session Display running (or restart it) so the bay never sits on a blank screen.
             if ($null -eq $payloadObj) { $payloadObj = @{} }
+            # R7 / RR1 (attacks 2026-10-08 and 2026-10-09): the platform sends a full Reset AT ONCE for every canceled
+            # booking, bound to that booking's session on the row, whoever is playing on that bay. A Reset may not rewrite
+            # the wall, restart the display or move the facility while a DIFFERENT session is running. "Running" is the
+            # running-session record (RF-K1), which only Start, that session's own End and a Reset for that session move;
+            # never session.json's status, which Prep, an emergency stop and a late End all rewrite while a member plays.
+            $resetGate = Get-ResetGate -Running $Global:RunningSession -BoundSessionId $BoundSessionId -Payload $payloadObj -NowUtc ((Get-Date).ToUniversalTime())
+            if (-not $resetGate.Proceed) {
+                return @{
+                    reset = $false
+                    skipped = $true
+                    reason = $resetGate.Why
+                    runningSessionId = $resetGate.RunningSessionId
+                    namedSessionId = $resetGate.NamedSessionId
+                    force = $resetGate.Force
+                }
+            }
+            # The running booking itself was canceled mid-play (the platform cancels its End): this Reset is what ends it.
+            if ($resetGate.NamesRunning) { $null = Set-RunningSession -Record $null -Reason ("Reset for the running session " + $resetGate.RunningSessionId) }
             # A0.363: the launcher is not wanted after a reset.
             $null = Set-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload $payloadObj
 
@@ -5128,6 +5159,8 @@ $CMD_EMERGENCY_STOP {
 
             return @{
                 reset = $true
+                gate = $resetGate.Why
+                force = $resetGate.Force
                 closeDisplay = $closeDisplay
                 restartDisplay = $restartDisplay
                 stopped = $stop
@@ -5163,6 +5196,25 @@ function Process-Command {
     }
 
     Write-Log "Processing command $cmdId (type=$type attempt=$attempt)" "INFO"
+    $boundSessionId = [string](Get-PropValue $cmd $Lookup_BaySessionValue "")
+
+    # 0) A Reset the gate refuses is closed out as Skipped while it is still Pending (the guard plugin allows Pending ->
+    # Skipped with no execution fields, and refuses InProgress -> Skipped). If that write fails for any reason, the
+    # command takes the normal path below, where Execute-Command's own gate skips it and the result says so: a Reset
+    # left Pending would be fetched first on every poll and block every later command.
+    if ($type -eq $CMD_RESET) {
+        $preGate = $null
+        try { $preGate = Get-ResetGate -Running $Global:RunningSession -BoundSessionId $boundSessionId -Payload (Try-ParseJson ([string]$cmd.$Col_Payload)) -NowUtc ((Get-Date).ToUniversalTime()) } catch { $preGate = $null }
+        if ($null -ne $preGate -and -not $preGate.Proceed) {
+            $skippedOk = $false
+            try { Patch-Row $token $BayCommandEntitySet $cmdId @{ $Col_Status = $STATUS_SKIPPED } $etag; $skippedOk = $true }
+            catch { Write-Log ("Reset {0}: could not mark it Skipped ({1}); it runs, and its gate skips it" -f $cmdId, $_.Exception.Message) "WARN" }
+            if ($skippedOk) {
+                Write-Log ("Reset {0} Skipped: {1}" -f $cmdId, $preGate.Why) "INFO"
+                return
+            }
+        }
+    }
 
     # 1) LOCK (Pending -> InProgress) using ETag
     $now1 = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -5210,7 +5262,7 @@ $bayLabelFromCmd = Get-BayLabelFromCommandRow $cmd
 # A0.458: an identity switch probes the command guard on the command it runs on (Test-IdentityCandidate).
 $Global:CurrentCommandId = $cmdId
 try {
-    $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel $bayLabelFromCmd
+    $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel $bayLabelFromCmd -BoundSessionId $boundSessionId
 } finally {
     $Global:CurrentCommandId = $null
 }
@@ -5306,6 +5358,11 @@ $KioskIntentPath            = Join-Path $BaseDir "state\kiosk-intent.json"
 $KioskHeartbeatPath         = Join-Path $BaseDir "state\kiosk-shell.json"
 $KioskReconcilePath         = Join-Path $BaseDir "state\kiosk-reconcile.json"
 $KioskIntentGraceSeconds    = 120
+# RF-K1 (attack 2026-10-09): who is playing, as a fact only that session's own commands move (Get-ResetGate). In every
+# mode, dormant included: it protects the wall, the display and the facility from another booking's Reset.
+$RunningSessionPath            = Join-Path $BaseDir "state\running-session.json"
+$Global:RunningSession         = $null
+$Global:RunningSessionPending  = $false
 $KioskReconcileEverySeconds = 60
 $KioskShellAliveSeconds     = 60
 $KioskShellHungSeconds      = 180
@@ -5574,6 +5631,165 @@ function Get-KioskShellLiveness($HeartbeatRead, [DateTime]$NowUtc, [scriptblock]
     return $l
 }
 
+function Test-BaySessionIdMatch([string]$A, [string]$B) {
+    # Pure. Two bay session ids name the same session: both present, compared as GUID text (spaces and braces trimmed,
+    # case ignored: the row lookup is lower case, a payload may not be). An empty id never matches anything.
+    $x = $(if ($null -ne $A) { $A.Trim().Trim('{', '}').Trim() } else { "" })
+    $y = $(if ($null -ne $B) { $B.Trim().Trim('{', '}').Trim() } else { "" })
+    if ($x.Length -eq 0 -or $y.Length -eq 0) { return $false }
+    return [string]::Equals($x, $y, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-ResetGate {
+    # Pure. May a Reset touch the wall, display and facility right now? (R7, RR1; RF-K1 of the 2026-10-09 attack.)
+    # "A member is playing" is the RUNNING-SESSION RECORD ($Global:RunningSession), never session.json's status: Prep of
+    # the next booking, an emergency stop that was cleared, a late End of the previous booking and the passage of time
+    # all move session.json off ACTIVE while a member still plays, and none of them moves the record (only Start, that
+    # session's own End, and a Reset for that session do). The session a Reset is FOR is the row's bound session
+    # (BoundSessionId), else a payload baySessionId. Proceeds when: no record; the Reset is for the running session (it
+    # was canceled mid-play: NamesRunning, the caller clears the record); force is the JSON literal true (an operator;
+    # "true", 1, "false" or {} are not force); the record's end is more than LapseHours past (an End that never came must
+    # not pin the bay for good). Otherwise holds. @{ Proceed; Why; RunningSessionId; NamedSessionId; NamesRunning; Force }
+    param($Running, [string]$BoundSessionId, $Payload, [DateTime]$NowUtc, [int]$LapseHours = 6)
+    # Get-KioskProp keeps an array an array (Get-PropValue would unroll [true] to true).
+    $f = Get-KioskProp $Payload "force" $null
+    $force = ($f -is [bool] -and $f -eq $true)
+    $named = $(if (-not [string]::IsNullOrWhiteSpace($BoundSessionId)) { $BoundSessionId.Trim() } else { [string](Get-PropValue $Payload "baySessionId" "") })
+    $runSid = $(if ($null -ne $Running) { [string](Get-KioskProp $Running "baySessionId" "") } else { "" })
+    $g = @{ Proceed = $false; Why = ""; RunningSessionId = $runSid; NamedSessionId = $named; NamesRunning = $false; Force = $force }
+    if ($null -eq $Running) { $g.Proceed = $true; $g.Why = "nobody is playing (no running-session record)"; return $g }
+    if (Test-BaySessionIdMatch $named $runSid) { $g.Proceed = $true; $g.NamesRunning = $true; $g.Why = "the Reset is for the running session $runSid"; return $g }
+    if ($force) { $g.Proceed = $true; $g.Why = "force"; return $g }
+    $end = ConvertTo-KioskUtc (Get-KioskProp $Running "endUtc" $null)
+    if ($null -ne $end -and $NowUtc -gt $end.AddHours($LapseHours)) { $g.Proceed = $true; $g.Why = "the running-session record for $runSid lapsed ($LapseHours h past its end, no End came)"; return $g }
+    $g.Why = "session '$runSid' is playing and this Reset is for '$named': the wall, display and facility are left alone"
+    return $g
+}
+
+function Get-RunningSessionForCommand {
+    # Pure. What a command does to the running-session record. @{ Change; Record; Reason }; Record $null = nobody plays.
+    #   StartSession Start  this session plays (replaces any older record: the bay moved on). Prep changes nothing.
+    #   EndSession          clears the record only when it names the recorded session (a late End of an older one does not).
+    #   UpdateSessionDisplay moves the recorded session's end LATER only (an extension), never earlier, never another session.
+    # The caller runs Start only when no emergency stop blocked it; the Reset's own clear is Get-ResetGate's NamesRunning.
+    param([int]$CommandType, [string]$Mode, $Payload, $Current, [DateTime]$NowUtc)
+    $none = @{ Change = $false; Record = $Current; Reason = "" }
+    $m = $(if ($null -ne $Mode) { $Mode.ToLowerInvariant() } else { "" })
+    $sid = [string](Get-KioskProp $Payload "baySessionId" "")
+    $curSid = $(if ($null -ne $Current) { [string](Get-KioskProp $Current "baySessionId" "") } else { "" })
+    $end = ConvertTo-KioskUtc (Get-KioskProp $Payload "playEndUtc" $null)
+    if ($null -eq $end) { $end = ConvertTo-KioskUtc (Get-KioskProp $Payload "sessionEndUtc" $null) }
+    if ($CommandType -eq $CMD_STARTSESSION) {
+        if ($m -ne "start") { return $none }
+        if ($null -eq $end) { $end = ConvertTo-KioskUtc (Get-KioskProp $Payload "endUtc" $null) }
+        $rec = [ordered]@{ baySessionId = $sid; endUtc = $(if ($null -ne $end) { $end.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }); since = $NowUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        return @{ Change = $true; Record = $rec; Reason = "StartSession Start $sid" }
+    }
+    if ($null -eq $Current -or -not (Test-BaySessionIdMatch $sid $curSid)) { return $none }
+    if ($CommandType -eq $CMD_ENDSESSION) { return @{ Change = $true; Record = $null; Reason = "EndSession $sid" } }
+    if ($CommandType -eq $CMD_UPDATESESSIONDISPLAY) {
+        if ($null -eq $end) { return $none }
+        $curEnd = ConvertTo-KioskUtc (Get-KioskProp $Current "endUtc" $null)
+        if ($null -ne $curEnd -and $end -le $curEnd) { return $none }
+        $rec = [ordered]@{ baySessionId = $curSid; endUtc = $end.ToString("yyyy-MM-ddTHH:mm:ssZ"); since = [string](Get-KioskProp $Current "since" "") }
+        return @{ Change = $true; Record = $rec; Reason = "UpdateSessionDisplay extended $curSid" }
+    }
+    return $none
+}
+
+function Write-RunningSessionFile {
+    # Lays the in-memory record down atomically and reads it back. Throws on failure (callers catch).
+    $r = $Global:RunningSession
+    $o = [ordered]@{
+        schema       = 1
+        running      = ($null -ne $r)
+        baySessionId = $(if ($null -ne $r) { [string](Get-KioskProp $r "baySessionId" "") } else { $null })
+        endUtc       = $(if ($null -ne $r) { Get-KioskProp $r "endUtc" $null } else { $null })
+        since        = $(if ($null -ne $r) { Get-KioskProp $r "since" $null } else { $null })
+        writtenUtc   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+    $text = ConvertTo-Json -InputObject $o -Depth 3
+    $dir = Split-Path -Parent $RunningSessionPath
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $tmp = "$RunningSessionPath.tmp"
+    [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding($false)))
+    try {
+        if (Test-Path -LiteralPath $RunningSessionPath) { [IO.File]::Replace($tmp, $RunningSessionPath, [NullString]::Value, $true) }
+        else { [IO.File]::Move($tmp, $RunningSessionPath) }
+    } catch { [IO.File]::Copy($tmp, $RunningSessionPath, $true); try { [IO.File]::Delete($tmp) } catch { } }
+    $fsR = New-Object IO.FileStream($RunningSessionPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { $sr = New-Object IO.StreamReader($fsR, (New-Object Text.UTF8Encoding($false))); $back = $sr.ReadToEnd() } finally { $fsR.Dispose() }
+    if ($back -cne $text) { throw "the running-session file does not read back as written" }
+}
+
+function Set-RunningSession($Record, [string]$Reason) {
+    # The in-memory record is the authority for this process (the gate reads it); the file only carries it across a
+    # restart. A failed write is retried every main-loop pass (Sync-RunningSessionFile). Never throws.
+    $Global:RunningSession = $Record
+    $Global:RunningSessionPending = $true
+    try {
+        Write-RunningSessionFile
+        $Global:RunningSessionPending = $false
+        try { Write-Log ("[SESSION] running-session record: {0} ({1})" -f $(if ($null -ne $Record) { [string](Get-KioskProp $Record "baySessionId" "") } else { "none" }), $Reason) "INFO" } catch { }
+        return $true
+    } catch {
+        try { Write-Log ("[SESSION] running-session record could not be written (kept in memory, retried every pass): {0}" -f $_.Exception.Message) "WARN" } catch { }
+        return $false
+    }
+}
+
+function Sync-RunningSessionFile {
+    # Every main-loop pass: lands a pending write. Never throws.
+    if (-not $Global:RunningSessionPending) { return $false }
+    try { Write-RunningSessionFile; $Global:RunningSessionPending = $false; return $true } catch { return $false }
+}
+
+function Set-RunningSessionForCommand {
+    # Execute-Command's call per Start, End and UpdateSessionDisplay. Never throws; returns the change, or $null.
+    param([int]$CommandType, [string]$Mode, $Payload)
+    try {
+        $c = Get-RunningSessionForCommand -CommandType $CommandType -Mode $Mode -Payload $Payload -Current $Global:RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+        if (-not $c.Change) { return $null }
+        $ok = Set-RunningSession -Record $c.Record -Reason $c.Reason
+        return [ordered]@{ running = ($null -ne $c.Record); reason = $c.Reason; written = $ok }
+    } catch {
+        try { Write-Log ("[SESSION] running-session record for command {0} failed: {1}" -f $CommandType, $_.Exception.Message) "WARN" } catch { }
+        return $null
+    }
+}
+
+function Initialize-RunningSession([DateTime]$NowUtc) {
+    # Agent start. A readable record file is the authority (it outlives a restart). Absent or unreadable (the first start
+    # of a release that has it, or a damaged file): derived ONCE from session.json, a session ACTIVE or ENDING, or STOP
+    # (an emergency stop over a session) whose end is still ahead. Never throws.
+    try {
+        $rd = Read-KioskJsonFile -Path $RunningSessionPath -MaxBytes 8192
+        if ($rd.Ok) {
+            $o = $rd.Obj
+            $schema = Get-KioskProp $o "schema" $null
+            $running = Get-KioskProp $o "running" $null
+            $sid = Get-KioskProp $o "baySessionId" $null
+            if (($schema -is [int] -or $schema -is [long]) -and [int64]$schema -ge 1 -and $running -is [bool]) {
+                if (-not $running) { $Global:RunningSession = $null; return }
+                if ($sid -is [string]) {
+                    $e = ConvertTo-KioskUtc (Get-KioskProp $o "endUtc" $null)
+                    $Global:RunningSession = [ordered]@{ baySessionId = $sid; endUtc = $(if ($null -ne $e) { $e.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }); since = [string](Get-KioskProp $o "since" "") }
+                    return
+                }
+            }
+        }
+        $model = Read-SessionModelFromDisk
+        $status = [string](Get-KioskProp $model "status" "")
+        $msid = [string](Get-KioskProp $model "baySessionId" "")
+        $mend = ConvertTo-KioskUtc (Get-KioskProp $model "sessionEndUtc" $null)
+        $rec = $null
+        $plays = ($status -cin @("ACTIVE", "ENDING")) -or ($status -ceq "STOP" -and $null -ne $mend -and $NowUtc -lt $mend)
+        if ($plays -and -not [string]::IsNullOrWhiteSpace($msid)) {
+            $rec = [ordered]@{ baySessionId = $msid; endUtc = $(if ($null -ne $mend) { $mend.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null }); since = $NowUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        }
+        $null = Set-RunningSession -Record $rec -Reason ("agent start: derived from session.json (status '{0}', record file {1})" -f $status, $rd.Why)
+    } catch { try { Write-Log ("[SESSION] running-session record could not be initialized: {0}" -f $_.Exception.Message) "WARN" } catch { } }
+}
 function Get-KioskIntentForCommand {
     # Pure: what a command does to the launcher intent. $null = leave it as it is.
     param(
@@ -5933,6 +6149,7 @@ function Invoke-KioskReconcileTick {
 function Invoke-KioskReconcileTickIfDue([DateTime]$NowUtc) {
     # Every main-loop pass (a few seconds): an edited intent file is put back before it can steer the shell for long.
     try { [void](Test-KioskIntentIntegrity) } catch { }
+    try { [void](Sync-RunningSessionFile) } catch { }
     if ($NowUtc -lt $Global:KioskNextReconcileUtc) { return }
     $Global:KioskNextReconcileUtc = $NowUtc.AddSeconds($KioskReconcileEverySeconds)
     try { Invoke-KioskReconcileTick -NowUtc $NowUtc } catch { }
@@ -7052,6 +7269,8 @@ catch { Write-Log ("[SELFHEAL] could not start; it stays off: {0}" -f $_.Excepti
 # A0.363: the kiosk intent is re-derived from session.json (after the emergency-stop latch is restored), and the first
 # reconcile runs now, so the kiosk block is in the first capabilities report. Nothing here can stop the agent starting.
 if (-not $EnrollCert -and -not $TokenOnly) {
+    # RF-K1: who is playing, before any command can run (a Reset reads it).
+    try { Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime()) } catch { Write-Log ("[SESSION] could not initialize: {0}" -f $_.Exception.Message) "ERROR" }
     try { Initialize-Kiosk -NowUtc ((Get-Date).ToUniversalTime()) } catch { Write-Log ("[KIOSK] could not initialize: {0}" -f $_.Exception.Message) "ERROR" }
     try { Invoke-KioskReconcileTickIfDue -NowUtc ((Get-Date).ToUniversalTime()) } catch { }
 }

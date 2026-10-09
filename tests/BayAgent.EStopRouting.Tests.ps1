@@ -245,6 +245,8 @@ try {
     $Global:SessionDisplayProfileDir = Join-Path $tmp "edge-profile-unique"
     $Global:SessionDisplayStatePath = Join-Path $tmp "display-state.json"
     $Global:SessionDisplayProcId = $null
+    # The agent's script-level running-session state (RF-K1, 2026-10-09): nobody playing, its file in this sandbox.
+    $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $RunningSessionPath = Join-Path $tmp "state\running-session.json"
 
     function Invoke-Cmd([int]$type, [string]$json) { return (Execute-Command -CommandType $type -PayloadJson $json -BayLabel "TestBay") }
     function New-Victim {
