@@ -1328,6 +1328,12 @@ try {
     $r5 = $(if ($null -ne $ends5) { Invoke-CancelEndIfDue -NowUtc $ends5.AddSeconds(1) } else { "no warning" })
     Assert-True ($null -eq $r5 -and (Get-RecSid) -eq "s-n5" -and (Get-SessStatus) -eq "ACTIVE/s-n5" -and (Get-IntentNow).Wanted) "A0.467 the next booking's Start during the warning takes over; the canceled booking's end does not touch it"
     [void](Invoke-End "s-n5")
+    # Canceled after the next booking's Prep already rewrote the wall: the warning is the canceled booking's own.
+    Clear-Bay
+    [void](Invoke-Start "s-c9"); [void](Invoke-Start "s-n9" "Prep")
+    $ends9 = Get-EndsOf (Invoke-BoundReset "s-c9")
+    Assert-True ($null -ne $ends9 -and (Get-SessStatus) -eq "ENDING/s-c9" -and (ConvertTo-KioskUtc (Get-PropValue (Get-Sess) "playEndUtc" $null)) -eq $ends9) "A0.467 canceled after the next booking's Prep rewrote the wall: the warning shows s-c9's own countdown (ENDING/s-c9), not s-n9's Prep"
+    if ($null -ne $ends9) { [void](Invoke-CancelEndIfDue -NowUtc $ends9.AddSeconds(1)) }
     # Pure: the warning's end, the record across a replayed Start or an extension, the intent cut.
     $nC = [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-09T12:00:00"), [DateTimeKind]::Utc)
     Assert-True ((Get-CancelEndUtc -NowUtc $nC -RecordEndUtc $nC.AddHours(1) -WarningSeconds 300) -eq $nC.AddMinutes(5)) "A0.467 end: 5 minutes from now when the booking runs longer"
@@ -1395,6 +1401,8 @@ try {
     $rU = Invoke-End "s-U3"
     $rN = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","closeLauncher":false}' -BayLabel "Bay"
     Assert-True ([IO.File]::ReadAllText($sessPath) -ceq $wallT3 -and $script:Fac.Count -eq 0 -and (Get-RecSid) -eq "s-T3" -and (Get-IntentNow).Wanted -and (Get-PropValue $rU "scope" "") -eq "other" -and (Get-PropValue $rN "scope" "") -eq "other") "an End of another booking, or naming no session, while s-T3 plays: wall, facility, record and intent untouched"
+    $rU3 = Invoke-Start "s-U3"
+    Assert-True ((Get-PropValue $rU3 "skipped" $null) -eq $true -and (Get-RecSid) -eq "s-T3") "RV1 a booking whose late End came while another played is listed as ended: a replayed Start of it is refused"
     [void](Invoke-End "s-T3")
 
     # ---- F1-R3: an ON-TIME End after the next booking's Prep (session.json moved to the next booking).
@@ -1450,6 +1458,8 @@ try {
         if ((Get-Command Get-KioskSessionGuard).Parameters.ContainsKey("ClosedSinceUtc")) { $a["ClosedSinceUtc"] = $since }
         return (Get-KioskSessionGuard @a).AllowClose
     }
+    $tickText = Get-DefText $ShellDefs "Invoke-KioskTick"
+    Assert-True ($tickText -match 'Get-KioskSessionGuard [^\r\n]*-ClosedSinceUtc \$S\.Wanted\.ClosedSinceUtc') "the shell's tick passes the closed intent's time to its guard (the rule below needs it)"
     $atOk = $nS.ToString($fmtZ); $atOld = $nS.AddMinutes(-5).ToString($fmtZ)
     Assert-True (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-n" $atOk)) "s-a" $sinceS) "guard: PREP stamped nobody-plays, after the closed intent: close"
     Assert-True (Get-GG (New-Wall "READY" $null (New-St $false "READY" "" $atOk)) "s-a" $sinceS) "guard: READY (no session) stamped nobody-plays: close"
@@ -1543,7 +1553,8 @@ try {
     Assert-True ((Test-SessionFinished "s-R" $Global:RunningSessionFinished) -and (Get-RecSid) -eq "s-T7") "RV1 the ended-session list survives a restart (record file)"
     $l60 = @(); for ($i = 1; $i -le 60; $i++) { $l60 = @(Add-FinishedSessionToList -Finished $l60 -SessionId ("s-" + $i) -NowUtc $nC -Max 50) }
     $l60b = @(Add-FinishedSessionToList -Finished $l60 -SessionId "S-20" -NowUtc $nC -Max 50)
-    Assert-True ($l60.Count -eq 50 -and -not (Test-SessionFinished "s-10" $l60) -and (Test-SessionFinished "s-11" $l60) -and (Test-SessionFinished "s-60" $l60) -and $l60b.Count -eq 50 -and [string](Get-KioskProp $l60b[49] "id" "") -eq "S-20") "RV1 the list keeps the newest 50; a re-added session moves to newest (no duplicate)"
+    Assert-True ($l60.Count -eq 50 -and -not (Test-SessionFinished "s-10" $l60) -and (Test-SessionFinished "s-11" $l60) -and (Test-SessionFinished "s-60" $l60) -and $l60b.Count -eq 50 -and [string](Get-KioskProp $l60b[49] "id" "") -eq "S-20") "RV1 the list keeps the newest 50; a re-added session moves to newest"
+    Assert-True (@($l60b | Where-Object { Test-BaySessionIdMatch ([string](Get-KioskProp $_ "id" "")) "s-20" }).Count -eq 1 -and (Test-SessionFinished "s-11" $l60b)) "RV1 ...with no duplicate entry (the oldest, s-11, is still kept)"
     Assert-True (-not (Test-SessionFinished "" $l60) -and -not (Test-SessionFinished $null @())) "RV1 an empty id is never 'ended'"
     # Process-Command: a refused replay writes NO booking status (it would move a completed booking back to in-process);
     # a late End of another booking still writes its booking complete.
