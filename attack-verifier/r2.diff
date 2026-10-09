@@ -1,0 +1,480 @@
+diff --git a/src/BayAgent/BayAgent.ps1 b/src/BayAgent/BayAgent.ps1
+index 749c3da..ea6c9f4 100644
+--- a/src/BayAgent/BayAgent.ps1
++++ b/src/BayAgent/BayAgent.ps1
+@@ -4801,8 +4801,10 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel
+ # WHAT THIS SECTION DOES IN EVERY MODE (dormant included)
+ #   1. Writes state\kiosk-intent.json, the launcher signal the shell reads, one of three values:
+ #        wanted     StartSession Start, until the play end plus 2 minutes (extended by a later end for the same session)
+-#        closed     EndSession of the running session (written BEFORE the launcher is closed) and a Reset while nothing
+-#                   is wanted: no session may play, so the shell closes a launcher a member reopens (Part B Test 11)
++#        closed     ONLY the EndSession of the running session (it names a session, session.json holds it, and the
++#                   intent names no other), written BEFORE the launcher is closed: no session may play, so the shell
++#                   closes a launcher a member reopens (Part B Test 11). A Reset never changes the intent (attack RF1).
++#      A failed write keeps the DESIRED intent as the baseline and re-applies it every pass until it lands (RF2).
+ #        unmanaged  a Start with no readable end or startOnStart=false, an emergency stop, Maintenance/Offline: hands off
+ #      Prep changes nothing (it can run while the previous booking still plays). A readable intent outlives an agent
+ #      restart; an absent one is derived from session.json (running session: wanted; otherwise unmanaged).
+@@ -4870,8 +4872,16 @@ function Read-KioskJsonFile([string]$Path, [int]$MaxBytes = 65536) {
+     $r = @{ Ok = $false; Obj = $null; Why = "" }
+     try {
+         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $r.Why = "absent"; return $r }
+-        $bytes = [IO.File]::ReadAllBytes($Path)
+-        if ($bytes.Length -gt $MaxBytes) { $r.Why = "larger than $MaxBytes bytes"; return $r }
++        # Opened with every share flag, so a reader never makes the writer's atomic replace fail (attack RF2, 2026-10-08).
++        $fsR = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
++        $bytes = $null
++        try {
++            if ($fsR.Length -gt $MaxBytes) { $r.Why = "larger than $MaxBytes bytes"; return $r }
++            $bytes = New-Object byte[] ([int]$fsR.Length)
++            $got = 0
++            while ($got -lt $bytes.Length) { $n = $fsR.Read($bytes, $got, $bytes.Length - $got); if ($n -le 0) { break }; $got += $n }
++            if ($got -ne $bytes.Length) { $r.Why = "short read"; return $r }
++        } finally { $fsR.Dispose() }
+         $start = 0
+         if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
+         for ($i = $start; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -eq 0) { $r.Why = "contains NUL bytes"; return $r } }
+@@ -4938,7 +4948,7 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
+     # Three answers, read strictly:
+     #   Wanted   only for an exact "wanted" whose untilUtc (with its zone) is in the future: the shell restarts it.
+     #   Closed   only for an exact "closed" with a readable writtenUtc: no session may play (written by EndSession of the
+-    #            running session, and by Reset outside a session); the shell closes a launcher that appears (A0.360).
++    #            running session only); the shell closes a launcher that appears (A0.360), if session.json agrees.
+     #   neither  ("unmanaged", "not_wanted", expired, unreadable, unknown): hands off, never restart, never close.
+     # A failure to read is never a reason to close anything. Newer schemas are read by field name.
+     $w = @{ Wanted = $false; Closed = $false; ClosedSinceUtc = $null; Reason = ""; UntilUtc = $null; SessionId = $null }
+@@ -5101,11 +5111,13 @@ function Get-KioskIntentForCommand {
+         [DateTime]$NowUtc
+     )
+     # Three values (Get-KioskLauncherWanted): "wanted" (the shell restarts it), "closed" (no session may play: the
+-    # shell closes a launcher that appears), "unmanaged" (hands off). "closed" is written ONLY by EndSession of the
+-    # running session and by a Reset while nothing is wanted, never from a guess: a wrong "closed" ends a member's game.
++    # shell closes a launcher that appears), "unmanaged" (hands off). "closed" is written ONLY by the EndSession of the
++    # running session: it must name a session, be the session session.json holds, and not contradict the session the
++    # intent names. Never from a guess, never from a Reset: a wrong "closed" ends a paying member's game (attack RF1).
+     $m = $(if ($null -ne $Mode) { $Mode.ToLowerInvariant() } else { "" })
+     $sid = [string](Get-KioskProp $Payload "baySessionId" "")
+     $cur = Get-KioskLauncherWanted -IntentRead $CurrentIntentRead -NowUtc $NowUtc
++    $curSid = [string]$cur.SessionId
+     if ($CommandType -eq $CMD_STARTSESSION) {
+         if ($EmergencyStopEngaged) { return @{ Launcher = "unmanaged"; UntilUtc = $null; SessionId = $sid; Reason = "emergency stop engaged" } }
+         if ($m -eq "start") {
+@@ -5121,19 +5133,23 @@ function Get-KioskIntentForCommand {
+     }
+     if ($CommandType -eq $CMD_ENDSESSION) {
+         if (-not $SameSession) { return $null }
++        # An End that names no session cannot prove it ends the running one (attack E6).
++        if ([string]::IsNullOrWhiteSpace($sid)) { return $null }
++        # The intent names another session (a later booking already started): not this End's to close.
++        if (-not [string]::IsNullOrWhiteSpace($curSid) -and $curSid -cne $sid) { return $null }
+         return @{ Launcher = "closed"; UntilUtc = $null; SessionId = $sid; Reason = "EndSession" }
+     }
+     if ($CommandType -eq $CMD_RESET) {
+-        # A Reset follows a canceled booking, which may not be the one playing now: never close over a wanted session.
+-        if ($cur.Wanted) { return $null }
+-        return @{ Launcher = "closed"; UntilUtc = $null; SessionId = $sid; Reason = "Reset" }
++        # The platform sends a full Reset AT ONCE for every canceled booking, with no session id, whoever is playing
++        # (attack RF1): it never changes the intent. Only the running session's EndSession writes "closed".
++        return $null
+     }
+     if ($CommandType -eq $CMD_EMERGENCY_STOP) {
+         $a = [string](Get-KioskProp $Payload "action" "engage")
+         if ($a.ToLowerInvariant() -eq "clear") { return $null }
+-        # Stops restarts; closes nothing (what an emergency stop does to the golf program is not this build's call).
++        # Stops restarts; closes nothing (A0.457, Kevin 2026-10-08: an emergency stop does not close the golf program).
+         if (-not $cur.Wanted) { return $null }
+-        return @{ Launcher = "unmanaged"; UntilUtc = $null; SessionId = $sid; Reason = "emergency stop engaged" }
++        return @{ Launcher = "unmanaged"; UntilUtc = $null; SessionId = $(if ($sid) { $sid } else { $curSid }); Reason = "emergency stop engaged" }
+     }
+     if ($CommandType -eq $CMD_UPDATESESSIONDISPLAY) {
+         # Only EXTENDS a wanted intent of the SAME session to a later end (an extension); never creates one.
+@@ -5148,39 +5164,49 @@ function Get-KioskIntentForCommand {
+     return $null
+ }
+ 
++function Write-KioskIntentText([string]$Text) {
++    # Lays $Text down atomically and reads it back byte for byte (through a reader that blocks no writer). $true only
++    # when the file now holds exactly $Text. Throws on failure (callers catch).
++    $dir = Split-Path -Parent $KioskIntentPath
++    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
++    $tmp = "$KioskIntentPath.tmp"
++    [IO.File]::WriteAllText($tmp, $Text, (New-Object Text.UTF8Encoding($false)))
++    try {
++        if (Test-Path -LiteralPath $KioskIntentPath) { [IO.File]::Replace($tmp, $KioskIntentPath, [NullString]::Value, $true) }
++        else { [IO.File]::Move($tmp, $KioskIntentPath) }
++    } catch { [IO.File]::Copy($tmp, $KioskIntentPath, $true); try { [IO.File]::Delete($tmp) } catch { } }
++    $fsB = New-Object IO.FileStream($KioskIntentPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
++    try { $sr = New-Object IO.StreamReader($fsB, (New-Object Text.UTF8Encoding($false))); $back = $sr.ReadToEnd() } finally { $fsB.Dispose() }
++    if ($back -cne $Text) { throw "the intent file does not read back as written" }
++    return $true
++}
++
+ function Write-KioskIntent([string]$Launcher, $UntilUtc, [string]$SessionId, [string]$Reason) {
+-    # Atomic write, then read back through the same strict reader the shell uses. Returns $true only when the file now
+-    # says exactly what was written. Never throws.
++    # The DESIRED intent becomes the agent's baseline BEFORE the write (attack RF2): if the write fails (the file held
++    # open, a disk error), the older intent on disk is not authoritative; Test-KioskIntentIntegrity re-applies the
++    # desired one on every main-loop pass until it lands, and the report says it is pending. Returns $true only when the
++    # file now says exactly this. Never throws.
++    $o = [ordered]@{
++        schema       = 1
++        launcher     = $Launcher
++        untilUtc     = $(if ($null -ne $UntilUtc) { ([DateTime]$UntilUtc).ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null })
++        baySessionId = $SessionId
++        reason       = $Reason
++        writtenUtc   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
++        agentPid     = $PID
++    }
++    $text = ConvertTo-Json -InputObject $o -Depth 3
++    $Global:KioskIntentExpectedText = $text
++    $Global:KioskIntentPending = $true
+     try {
+-        $o = [ordered]@{
+-            schema       = 1
+-            launcher     = $Launcher
+-            untilUtc     = $(if ($null -ne $UntilUtc) { ([DateTime]$UntilUtc).ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null })
+-            baySessionId = $SessionId
+-            reason       = $Reason
+-            writtenUtc   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+-            agentPid     = $PID
+-        }
+-        $dir = Split-Path -Parent $KioskIntentPath
+-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+-        $tmp = "$KioskIntentPath.tmp"
+-        [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $o -Depth 3), (New-Object Text.UTF8Encoding($false)))
+-        try {
+-            if (Test-Path -LiteralPath $KioskIntentPath) { [IO.File]::Replace($tmp, $KioskIntentPath, [NullString]::Value, $true) }
+-            else { [IO.File]::Move($tmp, $KioskIntentPath) }
+-        } catch { [IO.File]::Copy($tmp, $KioskIntentPath, $true); try { [IO.File]::Delete($tmp) } catch { } }
+-        $back = Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192
+-        if (-not $back.Ok) { throw ("read back unreadable: " + $back.Why) }
+-        if ([string](Get-KioskProp $back.Obj "launcher" "") -cne $Launcher) { throw "read back a different launcher value" }
+-        $expectU = $(if ($null -ne $o.untilUtc) { ConvertTo-KioskUtc $o.untilUtc } else { $null })
+-        $backU = ConvertTo-KioskUtc (Get-KioskProp $back.Obj "untilUtc" $null)
+-        if ($expectU -ne $backU) { throw "read back a different untilUtc" }
++        [void](Write-KioskIntentText -Text $text)
++        $Global:KioskIntentPending = $false
+         $Global:KioskIntentLast = [ordered]@{ launcher = $Launcher; untilUtc = $o.untilUtc; reason = $Reason; utc = $o.writtenUtc; ok = $true }
+-        $Global:KioskIntentExpectedText = [IO.File]::ReadAllText($KioskIntentPath)
+         return $true
+     } catch {
+-        $Global:KioskIntentLast = [ordered]@{ launcher = $Launcher; reason = $Reason; ok = $false; error = $_.Exception.Message }
+-        try { Write-Log ("[KIOSK] intent '{0}' could not be written: {1}" -f $Launcher, $_.Exception.Message) "WARN" } catch { }
++        $Global:KioskIntentLast = [ordered]@{ launcher = $Launcher; reason = $Reason; ok = $false; pending = $true; error = $_.Exception.Message }
++        $Global:NextCapabilitiesUtc = [DateTime]::MinValue
++        try { Write-Log ("[KIOSK] intent '{0}' could not be written (retried every pass until it lands): {1}" -f $Launcher, $_.Exception.Message) "WARN" } catch { }
+         return $false
+     }
+ }
+@@ -5188,24 +5214,31 @@ function Write-KioskIntent([string]$Launcher, $UntilUtc, [string]$SessionId, [st
+ function Test-KioskIntentIntegrity {
+     # The intent file is state the shell ACTS on (restart, or end a relaunched launcher), and the bay account (or a member
+     # at the companion desktop) can write it. This agent is its only author: content that differs from what this agent
+-    # last wrote, or kept at start, is put back and reported (security review, 2026-10-08). Before this process has
+-    # written or kept an intent there is nothing to compare. Returns $true when it restored. Never throws.
++    # last DECIDED (written, kept at start, or still pending after a failed write) is put back. A pending write that now
++    # lands is reported as landed; a change made outside the agent is counted (security review and attack RF2,
++    # 2026-10-08). Before this process has decided an intent there is nothing to compare. Returns $true when it wrote.
++    # Never throws.
+     try {
+         $exp = $Global:KioskIntentExpectedText
+         if ($null -eq $exp) { return $false }
+         $onDisk = $null
+-        try { $onDisk = [IO.File]::ReadAllText($KioskIntentPath) } catch { $onDisk = $null }
+-        if ($null -ne $onDisk -and $onDisk -ceq $exp) { return $false }
+-        $tmp = "$KioskIntentPath.tmp"
+-        [IO.File]::WriteAllText($tmp, $exp, (New-Object Text.UTF8Encoding($false)))
+         try {
+-            if (Test-Path -LiteralPath $KioskIntentPath) { [IO.File]::Replace($tmp, $KioskIntentPath, [NullString]::Value, $true) }
+-            else { [IO.File]::Move($tmp, $KioskIntentPath) }
+-        } catch { [IO.File]::Copy($tmp, $KioskIntentPath, $true); try { [IO.File]::Delete($tmp) } catch { } }
+-        $prev = $Global:KioskIntentTamper
+-        $n = $(if ($null -ne $prev) { [int]$prev["count"] + 1 } else { 1 })
+-        $Global:KioskIntentTamper = [ordered]@{ count = $n; lastUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); found = $(if ($null -eq $onDisk) { "missing" } else { "changed" }) }
+-        try { Write-Log ("[KIOSK] the intent file was {0} outside the agent; restored ({1} so far)" -f $Global:KioskIntentTamper.found, $n) "WARN" } catch { }
++            $fsI = New-Object IO.FileStream($KioskIntentPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
++            try { $srI = New-Object IO.StreamReader($fsI, (New-Object Text.UTF8Encoding($false))); $onDisk = $srI.ReadToEnd() } finally { $fsI.Dispose() }
++        } catch { $onDisk = $null }
++        if ($null -ne $onDisk -and $onDisk -ceq $exp) { $Global:KioskIntentPending = $false; return $false }
++        $wasPending = [bool]$Global:KioskIntentPending
++        [void](Write-KioskIntentText -Text $exp)
++        $Global:KioskIntentPending = $false
++        if ($wasPending) {
++            try { Write-Log "[KIOSK] the pending intent landed" "INFO" } catch { }
++            if ($null -ne $Global:KioskIntentLast) { $Global:KioskIntentLast["ok"] = $true; $Global:KioskIntentLast["pending"] = $false }
++        } else {
++            $prev = $Global:KioskIntentTamper
++            $n = $(if ($null -ne $prev) { [int]$prev["count"] + 1 } else { 1 })
++            $Global:KioskIntentTamper = [ordered]@{ count = $n; lastUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); found = $(if ($null -eq $onDisk) { "missing" } else { "changed" }) }
++            try { Write-Log ("[KIOSK] the intent file was {0} outside the agent; restored ({1} so far)" -f $Global:KioskIntentTamper.found, $n) "WARN" } catch { }
++        }
+         $Global:NextCapabilitiesUtc = [DateTime]::MinValue
+         return $true
+     } catch { return $false }
+@@ -5218,7 +5251,13 @@ function Set-KioskIntentForCommand {
+     [void](Test-KioskIntentIntegrity)
+     try {
+         $now = (Get-Date).ToUniversalTime()
+-        $cur = Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192
++        # Decide from what this agent last DECIDED (which is what the file says once any pending write lands), never
++        # from an older value a failed write left on disk (attack RF2).
++        $cur = $null
++        if ($null -ne $Global:KioskIntentExpectedText) {
++            try { $cur = @{ Ok = $true; Obj = (ConvertFrom-Json -InputObject $Global:KioskIntentExpectedText); Why = "" } } catch { $cur = $null }
++        }
++        if ($null -eq $cur) { $cur = Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192 }
+         $next = Get-KioskIntentForCommand -CommandType $CommandType -Mode $Mode -Payload $Payload -CurrentIntentRead $cur `
+             -SameSession $SameSession -EmergencyStopEngaged ([bool]$Global:EmergencyStopEngaged) -NowUtc $now
+         if ($null -eq $next) { return $null }
+@@ -5239,18 +5278,35 @@ function Initialize-KioskIntent([DateTime]$NowUtc) {
+     try {
+         $curRead = Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192
+         $cur = Get-KioskLauncherWanted -IntentRead $curRead -NowUtc $NowUtc
++        $diskText = $null
++        if ($curRead.Ok) {
++            try {
++                $fsS = New-Object IO.FileStream($KioskIntentPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
++                try { $srS = New-Object IO.StreamReader($fsS, (New-Object Text.UTF8Encoding($false))); $diskText = $srS.ReadToEnd() } finally { $fsS.Dispose() }
++            } catch { $diskText = $null }
++        }
+         if ($Global:EmergencyStopEngaged) {
+             if ($cur.Wanted) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId ([string]$cur.SessionId) -Reason "agent start: emergency stop engaged") }
+-            elseif (-not $curRead.Ok) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId "" -Reason "agent start: emergency stop engaged") }
+-            else { $Global:KioskIntentExpectedText = [IO.File]::ReadAllText($KioskIntentPath) }
++            elseif (-not $curRead.Ok -or $null -eq $diskText) { [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId "" -Reason "agent start: emergency stop engaged") }
++            else { $Global:KioskIntentExpectedText = $diskText }
+             return
+         }
+-        $l = $(if ($curRead.Ok) { Get-KioskProp $curRead.Obj "launcher" $null } else { $null })
+-        if ($l -is [string] -and $l -cin @("wanted", "closed", "unmanaged")) { $Global:KioskIntentExpectedText = [IO.File]::ReadAllText($KioskIntentPath); return }
+         $model = Read-SessionModelFromDisk
+         $status = [string](Get-KioskProp $model "status" "")
+         $end = ConvertTo-KioskUtc (Get-KioskProp $model "sessionEndUtc" $null)
+         $sid = [string](Get-KioskProp $model "baySessionId" "")
++        $l = $(if ($curRead.Ok) { Get-KioskProp $curRead.Obj "launcher" $null } else { $null })
++        if ($null -ne $diskText -and $l -is [string] -and $l -cin @("closed", "unmanaged")) { $Global:KioskIntentExpectedText = $diskText; return }
++        if ($null -ne $diskText -and $l -is [string] -and $l -ceq "wanted") {
++            # Adopted only when session.json backs it: the same session running, and no later end than that session's
++            # own end plus the grace (attack residual R1: a "wanted until 2099" written while the agent was down).
++            $backed = ($status -in @("ACTIVE", "ENDING") -and -not [string]::IsNullOrWhiteSpace($sid) -and [string]$cur.SessionId -ceq $sid -and
++                       $null -ne $end -and $null -ne $cur.UntilUtc -and $cur.UntilUtc -le $end.AddSeconds($KioskIntentGraceSeconds))
++            $expiredWanted = ($null -ne (ConvertTo-KioskUtc (Get-KioskProp $curRead.Obj "untilUtc" $null)) -and -not $cur.Wanted)
++            if ($backed -or $expiredWanted) { $Global:KioskIntentExpectedText = $diskText; return }
++            [void](Write-KioskIntent -Launcher "unmanaged" -UntilUtc $null -SessionId ([string]$cur.SessionId) -Reason "agent start: a wanted intent that session.json does not back")
++            return
++        }
+         if ($status -in @("ACTIVE", "ENDING") -and $null -ne $end -and $NowUtc -lt $end.AddSeconds($KioskIntentGraceSeconds)) {
+             [void](Write-KioskIntent -Launcher "wanted" -UntilUtc ($end.AddSeconds($KioskIntentGraceSeconds)) -SessionId $sid -Reason "agent start: session.json says $status")
+         } else {
+@@ -5289,6 +5345,7 @@ $Global:KioskReport = $null
+ $Global:KioskIntentLast = $null
+ $Global:KioskIntentExpectedText = $null
+ $Global:KioskIntentTamper = $null
++$Global:KioskIntentPending = $false
+ $Global:KioskStarts = [DateTime[]]@()
+ $Global:KioskNextReconcileUtc = [DateTime]::MinValue
+ 
+@@ -5461,6 +5518,16 @@ function Get-KioskCapability {
+     } catch { }
+     $k["signerKnown"] = (-not [string]::IsNullOrWhiteSpace([string]$Global:KioskSignerThumbprint))
+     $k["intentRestored"] = $Global:KioskIntentTamper
++    $k["intentPending"] = [bool]$Global:KioskIntentPending
++    # The shell reads session.json at the LOCAL config's path; a platform overlay that moved it would leave the shell
++    # unable to confirm any session (it then neither restarts nor closes anything). Say so if they differ.
++    try {
++        $localSj = $null
++        $lr = Read-KioskJsonFile -Path $CfgPath -MaxBytes 262144
++        if ($lr.Ok) { $localSj = Get-KioskProp $lr.Obj "sessionJsonPath" $null }
++        if ($localSj -isnot [string] -or [string]::IsNullOrWhiteSpace($localSj)) { $localSj = "C:\AllBirdies\SessionDisplay\data\session.json" }
++        $k["sessionJsonPathSharedWithShell"] = ([IO.Path]::GetFullPath([string](Get-SessionJsonPath)) -ieq [IO.Path]::GetFullPath($localSj))
++    } catch { $k["sessionJsonPathSharedWithShell"] = $null }
+     return $k
+ }
+ 
+diff --git a/src/BayAgent/kiosk/ABG.KioskShell.ps1 b/src/BayAgent/kiosk/ABG.KioskShell.ps1
+index 1a72b51..f4d98b0 100644
+--- a/src/BayAgent/kiosk/ABG.KioskShell.ps1
++++ b/src/BayAgent/kiosk/ABG.KioskShell.ps1
+@@ -20,10 +20,11 @@ WHAT THIS RELEASE DOES AND DOES NOT DO
+ 
+ RULES IT KEEPS (each one is a test)
+   - It restarts the launcher only while state\kiosk-intent.json says "wanted" AND the time is before its untilUtc.
+-  - It closes a launcher ONLY under an explicit "closed" intent (written by EndSession of the running session and by a
+-    Reset outside a session), 15 s after it was written (EndSession closes the launcher itself first): the backstop for
+-    a member who relaunches the launcher from the desktop after the end (bench Part B Test 11; A0.360 "the launcher
+-    appears only from session start to play end"). By process id, only the configured launcher in this session.
++  - It closes a launcher ONLY under an explicit "closed" intent (written only by the EndSession of the running session),
++    15 s after it was written (EndSession closes the launcher itself first), AND only while session.json shows no other
++    session running: the backstop for a member who relaunches the launcher from the desktop after the end (bench Part B
++    Test 11; A0.360 "the launcher appears only from session start to play end"). By process id, only the configured
++    launcher (name and path) in this session.
+   - Anything unreadable, absent, expired, "unmanaged" or unknown means hands off: never restart, never close. It stops
+     no other process. With one screen it moves the wall display aside (minimizes it) rather than closing it.
+   - It takes its program paths and screen roles from the LOCAL agent-config.json only, never from the platform.
+@@ -118,8 +119,16 @@ function Read-KioskJsonFile([string]$Path, [int]$MaxBytes = 65536) {
+     $r = @{ Ok = $false; Obj = $null; Why = "" }
+     try {
+         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $r.Why = "absent"; return $r }
+-        $bytes = [IO.File]::ReadAllBytes($Path)
+-        if ($bytes.Length -gt $MaxBytes) { $r.Why = "larger than $MaxBytes bytes"; return $r }
++        # Opened with every share flag, so a reader never makes the writer's atomic replace fail (attack RF2, 2026-10-08).
++        $fsR = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
++        $bytes = $null
++        try {
++            if ($fsR.Length -gt $MaxBytes) { $r.Why = "larger than $MaxBytes bytes"; return $r }
++            $bytes = New-Object byte[] ([int]$fsR.Length)
++            $got = 0
++            while ($got -lt $bytes.Length) { $n = $fsR.Read($bytes, $got, $bytes.Length - $got); if ($n -le 0) { break }; $got += $n }
++            if ($got -ne $bytes.Length) { $r.Why = "short read"; return $r }
++        } finally { $fsR.Dispose() }
+         $start = 0
+         if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
+         for ($i = $start; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -eq 0) { $r.Why = "contains NUL bytes"; return $r } }
+@@ -186,7 +195,7 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
+     # Three answers, read strictly:
+     #   Wanted   only for an exact "wanted" whose untilUtc (with its zone) is in the future: the shell restarts it.
+     #   Closed   only for an exact "closed" with a readable writtenUtc: no session may play (written by EndSession of the
+-    #            running session, and by Reset outside a session); the shell closes a launcher that appears (A0.360).
++    #            running session only); the shell closes a launcher that appears (A0.360), if session.json agrees.
+     #   neither  ("unmanaged", "not_wanted", expired, unreadable, unknown): hands off, never restart, never close.
+     # A failure to read is never a reason to close anything. Newer schemas are read by field name.
+     $w = @{ Wanted = $false; Closed = $false; ClosedSinceUtc = $null; Reason = ""; UntilUtc = $null; SessionId = $null }
+@@ -218,6 +227,61 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
+     return $w
+ }
+ 
++function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime]$NowUtc, [int]$GraceSeconds = 120) {
++    # The SECOND source a close needs (attack RF1/RF2, 2026-10-08): session.json, which BayAgent writes at every session
++    # command, must not show a DIFFERENT session still running. A closed intent left over from session A while session B
++    # plays (a failed intent write, an event that moved B off "wanted") is then never acted on. Unreadable, absent or
++    # without a status: cannot tell, nothing is closed (toward free play, never toward ending a game). @{ AllowClose; Why }
++    if ($null -eq $SessionRead -or -not $SessionRead.Ok) {
++        $why = $(if ($null -ne $SessionRead) { [string]$SessionRead.Why } else { "no read" })
++        return @{ AllowClose = $false; Why = "session.json unreadable ($why): cannot tell, nothing closed" }
++    }
++    $o = $SessionRead.Obj
++    $status = Get-KioskProp $o "status" $null
++    if ($status -isnot [string]) { return @{ AllowClose = $false; Why = "session.json has no status: cannot tell, nothing closed" } }
++    # ALLOWLIST (security review "fail-open guard", 2026-10-08): only the statuses BayAgent writes when nobody plays allow
++    # a close. Anything else holds: ACTIVE or ENDING (whichever session, even the one the intent says ended, even past
++    # its end: the two sources disagree, so neither is trusted to end a game), STOP, or an unknown value.
++    if ($status -cin @("ENDED", "READY", "PREP")) { return @{ AllowClose = $true; Why = "no session running (status $status)" } }
++    $sid = Get-KioskProp $o "baySessionId" $null
++    return @{ AllowClose = $false; Why = ("session.json says '{0}' (session '{1}'): the closed intent (session '{2}') is not acted on" -f $status, $sid, $ClosedSessionId) }
++}
++
++function Get-KioskSessionBacksWanted($SessionRead, [string]$WantedSessionId) {
++    # The second source a RESTART needs (security review "source divergence", 2026-10-08): the shell acts on the intent
++    # FILE, while the agent decides from what it last decided; if a write of "closed" (End) failed, the file can still say
++    # "wanted" for a session the agent has ended. session.json, written by the same command before the intent, must show
++    # that same session ACTIVE or ENDING. Anything else, unreadable included: no restart (toward not reopening, never
++    # toward free play). @{ Backed; Why }
++    if ($null -eq $SessionRead -or -not $SessionRead.Ok) {
++        $why = $(if ($null -ne $SessionRead) { [string]$SessionRead.Why } else { "no read" })
++        return @{ Backed = $false; Why = "session.json unreadable ($why): no restart" }
++    }
++    $o = $SessionRead.Obj
++    $status = Get-KioskProp $o "status" $null
++    $sid = Get-KioskProp $o "baySessionId" $null
++    if ($status -isnot [string] -or $status -cnotin @("ACTIVE", "ENDING")) { return @{ Backed = $false; Why = ("session.json says '{0}': no restart" -f $status) } }
++    if ($sid -isnot [string] -or [string]::IsNullOrWhiteSpace($sid) -or [string]::IsNullOrWhiteSpace($WantedSessionId) -or $sid -cne $WantedSessionId) {
++        return @{ Backed = $false; Why = ("session.json runs session '{0}', the intent wants '{1}': no restart" -f $sid, $WantedSessionId) }
++    }
++    return @{ Backed = $true; Why = "session.json runs the wanted session" }
++}
++
++function Test-KioskIsConfiguredLauncher($Proc, $Cfg, [int]$SessionId) {
++    # A process the closer may act on: the configured launcher by name AND by full path (a bare name from the bay-writable
++    # config could otherwise point the closer at the agent, the shell or the desktop: attack residual R2), in this
++    # session, and never a system or ABG process.
++    try {
++        $name = [string]$Proc.ProcessName
++        if ($name -in @("powershell", "pwsh", "explorer", "msedge", "msedgewebview2", "winlogon", "csrss", "lsass", "services", "svchost", "dwm", "conhost", "cmd", "taskmgr", "userinit", "sihost", "ctfmon", "runtimebroker", "bayagent")) { return $false }
++        if ($name -ine [string]$Cfg.LauncherName) { return $false }
++        if ([int]$Proc.SessionId -ne $SessionId) { return $false }
++        $path = $null; try { $path = [string]$Proc.Path } catch { $path = $null }
++        if ([string]::IsNullOrWhiteSpace($path)) { return $false }
++        return ([IO.Path]::GetFullPath($path) -ieq [IO.Path]::GetFullPath([string]$Cfg.LauncherPath))
++    } catch { return $false }
++}
++
+ function Get-KioskCountInWindow([DateTime[]]$Times, [DateTime]$NowUtc, [int]$WindowSeconds) {
+     $cut = $NowUtc.AddSeconds(-1 * $WindowSeconds)
+     return @(@($Times) | Where-Object { $_ -gt $cut }).Count
+@@ -396,11 +460,13 @@ function Read-KioskLocalConfig([string]$Path) {
+         WallMode         = "kiosk"
+         ControlSelector  = $null
+         SessionSelector  = $null
++        SessionJsonPath  = "C:\AllBirdies\SessionDisplay\data\session.json"
+     }
+     $read = Read-KioskJsonFile -Path $Path -MaxBytes 262144
+     if (-not $read.Ok) { $c.Source = "defaults (agent-config.json " + $read.Why + ")"; return $c }
+     $c.Source = "agent-config.json"
+     $o = $read.Obj
++    $v = Get-KioskProp $o "sessionJsonPath" $null; if ($v -is [string] -and -not [string]::IsNullOrWhiteSpace($v)) { $c.SessionJsonPath = $v.Trim() }
+     $l = Get-KioskProp $o "launcher" $null
+     $v = Get-KioskProp $l "path" $null; if ($v -is [string] -and -not [string]::IsNullOrWhiteSpace($v)) { $c.LauncherPath = $v.Trim() }
+     $v = Get-KioskProp $l "args" $null; if ($v -is [string]) { $c.LauncherArgs = $v }
+@@ -653,6 +719,7 @@ function New-KioskState {
+         LauncherPlaceUntil = $null
+         LauncherPlacedSig = ""
+         Closing           = @{}
++        CloseHeld         = $null
+         WallPids          = @()
+         WallRunning       = $false
+         WallStarts        = [DateTime[]]@()
+@@ -700,6 +767,7 @@ function Write-KioskHeartbeat($S, [DateTime]$NowUtc, [switch]$Force) {
+                 wanted   = $(if ($null -ne $S.Wanted) { [bool]$S.Wanted.Wanted } else { $false })
+                 closed   = $(if ($null -ne $S.Wanted) { [bool]$S.Wanted.Closed } else { $false })
+                 closing  = @($S.Closing.Keys)
++                closeHeld = $S.CloseHeld
+                 reason   = $(if ($null -ne $S.Wanted) { $S.Wanted.Reason } else { $null })
+                 untilUtc = $(if ($null -ne $S.Wanted -and $null -ne $S.Wanted.UntilUtc) { $S.Wanted.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { $null })
+                 running  = $launcherRunning
+@@ -732,6 +800,10 @@ function Close-KioskLauncher($S, [object[]]$Procs, [DateTime]$NowUtc) {
+     foreach ($p in @($Procs)) {
+         $procId = [int]$p.Id
+         $st = $null; try { $st = $p.StartTime.ToUniversalTime() } catch { $st = $null }
++        if (-not (Test-KioskIsConfiguredLauncher -Proc $p -Cfg $S.Cfg -SessionId $S.SessionId)) {
++            Write-KioskLog ("pid {0} is not the configured launcher (name, path or session): left alone" -f $procId) "WARN" ("notlauncher-" + $procId)
++            continue
++        }
+         if (-not $S.Closing.ContainsKey($procId)) {
+             $S.Closing[$procId] = @{ First = $NowUtc; Start = $st }
+             try { [void]$p.CloseMainWindow() } catch { }
+@@ -745,7 +817,7 @@ function Close-KioskLauncher($S, [object[]]$Procs, [DateTime]$NowUtc) {
+         $S.Closing.Remove($procId)
+         if ($null -eq $fresh) { continue }
+         $fst = $null; try { $fst = $fresh.StartTime.ToUniversalTime() } catch { $fst = $null }
+-        if ($fresh.ProcessName -ine [string]$S.Cfg.LauncherName -or $fresh.SessionId -ne $S.SessionId -or $null -eq $fst -or $fst -ne $rec.Start) {
++        if (-not (Test-KioskIsConfiguredLauncher -Proc $fresh -Cfg $S.Cfg -SessionId $S.SessionId) -or $null -eq $fst -or $fst -ne $rec.Start) {
+             Write-KioskLog ("pid {0} is no longer the launcher it was; left alone" -f $procId) "WARN"
+             continue
+         }
+@@ -794,6 +866,11 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
+ 
+     # ---- launcher ----
+     $S.Wanted = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath -MaxBytes 8192) -NowUtc $NowUtc
++    if ($S.Wanted.Wanted) {
++        # Two sources must agree before the shell (re)starts a launcher: the intent AND session.json.
++        $backing = Get-KioskSessionBacksWanted -SessionRead (Read-KioskJsonFile -Path $S.Cfg.SessionJsonPath -MaxBytes 262144) -WantedSessionId ([string]$S.Wanted.SessionId)
++        if (-not $backing.Backed) { $S.Wanted.Wanted = $false; $S.Wanted.Reason = "intent wanted but " + $backing.Why }
++    }
+     Write-KioskLog ("launcher " + $(if ($S.Wanted.Wanted) { "wanted until " + $S.Wanted.UntilUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } elseif ($S.Wanted.Closed) { "closed (no session) since " + $S.Wanted.ClosedSinceUtc.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { "hands off (" + $S.Wanted.Reason + ")" })) "INFO" "wanted"
+     $procs = @(Get-KioskProcessesInSession -Name $S.Cfg.LauncherName -SessionId $S.SessionId)
+     if ($procs.Count -gt 0) {
+@@ -810,7 +887,13 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
+         -PathExists (Test-Path -LiteralPath $S.Cfg.LauncherPath -PathType Leaf) -Closed ([bool]$S.Wanted.Closed) -ClosedForSeconds $closedFor -CloseGraceSeconds $KioskCloseGraceSeconds
+     if ($action -ne "close" -and $S.Closing.Count -gt 0) { $S.Closing.Clear() }
+     switch ($action) {
+-        "close" { Close-KioskLauncher -S $S -Procs $procs -NowUtc $NowUtc }
++        "close" {
++            # Two sources must agree before a game is ended: the closed intent AND session.json showing no other session.
++            $guard = Get-KioskSessionGuard -SessionRead (Read-KioskJsonFile -Path $S.Cfg.SessionJsonPath -MaxBytes 262144) -ClosedSessionId ([string]$S.Wanted.SessionId) -NowUtc $NowUtc
++            $S.CloseHeld = $(if ($guard.AllowClose) { $null } else { $guard.Why })
++            if ($guard.AllowClose) { Close-KioskLauncher -S $S -Procs $procs -NowUtc $NowUtc }
++            else { $S.Closing.Clear(); Write-KioskLog ("close held: " + $guard.Why) "WARN" "close-held" }
++        }
+         "start" {
+             $keep = $NowUtc.AddSeconds(-2 * $KioskLauncherStartWindowSec)
+             $S.LauncherStarts = [DateTime[]]@(@(@($S.LauncherStarts) | Where-Object { $_ -gt $keep }) + $NowUtc)

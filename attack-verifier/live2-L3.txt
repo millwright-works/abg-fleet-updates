@@ -1,0 +1,17 @@
+after A End: intent {"launcher":"closed","baySessionId":"S-A","reason":"EndSession"}
+    [agent log WARN] [KIOSK] intent 'wanted' could not be written (retried every pass until it lands): Exception calling "Copy" with "3" argument(s): "The process cannot access the file 'C:\Users\kedah\AppData\Local\Temp\kiosk-verif-live2-ae2e0c41\state\kiosk-intent.json' because it is being used by another process."
+B Start: written=False; file still says {"launcher":"closed","baySessionId":"S-A","reason":"EndSession"}
+paying member's launcher pid 27804
+shell pid 20716
+canceled-booking Reset while B's write still fails: session.json READY
+after the window: pending=True; intent {"launcher":"closed","baySessionId":"S-A","reason":"EndSession"}
+RESULT L3: paying member's launcher ENDED after 12.3 s
+---- shell log
+  2026-10-09T01:36:14Z [INFO] kiosk shell 1.4.0 starting (pid 20716, session 1, role companion)
+  2026-10-09T01:36:14Z [INFO] config: agent-config.json; launcher AbgVerifLaunch9347c1 at C:\Users\kedah\AppData\Local\Temp\kiosk-verif-live2-ae2e0c41\AbgVerifLaunch9347c1.exe
+  2026-10-09T01:36:14Z [INFO] supervision: on (companion)
+  2026-10-09T01:36:14Z [INFO] launcher closed (no session) since 2026-10-09T01:36:12Z
+  2026-10-09T01:36:14Z [INFO] screens: 1 [\\.\DISPLAY1|P|0,0,1920x1080]
+  2026-10-09T01:36:14Z [INFO] wall plan: none
+  2026-10-09T01:36:27Z [WARN] launcher pid 27804 is running with no session (intent closed): asked it to close
+  2026-10-09T01:36:35Z [WARN] launcher pid 27804 did not close within 8 s with no session: ended

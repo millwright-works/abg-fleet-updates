@@ -1,0 +1,13 @@
+﻿# run started 2026-10-09T01:37:49.5789023Z repo C:\aoc-wt\kiosk-attack-r2 HEAD 1f09df7
+M00u	SURVIVED	SURVIVED	unit	11s	baseline	347 passed, 0 failed; first: 
+A12b	KILLED	KILLED	unit	9s	agent start adopts a wanted intent session.json does not back (R1)	345 passed, 2 failed; first: a 'wanted until 2099' found at start (written while the agent was down): unmanaged (R1)
+A15	KILLED	KILLED	unit	9s	RF1 insecure form: a Reset writes closed unless the intent reads wanted	340 passed, 7 failed; first: Reset over nothing on disk: no change, never closed (RF1)
+A15b	KILLED	KILLED	unit	10s	a Reset always writes closed	338 passed, 9 failed; first: Reset over nothing on disk: no change, never closed (RF1)
+F01	KILLED	KILLED	unit	9s	RF2 insecure form: the baseline is set only after a successful write	345 passed, 2 failed; first: E5 a later command decides from B's pending wanted, not A's closed left on disk (an extension of B is still applied)
+F02	KILLED	KILLED	unit	9s	commands decide from the file, not the pending decision	346 passed, 1 failed; first: E5 a later command decides from B's pending wanted, not A's closed left on disk (an extension of B is still applied)
+F04	KILLED	KILLED	unit	9s	an unreadable session.json allows a close	346 passed, 1 failed; first: session.json absent or unreadable: hold (cannot tell)
+F05	KILLED	KILLED	unit	9s	a running or unknown status allows a close	338 passed, 9 failed; first: E5 the shell holds: session.json shows B running, so A's closed is not acted on
+G01	KILLED	KILLED	unit	9s	source divergence (review): ACTIVE for another session backs a restart	346 passed, 1 failed; first: ACTIVE for ANOTHER session: no restart for this one
+F08	KILLED	KILLED	unit	9s	the launcher path is not matched (R2)	346 passed, 1 failed; first: the configured NAME but another PATH (attack R2: a bare name in the bay-writable config): NOT ended, never even asked
+F09	KILLED	KILLED	unit	9s	the deny list is removed (R2)	346 passed, 1 failed; first: a config naming powershell or pwsh (this test's own process, exact path): never a launcher
+# run finished 2026-10-09T01:39:35.2626969Z notApplied=0

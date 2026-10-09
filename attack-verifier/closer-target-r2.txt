@@ -1,0 +1,5 @@
+own powershell, cfg name powershell + its real path : False
+explorer, cfg name explorer + its real path         : False
+stand-in, right name + right path                    : True
+stand-in, right name + OTHER path                    : False
+stand-in, path given in other case/8.3-free form     : True

@@ -1,0 +1,13 @@
+paying member's launcher pid 11408
+shell pid 22104
+e-stop engaged+cleared, then canceled-booking Reset (session.json READY): intent {"launcher":"unmanaged","baySessionId":"S-PAID","reason":"emergency stop engaged"}
+RESULT L1: paying member's launcher still running after 45.5 s
+---- shell log
+  2026-10-09T01:34:03Z [INFO] kiosk shell 1.4.0 starting (pid 22104, session 1, role companion)
+  2026-10-09T01:34:03Z [INFO] config: agent-config.json; launcher AbgVerifLaunchf1bb8b at C:\Users\kedah\AppData\Local\Temp\kiosk-verif-live2-540abaad\AbgVerifLaunchf1bb8b.exe
+  2026-10-09T01:34:03Z [INFO] supervision: on (companion)
+  2026-10-09T01:34:03Z [INFO] launcher wanted until 2026-10-09T02:21:01Z
+  2026-10-09T01:34:03Z [INFO] screens: 1 [\\.\DISPLAY1|P|0,0,1920x1080]
+  2026-10-09T01:34:03Z [INFO] wall plan: none
+  2026-10-09T01:34:10Z [INFO] launcher hands off (intent says not wanted)
+  2026-10-09T01:34:14Z [INFO] launcher placement: placed on \\.\DISPLAY1
