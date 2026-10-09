@@ -269,7 +269,7 @@ try {
     Assert-True (@($sync["Requests"] | Where-Object { $_.method -eq "PATCH" -and $_.path -match "build_baies\($BayId\)" -and $_.auth -eq $newTok }).Count -eq 1) "proof: this bay's heartbeat written as the new identity"
     $probe = @($sync["Requests"] | Where-Object { $_.method -eq "PATCH" -and $_.path -match "build_baycommands\(cmd-1\)" -and $_.auth -eq $newTok })
     Assert-True ($probe.Count -eq 1 -and $probe[0].body -match "build_resultjson") "proof: the command guard probe is an execution-field write on THIS command, as the new identity"
-    Assert-True ($null -eq $Global:AccessToken) "the cached token is dropped"
+    Assert-True ($Global:TokenExpiresUtc -le [DateTime]::UtcNow) "the cached token is expired (the next call re-mints)"
     Assert-True ((Get-CredentialTelemetry).activeClientId -eq $OwnApp) "telemetry names the bay's own app (the operator ladder reads it)"
 
     $refusals = @(
@@ -342,7 +342,7 @@ try {
     Assert-True ($null -eq (Get-PropValue $st "identityProbation" $null)) "probation closed"
     Assert-True ([string]$st.identityReverted.fromClientId -eq $OwnApp -and [string]$st.identityReverted.reason -match "^auto:") "the revert is recorded with its reason"
     Assert-True (@($st.superseded) -contains $pc.Thumbprint) "the left certificate stays recorded (retirable)"
-    Assert-True ($null -eq $Global:AccessToken) "the cached token is dropped"
+    Assert-True ($Global:TokenExpiresUtc -le [DateTime]::UtcNow) "the cached token is expired (the next call re-mints)"
 
     Section "I8 an outage is not a refusal: a probation is never reverted by a network failure"
     $null = Open-Probation

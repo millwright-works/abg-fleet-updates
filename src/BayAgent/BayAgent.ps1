@@ -1344,7 +1344,8 @@ function Invoke-IdentityRevert {
         superseded        = $sup
         identityReverted  = [ordered]@{ utc = $nowStr; reason = $Reason; fromClientId = $fromClient; fromThumbprint = $fromTp }
     } | Out-Null
-    Set-Variable -Name AccessToken -Scope Global -Value $null
+    # Expiring the cached token is enough: Get-AccessToken re-mints when the expiry has passed (the e-stop latch writer
+    # census pins every dynamic variable write, so no Set-Variable here).
     $Global:TokenExpiresUtc = [DateTime]::MinValue
     $Global:IdentityProbationFailures = 0
     Write-Log ("[IDENTITY] REVERTED from app {0} to {1}: {2}" -f $fromClient, $(if ($prevTp) { "certificate $prevTp" } else { "the configured credential" }), $Reason) "ERROR"
