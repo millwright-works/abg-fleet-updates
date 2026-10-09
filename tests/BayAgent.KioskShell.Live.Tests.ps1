@@ -249,7 +249,7 @@ try {
     $sh = Start-Shell
     Assert-True (Wait-Until { $h = Read-Hb; $null -ne $h -and $h.supervising -eq $true } 15) "heartbeat written and supervising"
     $h = Read-Hb
-    Assert-True ($null -ne $h -and $h.role -eq "companion" -and $h.policyMode -eq "companion" -and $h.pid -eq $sh.Id -and $h.version -eq "1.4.0") "role companion, policy companion, its own pid, version 1.4.0"
+    Assert-True ($null -ne $h -and $h.role -eq "companion" -and $h.policyMode -eq "companion" -and $h.pid -eq $sh.Id -and $h.version -eq "1.5.0") "role companion, policy companion, its own pid, version 1.5.0"
     Assert-True ($null -ne $h -and $h.sha256 -match '^[0-9a-f]{64}$') "it reports the sha256 of the file it runs"
     Start-Sleep -Seconds 6
     Assert-True (@(Get-Ours $LaunchName).Count -eq 0) "no intent: the launcher was not started (6 s)"

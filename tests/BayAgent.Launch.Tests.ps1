@@ -492,9 +492,9 @@ try {
         $cfgText = [IO.File]::ReadAllText((Join-Path $l7.Root "agent-config.json")).Replace("SANDBOX_SESSION_JSON", ((Join-Path $l7.Root "session.json") -replace '\\', '\\'))
         [IO.File]::WriteAllText((Join-Path $l7.Root "agent-config.json"), $cfgText, (New-Object Text.UTF8Encoding($false)))
         New-Item -ItemType Directory -Force -Path (Join-Path $l7.Root "current\kiosk") | Out-Null
-        New-Item -ItemType Directory -Force -Path (Join-Path $l7.Root "releases\1.4.0\kiosk") | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $l7.Root "releases\1.5.0\kiosk") | Out-Null
         [IO.File]::WriteAllText((Join-Path $l7.Root "current\kiosk\kiosk-policy.json"), ("{`"schema`":1,`"mode`":`"$kmode`",`"minShellBytes`":4096}"), (New-Object Text.UTF8Encoding($false)))
-        $shellCopy7 = Join-Path $l7.Root "releases\1.4.0\kiosk\ABG.KioskShell.ps1"
+        $shellCopy7 = Join-Path $l7.Root "releases\1.5.0\kiosk\ABG.KioskShell.ps1"
         [IO.File]::WriteAllText($shellCopy7, ([IO.File]::ReadAllText($shellSrc).Replace('$BaseDir = "C:\AllBirdies\BayAgent"', ('$BaseDir = "{0}"' -f $l7.Root))), (New-Object Text.UTF8Encoding($false)))
         $r7 = Start-BayAgentLikeAgentHost -Install $l7 -BoundingSwitch "-Once"
         Show-Evidence $r7 ("L7-" + $kcase)

@@ -61,7 +61,7 @@ $ErrorActionPreference = "Stop"
 # ---------------- Paths (one literal; the launch test repoints exactly this line) ----------------
 $BaseDir = "C:\AllBirdies\BayAgent"
 
-$KioskShellCodeVersion = "1.4.0"
+$KioskShellCodeVersion = "1.5.0"
 # THE AUTHORITY FOR THE MODE IS THIS LINE OF SIGNED CODE (twin of BayAgent.ps1's $KioskReleaseMode; the build refuses a
 # package where they and kiosk-policy.json disagree). The policy file is writable by the bay account and, in companion
 # mode, reachable from the desktop: it may only turn the kiosk OFF, never on.

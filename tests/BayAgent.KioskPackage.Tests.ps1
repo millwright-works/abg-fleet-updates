@@ -42,7 +42,7 @@ function New-Tree {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "tools\Build-ReleasePackage.ps1") -Destination (Join-Path $root "tools\Build-ReleasePackage.ps1") -Force
     return $root
 }
-function Invoke-Build([string]$root, [string]$version = "1.4.0") {
+function Invoke-Build([string]$root, [string]$version = "1.5.0") {
     $out = Join-Path $root "dist"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ps51
@@ -80,7 +80,7 @@ try {
             }
             $pe = $z.GetEntry("kiosk/kiosk-policy.json"); $ms2 = New-Object IO.MemoryStream; $s2 = $pe.Open(); try { $s2.CopyTo($ms2) } finally { $s2.Dispose() }
             $pol = [Text.Encoding]::UTF8.GetString($ms2.ToArray()) | ConvertFrom-Json
-            Assert-True ($pol.mode -ceq "explorer") "the shipped policy is explorer: 1.4.0 is DORMANT"
+            Assert-True ($pol.mode -ceq "explorer") "the shipped policy is explorer: 1.5.0 is DORMANT"
         } finally { $z.Dispose() }
         $sha1 = Get-Sha $b1.Zip
         Remove-Item -LiteralPath $b1.Zip -Force
@@ -126,9 +126,9 @@ try {
     Section "P4 the shell's version constant must match"
     $t = New-Tree
     $sp = Join-Path $t "src\BayAgent\kiosk\ABG.KioskShell.ps1"
-    [IO.File]::WriteAllText($sp, ([IO.File]::ReadAllText($sp).Replace('$KioskShellCodeVersion = "1.4.0"', '$KioskShellCodeVersion = "1.3.9"')), (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($sp, ([IO.File]::ReadAllText($sp).Replace('$KioskShellCodeVersion = "1.5.0"', '$KioskShellCodeVersion = "1.3.9"')), (New-Object Text.UTF8Encoding($false)))
     $b = Invoke-Build $t
-    Assert-True ($b.Exit -ne 0 -and $b.Out -match "KioskShellCodeVersion = '1.3.9'") "a shell saying 1.3.9 in a 1.4.0 package is refused"
+    Assert-True ($b.Exit -ne 0 -and $b.Out -match "KioskShellCodeVersion = '1.3.9'") "a shell saying 1.3.9 in a 1.5.0 package is refused"
 
     Section "P5 a builder that drops the kiosk policy from its entries refuses to build"
     $t = New-Tree
