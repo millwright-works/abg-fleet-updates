@@ -780,7 +780,7 @@ try {
     # ============================================================ K13
     Section "K13 the command handlers reach the intent and the deferral (Execute-Command run with stubs)"
     foreach ($n in @("Execute-Command", "Try-ParseJson", "Get-BayLabel", "Set-PropValue", "To-Hashtable", "Merge-Hashtables", "Build-SessionDisplayPatchFromPayload",
-                     "Normalize-SessionModel", "UtcNow-Z", "Get-HelpText", "Get-LauncherConfigFromPayloadOrConfig", "Write-SessionFiles", "Set-EmergencyStopBanner", "Get-SessionJsPath")) {
+                     "Normalize-SessionModel", "UtcNow-Z", "Get-HelpText", "Get-LauncherConfigFromPayloadOrConfig", "Write-SessionFiles", "Set-EmergencyStopBanner", "Get-SessionJsPath", "Get-ResetGate", "Read-SessionModelFromDisk")) {
         . ([scriptblock]::Create((Get-DefText $AgentDefs $n)))
     }
     $BayId = "33333333-3333-3333-3333-333333333333"
@@ -903,6 +903,57 @@ try {
     $resEndB = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-B") -BayLabel "Bay"
     Assert-True ((Get-IntentNow).Closed) "B's own End: closed"
 
+    # ---- K18b: R7 and RR1 (attack 2026-10-08). A Reset for a canceled booking is tied to its own session: it never
+    # rewrites the wall (session.json), restarts the display, moves the facility or touches the intent while a DIFFERENT
+    # session runs on the bay.
+    Section "K18b R7/RR1: a Reset for another booking leaves a running session's wall, display and facility alone"
+    $script:DisplayStops = 0; $script:FacilityCalls = 0
+    function Invoke-FacilitySetMode { param([string]$Mode, $payloadObj) $script:FacilityCalls++; return @{ ok = $true; scene = $Mode } }
+    function Start-SessionDisplay($payloadObj) { $script:DisplayStops++; return @{ started = $false; reason = "stub" } }
+    function Stop-SessionDisplay { $script:DisplayStops++; return @{ stopped = $false; reason = "stub" } }
+    $sessPath = Join-Path $Sandbox "session.json"
+    function Get-SessNow { return ([IO.File]::ReadAllText($sessPath) | ConvertFrom-Json) }
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-r7") -BayLabel "Bay")
+    $before = [IO.File]::ReadAllText($sessPath)
+    $script:DisplayStops = 0; $script:FacilityCalls = 0
+    $r7 = Execute-Command -CommandType $CMD_RESET -PayloadJson $resetJson -BayLabel "Bay"
+    Assert-True ($r7.reset -eq $false -and $r7.skipped -eq $true -and $r7.runningSessionId -eq "s-r7") "R7 Reset (BookingCanceled, no session id) while s-r7 plays: skipped, and the result says who is running"
+    Assert-True ((Get-SessNow).status -eq "ACTIVE" -and (Get-SessNow).baySessionId -eq "s-r7" -and [IO.File]::ReadAllText($sessPath) -ceq $before) "R7 the wall's session.json is byte for byte unchanged (still ACTIVE s-r7, not READY)"
+    Assert-True ($script:DisplayStops -eq 0 -and $script:FacilityCalls -eq 0) "R7 no display stop/start and no facility change"
+    Assert-True ((Get-IntentNow).Wanted -and (Get-IntentNow).SessionId -eq "s-r7") "R7 the launcher signal (intent) still wanted for s-r7"
+    $rN = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","baySessionId":"s-other"}' -BayLabel "Bay"
+    Assert-True ($rN.reset -eq $false -and (Get-SessNow).status -eq "ACTIVE") "R7 a Reset naming a DIFFERENT session: skipped"
+    $rS = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","baySessionId":"s-r7"}' -BayLabel "Bay"
+    Assert-True ($rS.reset -eq $true -and (Get-SessNow).status -eq "READY") "R7 a Reset naming the running session itself proceeds (the wall goes READY)"
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-r7b") -BayLabel "Bay")
+    $rF = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","force":true}' -BayLabel "Bay"
+    Assert-True ($rF.reset -eq $true -and (Get-SessNow).status -eq "READY") "R7 an operator's force=true Reset proceeds"
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-r7c") -BayLabel "Bay")
+    [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-r7c") -BayLabel "Bay")
+    $rE = Execute-Command -CommandType $CMD_RESET -PayloadJson $resetJson -BayLabel "Bay"
+    Assert-True ($rE.reset -eq $true -and (Get-SessNow).status -eq "READY") "R7 a canceled booking's Reset when nobody plays (after an End): still resets the wall to READY"
+    # RR1 (L3): A ends (closed A); B's Start write keeps failing (file held open); a canceled booking's Reset arrives.
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-LA") -BayLabel "Bay")
+    [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-LA") -BayLabel "Bay")
+    $lock3 = New-Object IO.FileStream($KioskIntentPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-LB") -BayLabel "Bay")
+        [void](Execute-Command -CommandType $CMD_RESET -PayloadJson $resetJson -BayLabel "Bay")
+        Assert-True ((Get-SessNow).status -eq "ACTIVE" -and (Get-SessNow).baySessionId -eq "s-LB") "RR1 L3 the Reset during a failing intent write leaves session.json ACTIVE s-LB (not READY)"
+        Assert-True ((Get-ShellVerdictNow) -eq "held") "RR1 L3 the shell holds A's stale closed (B plays): B's game is not ended"
+    } finally { $lock3.Dispose() }
+    [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-LB") -BayLabel "Bay")
+    # The gate itself, pure.
+    $nR = (Get-Date).ToUniversalTime(); $fut = $nR.AddMinutes(30).ToString("yyyy-MM-ddTHH:mm:ssZ"); $old = $nR.AddMinutes(-20).ToString("yyyy-MM-ddTHH:mm:ssZ"); $recent = $nR.AddMinutes(-5).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    function Get-RG($m, $pl) { return (Get-ResetGate -SessionModel ([pscustomobject]$m) -Payload ([pscustomobject]$pl) -NowUtc $nR) }
+    Assert-True ((Get-ResetGate -SessionModel $null -Payload ([pscustomobject]@{}) -NowUtc $nR).Proceed) "gate: no session.json: proceed"
+    Assert-True (-not (Get-RG @{ status = "ENDING"; baySessionId = "s-x"; sessionEndUtc = $fut } @{}).Proceed) "gate: ENDING, no id: hold"
+    Assert-True (-not (Get-RG @{ status = "ACTIVE"; baySessionId = "s-x"; sessionEndUtc = $recent } @{}).Proceed) "gate: ACTIVE 5 minutes past its end (End late): hold"
+    Assert-True ((Get-RG @{ status = "ACTIVE"; baySessionId = "s-x"; sessionEndUtc = $old } @{}).Proceed) "gate: ACTIVE 20 minutes past its end and no End ever: proceed (the bay is recoverable)"
+    Assert-True (-not (Get-RG @{ status = "ACTIVE"; baySessionId = "s-x" } @{}).Proceed) "gate: ACTIVE with no readable end: hold"
+    Assert-True ((Get-RG @{ status = "PREP"; baySessionId = "s-x"; sessionEndUtc = $fut } @{}).Proceed) "gate: PREP: proceed"
+    Assert-True (-not (Get-RG @{ status = "ACTIVE"; baySessionId = "s-x"; sessionEndUtc = $fut } @{ baySessionId = "s-y" }).Proceed) "gate: another session named: hold"
+    Assert-True (-not (Get-RG @{ status = "ACTIVE"; baySessionId = "s-x"; sessionEndUtc = $fut } @{ baySessionId = "S-X" }).Proceed) "gate: id compared case-sensitively: hold"
     Section "K19 the shell's second check: session.json must not show another session running"
     $nG = (Get-Date).ToUniversalTime()
     function Get-G($obj, [string]$closedSid) { return (Get-KioskSessionGuard -SessionRead $obj -ClosedSessionId $closedSid -NowUtc $nG) }

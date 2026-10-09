@@ -4616,6 +4616,18 @@ $CMD_EMERGENCY_STOP {
             # Reset to a known-good "READY" state.
             # Default behavior: keep the Session Display running (or restart it) so the bay never sits on a blank screen.
             if ($null -eq $payloadObj) { $payloadObj = @{} }
+            # R7 / RR1 (attack 2026-10-08): the platform sends a full Reset AT ONCE for every canceled booking, with no
+            # session id, whoever is playing on that bay. A Reset is tied to its own session: it may not rewrite the wall,
+            # restart the display or move the facility while a DIFFERENT session is running. Nothing is changed then.
+            $resetGate = Get-ResetGate -SessionModel (Read-SessionModelFromDisk) -Payload $payloadObj -NowUtc ((Get-Date).ToUniversalTime())
+            if (-not $resetGate.Proceed) {
+                return @{
+                    reset = $false
+                    skipped = $true
+                    reason = $resetGate.Why
+                    runningSessionId = $resetGate.RunningSessionId
+                }
+            }
             # A0.363: the launcher is not wanted after a reset.
             $null = Set-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload $payloadObj
 
@@ -5099,6 +5111,28 @@ function Get-KioskShellLiveness($HeartbeatRead, [DateTime]$NowUtc, [scriptblock]
     return $l
 }
 
+function Get-ResetGate {
+    # Pure. May a Reset touch the wall, display and facility right now? A Reset names no session when the platform sends it
+    # for a canceled booking, so it can only proceed when session.json shows nobody playing. Running = status ACTIVE or
+    # ENDING (the statuses a session is on the bay). It still proceeds when: the payload names the running session itself,
+    # the payload sets force=true (an operator), or the running session ended more than StaleMinutes ago and no End ever
+    # arrived (the bay must be recoverable). A missing session.json is "nobody known": proceed (as before). A running
+    # session with an unreadable end time holds. Returns @{ Proceed; Why; RunningSessionId }
+    param($SessionModel, $Payload, [DateTime]$NowUtc, [int]$StaleMinutes = 15)
+    if ($null -eq $SessionModel) { return @{ Proceed = $true; Why = "no session.json"; RunningSessionId = "" } }
+    $status = [string](Get-PropValue $SessionModel "status" "")
+    $runSid = [string](Get-PropValue $SessionModel "baySessionId" "")
+    if ($status -cnotin @("ACTIVE", "ENDING")) { return @{ Proceed = $true; Why = "no session running (status $status)"; RunningSessionId = $runSid } }
+    $force = $false
+    try { $force = [bool](Get-PropValue $Payload "force" $false) } catch { $force = $false }
+    if ($force) { return @{ Proceed = $true; Why = "force"; RunningSessionId = $runSid } }
+    $paySid = [string](Get-PropValue $Payload "baySessionId" "")
+    if (-not [string]::IsNullOrWhiteSpace($paySid) -and $paySid -ceq $runSid) { return @{ Proceed = $true; Why = "the Reset names the running session"; RunningSessionId = $runSid } }
+    $end = $null
+    try { $end = ConvertTo-KioskUtc (Get-PropValue $SessionModel "sessionEndUtc" $null) } catch { $end = $null }
+    if ($null -ne $end -and $NowUtc -gt $end.AddMinutes($StaleMinutes)) { return @{ Proceed = $true; Why = "session $runSid ended over $StaleMinutes minutes ago and no End arrived"; RunningSessionId = $runSid } }
+    return @{ Proceed = $false; Why = "session '$runSid' is running ($status) and this Reset does not name it: the wall, display and facility are left alone"; RunningSessionId = $runSid }
+}
 function Get-KioskIntentForCommand {
     # Pure: what a command does to the launcher intent. $null = leave it as it is.
     param(
