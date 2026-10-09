@@ -787,6 +787,20 @@ try {
                      "Set-RunningSessionForCommand", "Initialize-RunningSession")) {
         . ([scriptblock]::Create((Get-DefText $AgentDefs $n)))
     }
+    # Kiosk round 2 (A0.467, F1-R1, F1-R2, RV1-RV4). Lifted when present, so this file also runs against the base
+    # release (4c8851ac), where the K21 scenarios then FAIL for the reason they exist instead of the lift throwing.
+    foreach ($n in @("Set-AgentRunningStamp", "ConvertTo-RunningSnapshot", "Test-SessionFinished", "Add-FinishedSessionToList", "Add-FinishedSession",
+                     "Get-EndSessionScope", "Get-CancelEndUtc", "Get-CancelWarningText", "Send-ControlScreenWarning", "Start-CancelWarning", "Invoke-CancelEndIfDue")) {
+        if (@($AgentDefs | Where-Object { $_.Name -eq $n }).Count -eq 1) { . ([scriptblock]::Create((Get-DefText $AgentDefs $n))) }
+        else { . ([scriptblock]::Create("function $n { return `$null }")) }
+    }
+    # The real msg.exe would put a message box on this PC's desktop: the suite records the call instead (K21 tests the
+    # real function with an injected starter).
+    $script:ControlWarnings = New-Object System.Collections.ArrayList
+    if (@($AgentDefs | Where-Object { $_.Name -eq "Send-ControlScreenWarning" }).Count -eq 1) {
+        . ([scriptblock]::Create((Get-DefText $AgentDefs "Send-ControlScreenWarning").Replace("function Send-ControlScreenWarning", "function Test-RealSendControlScreenWarning")))
+    }
+    function Send-ControlScreenWarning { param([string]$Text, [int]$Seconds, [scriptblock]$Starter = $null) [void]$script:ControlWarnings.Add(@{ Text = $Text; Seconds = $Seconds }); return [ordered]@{ shown = $true; via = "test"; why = "recorded"; pid = $null } }
     $BayId = "33333333-3333-3333-3333-333333333333"
     $Global:EmergencyStopReason = $null
     $script:LauncherStarts = 0
@@ -857,7 +871,10 @@ try {
         # What the shell would do to a running launcher right now, 60 s into the intent (past any grace).
         $wn = Get-KioskLauncherWanted -IntentRead (Read-KioskJsonFile -Path $KioskIntentPath) -NowUtc ((Get-Date).ToUniversalTime())
         $act = Get-KioskLauncherAction -Wanted ([bool]$wn.Wanted) -Running $true -AbsentTicks 0 -StartAllowed $true -PathExists $true -Closed ([bool]$wn.Closed) -ClosedForSeconds 600 -CloseGraceSeconds 15
-        $g = Get-KioskSessionGuard -SessionRead (Read-KioskJsonFile -Path (Join-Path $Sandbox "session.json") -MaxBytes 262144) -ClosedSessionId ([string]$wn.SessionId) -NowUtc ((Get-Date).ToUniversalTime())
+        # As Invoke-KioskTick calls it (round 2 passes the closed intent's time; the base release's guard has no such parameter).
+        $gArgs = @{ SessionRead = (Read-KioskJsonFile -Path (Join-Path $Sandbox "session.json") -MaxBytes 262144); ClosedSessionId = ([string]$wn.SessionId); NowUtc = ((Get-Date).ToUniversalTime()) }
+        if ((Get-Command Get-KioskSessionGuard).Parameters.ContainsKey("ClosedSinceUtc")) { $gArgs["ClosedSinceUtc"] = $wn.ClosedSinceUtc }
+        $g = Get-KioskSessionGuard @gArgs
         if ($act -eq "close" -and -not $g.AllowClose) { return "held" }
         return $act
     }
@@ -928,7 +945,8 @@ try {
     $rN = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","baySessionId":"s-other"}' -BayLabel "Bay"
     Assert-True ($rN.reset -eq $false -and (Get-SessNow).status -eq "ACTIVE") "R7 a Reset naming a DIFFERENT session: skipped"
     $rS = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","baySessionId":"s-r7"}' -BayLabel "Bay"
-    Assert-True ($rS.reset -eq $true -and (Get-SessNow).status -eq "READY") "R7 a Reset naming the running session itself proceeds (the wall goes READY)"
+    # Kiosk round 2 (A0.467): the running booking canceled mid-play is warned for 5 minutes (the wall goes ENDING), not reset.
+    Assert-True ((Get-PropValue $rS "reset" $null) -eq $false -and $null -ne (Get-PropValue $rS "cancelWarning" $null) -and (Get-SessNow).status -eq "ENDING") "R7 a Reset naming the running session itself (canceled mid-play): its 5-minute warning starts, the wall goes ENDING (A0.467)"
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-r7b") -BayLabel "Bay")
     $rF = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","force":true}' -BayLabel "Bay"
     Assert-True ($rF.reset -eq $true -and (Get-SessNow).status -eq "READY") "R7 an operator's force=true Reset proceeds"
@@ -1061,7 +1079,7 @@ try {
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-A3") -BayLabel "Bay")
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-B3") -BayLabel "Bay")
     [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-A3") -BayLabel "Bay")
-    Assert-True ((Get-SessStatus) -eq "ENDED/s-A3" -and (Get-RecSid) -eq "s-B3") "X3 precondition: A3's late End wrote ENDED/s-A3 (pre-existing); the record still names B3"
+    Assert-True ((Get-SessStatus) -eq "ACTIVE/s-B3" -and (Get-RecSid) -eq "s-B3") "X3 A3's late End leaves B3's wall ACTIVE/s-B3 (round 2, F1-R2; it wrote ENDED/s-A3 before); the record still names B3"
     foreach ($b in @("", "s-C3", "s-A3")) {
         $x = Invoke-CancelReset $b
         Assert-True ($x.Skipped -and $x.WallSame -and $x.Touched -eq 0) "X3 then a cancel Reset bound to [$b]: skipped, nothing touched"
@@ -1080,7 +1098,9 @@ try {
     $x = Invoke-CancelReset ""
     Assert-True ($x.Skipped) "X10 a Reset bound to no session while s-x10 plays: skipped"
     $x = Invoke-CancelReset "S-X10"
-    Assert-True ($x.Reset -and (Get-SessStatus) -match "^READY" -and (Get-RecSid) -eq "<none>") "X10 the Reset bound to s-x10 itself (canceled mid-play): proceeds, the wall goes READY, and the record is cleared"
+    Assert-True (-not $x.Reset -and $null -ne (Get-PropValue $x.R "cancelWarning" $null) -and (Get-SessStatus) -eq "ENDING/s-x10" -and (Get-RecSid) -eq "s-x10") "X10 the Reset bound to s-x10 itself (canceled mid-play): its warning starts (wall ENDING/s-x10, still recorded; A0.467)"
+    [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime().AddMinutes(6)))
+    Assert-True ((Get-SessStatus) -eq "ENDED/s-x10" -and (Get-RecSid) -eq "<none>") "X10 when the warning is over, s-x10 ends like a normal End (ENDED, record cleared)"
     $x = Invoke-CancelReset "s-later"
     Assert-True ($x.Reset) "X10 after that, nobody plays: a later cancel Reset proceeds"
     $rForce = Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","force":"true"}' -BayLabel "Bay"
@@ -1111,7 +1131,7 @@ try {
     [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" "s-ext") -BayLabel "Bay")
     [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"engage","reason":"t"}' -BayLabel "Bay")
     [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload "Start" "s-blocked") -BayLabel "Bay")
-    Assert-True ((Get-RecSid) -eq "<none>") "record: a Start refused by an engaged emergency stop does not make anyone 'playing'"
+    Assert-True ((Get-RecSid) -eq "s-blocked") "record: a Start refused by an engaged emergency stop is still recorded (round 2, RV3: it is the bay's running booking)"
     [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"clear"}' -BayLabel "Bay")
 
     # Persistence: the file carries the record across a restart; a failed write keeps memory authoritative and lands later.
@@ -1197,7 +1217,9 @@ try {
     Assert-True ([IO.File]::ReadAllText($sessPath) -ceq $wallPc) "...and the wall is still untouched"
     $script:Patches.Clear(); Process-Command -token "t" -cmd (New-ResetRow "s-pc")
     $last = $(if ($script:Patches.Count -gt 0) { $script:Patches[$script:Patches.Count - 1] } else { @{ Body = @{}; IfMatch = "" } })
-    Assert-True ($last.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$last.Body[$Col_Result] -match '"reset":true' -and (Get-SessStatus) -match "^READY" -and (Get-RecSid) -eq "<none>") "Process-Command: the Reset bound (row lookup) to the running s-pc: runs, READY, the record cleared"
+    Assert-True ($last.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$last.Body[$Col_Result] -match '"cancelWarning"' -and (Get-SessStatus) -eq "ENDING/s-pc" -and (Get-RecSid) -eq "s-pc") "Process-Command: the Reset bound (row lookup) to the running s-pc: runs, starts its warning (ENDING; A0.467)"
+    [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime().AddMinutes(6)))
+    Assert-True ((Get-RecSid) -eq "<none>") "...and its End after the warning clears the record"
     $script:Patches.Clear(); Process-Command -token "t" -cmd (New-ResetRow "")
     Assert-True ($script:Patches.Count -eq 2 -and $script:Patches[1].Body[$Col_Status] -eq $STATUS_SUCCEEDED) "Process-Command: nobody plays: a Reset runs as before (lock, then Succeeded)"
 
@@ -1210,6 +1232,345 @@ try {
     [void](Get-NextPendingCommand -token "t")
     $selPart = $(if ($script:PollUri -match '\$select=([^&]+)') { $Matches[1] } else { "" })
     Assert-True (@($selPart -split ',') -contains "_build_baysession_value") "the command poll selects _build_baysession_value (got: $selPart)"
+
+    # ============================================================ K21 (kiosk round 2, 2026-10-09)
+    # A0.467 (a booking canceled mid-play: a 5-minute warning, then a normal End), F1-R2/X3b (a second End of an ended
+    # session), F1-R3 (an on-time End after the next Prep), F1-R1 (A0.360 after a Prep or a cancel Reset), RV1 to RV4.
+    # Through the real Execute-Command (Process-Command where the row matters) with the real emergency stop, judged by the
+    # shell's own decision functions. Each scenario FAILS on 4c8851ac (this file with -AgentScript/-ShellScript of it).
+    Section "K21 round 2: a canceled booking is warned then ended; a stale End never ends a paying game; no free play after an End"
+    $script:Fac = @()
+    function Invoke-FacilitySetMode { param([string]$Mode, $payloadObj) $script:Fac += $Mode; return @{ ok = $true; scene = $Mode } }
+    function Start-SessionDisplay($payloadObj) { return @{ started = $false; reason = "stub" } }
+    function Stop-SessionDisplay { return @{ stopped = $false; reason = "stub" } }
+    function Get-Sess { try { return ([IO.File]::ReadAllText($sessPath) | ConvertFrom-Json) } catch { return $null } }
+    function Get-RecCancel { if ($null -eq $Global:RunningSession) { return $null }; return (Get-KioskProp $Global:RunningSession "cancelEndUtc" $null) }
+    function Clear-Bay { $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $Global:RunningSessionFinished = @(); Remove-Item -LiteralPath $RunningSessionPath -Force -ErrorAction SilentlyContinue; $Global:EmergencyStopEngaged = $false }
+    function Invoke-Start([string]$sid, [string]$mode = "Start") { return (Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload $mode $sid) -BayLabel "Bay") }
+    function Invoke-End([string]$sid) { return (Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" $sid) -BayLabel "Bay") }
+    function Invoke-BoundReset([string]$bound) { try { return (Execute-Command -CommandType $CMD_RESET -PayloadJson $resetJson -BayLabel "Bay" -BoundSessionId $bound) } catch { return $null } }
+    function Lock-Intent { return (New-Object IO.FileStream($KioskIntentPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)) }
+    function Get-Stamp { return (Get-PropValue (Get-Sess) "agentRunning" $null) }
+    function Get-EndsOf($r) { return (ConvertTo-KioskUtc (Get-PropValue (Get-PropValue $r "cancelWarning" $null) "endsUtc" $null)) }
+    $fmtZ = "yyyy-MM-ddTHH:mm:ssZ"
+    Clear-Bay
+
+    # ---- A0.467: the RUNNING booking is canceled mid-play (the platform cancels its Warn5 and End and sends a Reset bound to it).
+    $t0 = (Get-Date).ToUniversalTime()
+    [void](Invoke-Start "s-c1")
+    $script:Fac = @(); $script:ControlWarnings.Clear()
+    $rc = Invoke-BoundReset "s-c1"
+    $ends = Get-EndsOf $rc
+    Assert-True ((Get-PropValue $rc "reset" $null) -eq $false -and $null -ne $ends -and [Math]::Abs(($ends - $t0.AddMinutes(5)).TotalSeconds) -le 15) "A0.467 the cancel Reset of the running s-c1 is not a reset: a warning that ends 5 minutes from now"
+    $s = Get-Sess
+    Assert-True ((Get-PropValue $s "status" "") -eq "ENDING" -and (Get-PropValue $s "baySessionId" "") -eq "s-c1" -and $null -ne $ends -and (ConvertTo-KioskUtc (Get-PropValue $s "playEndUtc" $null)) -eq $ends -and (Get-PropValue $s "bannerText" "") -eq "Booking canceled") "A0.467 the wall shows the warning: ENDING for s-c1, its countdown to the new end, a 'Booking canceled' banner"
+    $cwText = $(if ($script:ControlWarnings.Count -gt 0) { [string]$script:ControlWarnings[0].Text } else { "" })
+    $cwSecs = $(if ($script:ControlWarnings.Count -gt 0) { [int]$script:ControlWarnings[0].Seconds } else { 0 })
+    Assert-True ($script:ControlWarnings.Count -eq 1 -and $cwText -match "canceled" -and $cwText -match "5 minutes" -and $cwSecs -ge 285 -and $cwSecs -le 300) "A0.467 the control screen (the launcher's screen) shows the warning once, for its 5 minutes (got: $cwText / $cwSecs s)"
+    Assert-True ($script:Fac -contains "Warning") "A0.467 the facility moves to its Warning scene"
+    $wi = Get-IntentNow
+    Assert-True ($wi.Wanted -and $wi.SessionId -eq "s-c1" -and $null -ne $ends -and $wi.UntilUtc -eq $ends.AddSeconds(120)) "A0.467 the game keeps running: the launcher stays wanted for s-c1, but only until the warning ends (plus the 2-minute grace)"
+    $bk = Get-KioskSessionBacksWanted -SessionRead (Read-KioskJsonFile -Path $sessPath -MaxBytes 262144) -WantedSessionId "s-c1"
+    Assert-True ($bk.Backed -and (Get-ShellVerdictNow) -ne "close") "A0.467 during the warning the shell keeps the game (session.json backs a restart; nothing is closed)"
+    Assert-True ((Get-RecSid) -eq "s-c1" -and $null -ne $ends -and (ConvertTo-KioskUtc (Get-RecCancel)) -eq $ends) "A0.467 the running-session record keeps s-c1 and carries the warning's end"
+    $rfC = Read-KioskJsonFile -Path $RunningSessionPath
+    Assert-True ($rfC.Ok -and $null -ne $ends -and (ConvertTo-KioskUtc (Get-KioskProp $rfC.Obj "cancelEndUtc" $null)) -eq $ends) "A0.467 ...and so does the record file (a restart keeps the warning)"
+    $stC = Get-Stamp
+    Assert-True ((Get-PropValue $stC "running" $null) -eq $true -and (Get-PropValue $stC "baySessionId" "") -eq "s-c1") "A0.467 the wall's stamp says s-c1 still plays"
+    $script:ControlWarnings.Clear()
+    $rc2 = Invoke-BoundReset "s-c1"
+    Assert-True ($null -ne $ends -and (ConvertTo-KioskUtc (Get-RecCancel)) -eq $ends -and $script:ControlWarnings.Count -eq 0 -and (Get-PropValue (Get-PropValue $rc2 "cancelWarning" $null) "duplicate" $null) -eq $true) "A0.467 a redelivered cancel Reset keeps the first end and warns only once"
+    $x = Invoke-CancelReset "s-other"
+    Assert-True ($x.Skipped -and $x.WallSame) "A0.467 another booking's Reset during the warning: held, the warning wall untouched"
+    $early = Invoke-CancelEndIfDue -NowUtc $t0.AddMinutes(4)
+    Assert-True ($null -eq $early -and (Get-RecSid) -eq "s-c1" -and (Get-PropValue (Get-Sess) "status" "") -eq "ENDING") "A0.467 4 minutes in: nothing ends yet"
+    $agentText = [IO.File]::ReadAllText($AgentScript)
+    $iLoop = $agentText.IndexOf("# ---------------- Main Loop")
+    $iDue = $(if ($iLoop -ge 0) { $agentText.IndexOf("Invoke-CancelEndIfDue -NowUtc", $iLoop) } else { -1 })
+    $iTok = $(if ($iLoop -ge 0) { $agentText.IndexOf("`$token = Get-AccessToken", $iLoop) } else { -1 })
+    Assert-True ($iLoop -gt 0 -and $iDue -gt $iLoop -and $iDue -lt $iTok) "A0.467 the main loop runs the due check every pass, before the token (no network needed)"
+    $script:Fac = @()
+    $endRes = $(if ($null -ne $ends) { Invoke-CancelEndIfDue -NowUtc $ends.AddSeconds(1) } else { $null })
+    $s = Get-Sess; $wE = Get-IntentNow
+    Assert-True ((Get-PropValue $s "status" "") -eq "ENDED" -and (Get-PropValue $s "baySessionId" "") -eq "s-c1" -and $wE.Closed -and $wE.SessionId -eq "s-c1" -and (Get-RecSid) -eq "<none>" -and $script:Fac -contains "Cleanup") "A0.467 when the warning is over: a normal End (wall ENDED, intent closed, record cleared, facility Cleanup)"
+    Assert-True ((Get-PropValue $endRes "scope" "") -eq "running") "A0.467 ...through the same End handler, as the running session"
+    Assert-True ((Get-ShellVerdictNow) -eq "close") "A0.467 a launcher relaunched after that end is closed by the shell: a canceled booking never becomes free play"
+    $wallC = [IO.File]::ReadAllText($sessPath)
+    $rr = Invoke-Start "s-c1"
+    Assert-True ((Get-PropValue $rr "skipped" $null) -eq $true -and (Get-RecSid) -eq "<none>" -and [IO.File]::ReadAllText($sessPath) -ceq $wallC -and (Get-IntentNow).Closed) "A0.467/RV1 a replayed Start of the canceled booking after its end: refused, nothing touched"
+    # Only 2 minutes left in the booking: it ends at its own end, not 3 minutes later.
+    Clear-Bay
+    $e2 = (Get-Date).ToUniversalTime().AddMinutes(2).ToString($fmtZ)
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson ('{"mode":"Start","baySessionId":"s-c2","startUtc":"2026-10-08T12:00:00Z","playEndUtc":"' + $e2 + '","endUtc":"' + $e2 + '","closeLauncher":false}') -BayLabel "Bay")
+    $rc = Invoke-BoundReset "s-c2"
+    Assert-True ((Get-EndsOf $rc) -eq (ConvertTo-KioskUtc $e2)) "A0.467 with 2 minutes left, the canceled booking ends at its own end (never plays longer than it would have)"
+    [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime().AddMinutes(3)))
+    # The booking's own end already passed (its End was canceled before it ran): it ends now.
+    Clear-Bay
+    $ePast = (Get-Date).ToUniversalTime().AddMinutes(-1).ToString($fmtZ)
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson ('{"mode":"Start","baySessionId":"s-c3","startUtc":"2026-10-08T12:00:00Z","playEndUtc":"' + $ePast + '","endUtc":"' + $ePast + '","closeLauncher":false}') -BayLabel "Bay")
+    $rc = Invoke-BoundReset "s-c3"
+    Assert-True ((Get-PropValue (Get-PropValue $rc "cancelWarning" $null) "endedNow" $null) -eq $true -and (Get-SessStatus) -eq "ENDED/s-c3" -and (Get-RecSid) -eq "<none>" -and (Get-IntentNow).Closed) "A0.467 with the booking's own end already past, the cancel ends it now"
+    # An agent restart during the warning keeps it.
+    Clear-Bay
+    [void](Invoke-Start "s-c4")
+    $ends4 = Get-EndsOf (Invoke-BoundReset "s-c4")
+    $Global:RunningSession = $null
+    Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Get-RecSid) -eq "s-c4" -and $null -ne $ends4 -and (ConvertTo-KioskUtc (Get-RecCancel)) -eq $ends4) "A0.467 an agent restart during the warning keeps it (record and end read back)"
+    if ($null -ne $ends4) { [void](Invoke-CancelEndIfDue -NowUtc $ends4.AddSeconds(1)) }
+    Assert-True ((Get-SessStatus) -eq "ENDED/s-c4" -and (Get-RecSid) -eq "<none>") "A0.467 ...and still ends it on time"
+    # The next booking's Start during the warning takes the bay: the canceled booking's end does nothing to it.
+    Clear-Bay
+    [void](Invoke-Start "s-c5")
+    $ends5 = Get-EndsOf (Invoke-BoundReset "s-c5")
+    [void](Invoke-Start "s-n5")
+    $r5 = $(if ($null -ne $ends5) { Invoke-CancelEndIfDue -NowUtc $ends5.AddSeconds(1) } else { "no warning" })
+    Assert-True ($null -eq $r5 -and (Get-RecSid) -eq "s-n5" -and (Get-SessStatus) -eq "ACTIVE/s-n5" -and (Get-IntentNow).Wanted) "A0.467 the next booking's Start during the warning takes over; the canceled booking's end does not touch it"
+    [void](Invoke-End "s-n5")
+    # Pure: the warning's end, the record across a replayed Start or an extension, the intent cut.
+    $nC = [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-09T12:00:00"), [DateTimeKind]::Utc)
+    Assert-True ((Get-CancelEndUtc -NowUtc $nC -RecordEndUtc $nC.AddHours(1) -WarningSeconds 300) -eq $nC.AddMinutes(5)) "A0.467 end: 5 minutes from now when the booking runs longer"
+    Assert-True ((Get-CancelEndUtc -NowUtc $nC -RecordEndUtc $nC.AddMinutes(2) -WarningSeconds 300) -eq $nC.AddMinutes(2)) "A0.467 end: the booking's own end when that is sooner"
+    Assert-True ((Get-CancelEndUtc -NowUtc $nC -RecordEndUtc $nC.AddMinutes(-3) -WarningSeconds 300) -eq $nC) "A0.467 end: now when the booking's end has passed"
+    Assert-True ((Get-CancelEndUtc -NowUtc $nC -RecordEndUtc $null -WarningSeconds 300) -eq $nC.AddMinutes(5)) "A0.467 end: 5 minutes when the booking's end is unreadable"
+    $recC = [ordered]@{ baySessionId = "s-a"; endUtc = "2026-10-09T13:00:00Z"; since = "2026-10-09T11:00:00Z"; cancelEndUtc = "2026-10-09T12:05:00Z" }
+    $cS2 = Get-RunningSessionForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload ('{"baySessionId":"s-a","playEndUtc":"2026-10-09T13:00:00Z"}' | ConvertFrom-Json) -Current $recC -NowUtc $nC
+    Assert-True ((Get-KioskProp $cS2.Record "cancelEndUtc" $null) -eq "2026-10-09T12:05:00Z") "A0.467 a replayed Start of the SAME canceled booking during its warning keeps the warning's end"
+    $cS3 = Get-RunningSessionForCommand -CommandType $CMD_STARTSESSION -Mode "Start" -Payload ('{"baySessionId":"s-b","playEndUtc":"2026-10-09T14:00:00Z"}' | ConvertFrom-Json) -Current $recC -NowUtc $nC
+    Assert-True ($null -eq (Get-KioskProp $cS3.Record "cancelEndUtc" $null)) "A0.467 ...the next booking's Start does not inherit it"
+    $cU2 = Get-RunningSessionForCommand -CommandType $CMD_UPDATESESSIONDISPLAY -Mode "Warn5" -Payload ('{"baySessionId":"s-a","playEndUtc":"2026-10-09T13:30:00Z"}' | ConvertFrom-Json) -Current $recC -NowUtc $nC
+    Assert-True ((Get-KioskProp $cU2.Record "cancelEndUtc" $null) -eq "2026-10-09T12:05:00Z") "A0.467 ...and an extension display keeps it too"
+    function New-IntentRead($l, $until, $sid) { return @{ Ok = $true; Why = ""; Obj = ([pscustomobject]@{ schema = 1; launcher = $l; untilUtc = $until; baySessionId = $sid; writtenUtc = $nC.ToString($fmtZ) }) } }
+    $cw5 = [pscustomobject]@{ baySessionId = "s-a"; playEndUtc = $nC.AddMinutes(5).ToString($fmtZ) }
+    $ki = Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "cancel-warning" -Payload $cw5 -CurrentIntentRead (New-IntentRead "wanted" $nC.AddHours(1).ToString($fmtZ) "s-a") -SameSession $true -EmergencyStopEngaged $false -NowUtc $nC
+    Assert-True ($null -ne $ki -and $ki.Launcher -eq "wanted" -and $ki.UntilUtc -eq $nC.AddMinutes(7) -and $ki.SessionId -eq "s-a") "A0.467 intent: a wanted s-a is cut to the warning's end plus the grace"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "cancel-warning" -Payload $cw5 -CurrentIntentRead (New-IntentRead "wanted" $nC.AddHours(1).ToString($fmtZ) "s-b") -SameSession $true -EmergencyStopEngaged $false -NowUtc $nC)) "A0.467 intent: never another session's"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "cancel-warning" -Payload $cw5 -CurrentIntentRead (New-IntentRead "wanted" $nC.AddMinutes(4).ToString($fmtZ) "s-a") -SameSession $true -EmergencyStopEngaged $false -NowUtc $nC)) "A0.467 intent: never extended (a sooner until is kept)"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "cancel-warning" -Payload $cw5 -CurrentIntentRead (New-IntentRead "closed" $null "s-a") -SameSession $true -EmergencyStopEngaged $false -NowUtc $nC)) "A0.467 intent: a closed intent is never made wanted"
+    Assert-True ($null -eq (Get-KioskIntentForCommand -CommandType $CMD_RESET -Mode "" -Payload $cw5 -CurrentIntentRead (New-IntentRead "wanted" $nC.AddHours(1).ToString($fmtZ) "s-a") -SameSession $true -EmergencyStopEngaged $false -NowUtc $nC)) "A0.467 intent: a plain Reset still never touches it"
+    $wt5 = Get-CancelWarningText -EndsUtc $nC.AddMinutes(5) -NowUtc $nC
+    $wt1 = Get-CancelWarningText -EndsUtc $nC.AddSeconds(30) -NowUtc $nC
+    Assert-True ([string]$wt5 -match "^This booking was canceled\. Play ends in 5 minutes, at " -and [string]$wt1 -match "in 1 minute, at " -and [string]$wt5 -notmatch '["&|<>]') "A0.467 the control-screen text (got: $wt5)"
+    if (Get-Command Test-RealSendControlScreenWarning -ErrorAction SilentlyContinue) {
+        $script:MsgStarts = New-Object System.Collections.ArrayList
+        $sw = Test-RealSendControlScreenWarning -Text 'This booking was canceled. Play ends in 5 minutes, at 7:42 PM. "x" & y' -Seconds 300 -Starter { param($f, $a) [void]$script:MsgStarts.Add(@($f, $a)); return 4321 }
+        $ownSess = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+        $wantArgs = ('{0} /TIME:300 "This booking was canceled. Play ends in 5 minutes, at 7:42 PM. x  y"' -f $ownSess)
+        $gotArgs = $(if ($script:MsgStarts.Count -gt 0) { [string]$script:MsgStarts[0][1] } else { "" })
+        Assert-True ($sw["shown"] -eq $true -and $sw["pid"] -eq 4321 -and $script:MsgStarts.Count -eq 1 -and [string]$script:MsgStarts[0][0] -like "*\System32\msg.exe" -and $gotArgs -ceq $wantArgs) "A0.467 the real control-screen sender: msg.exe to this desktop session, for the warning's seconds, only safe characters on its command line (got: $gotArgs)"
+        $swF = Test-RealSendControlScreenWarning -Text "t" -Seconds 0 -Starter { param($f, $a) throw "no desktop" }
+        Assert-True ($swF["shown"] -eq $false -and [string]$swF["why"] -match "no desktop") "A0.467 a sender that fails is reported, never thrown"
+    } else { Assert-True $false "A0.467 the real control-screen sender exists" }
+
+    # ---- F1-R2 / X3b: a SECOND End of an ended session S arrives while T plays and T's intent write keeps failing.
+    Clear-Bay
+    [void](Invoke-Start "s-S"); [void](Invoke-End "s-S")
+    $lockY = Lock-Intent
+    try {
+        [void](Invoke-Start "s-T")
+        $wallT = [IO.File]::ReadAllText($sessPath); $script:Fac = @()
+        $r2 = $null; try { $r2 = Invoke-End "s-S" } catch { $r2 = $null }
+        Assert-True ((Get-SessStatus) -eq "ACTIVE/s-T" -and [IO.File]::ReadAllText($sessPath) -ceq $wallT -and $script:Fac.Count -eq 0) "X3b a second End of the ended s-S while s-T plays: the wall and the facility are left alone (it wrote ENDED/s-S before)"
+        Assert-True ((Get-ShellVerdictNow) -eq "held") "X3b the shell's verdict on s-T's running launcher: held (the attack measured close)"
+        Assert-True ((Get-PropValue $r2 "skipped" $null) -eq $true -and (Get-RecSid) -eq "s-T") "X3b ...that End was refused as a duplicate (s-S already ended here) and s-T still plays"
+    } finally { $lockY.Dispose() }
+    Release-IntentLock
+    [void](Invoke-End "s-T")
+    # The same with the ended-session list lost (a restart with an older record file): the record alone protects T2.
+    [void](Invoke-Start "s-S2"); [void](Invoke-End "s-S2")
+    $lockY = Lock-Intent
+    try {
+        [void](Invoke-Start "s-T2")
+        $Global:RunningSessionFinished = @()
+        $wallT2 = [IO.File]::ReadAllText($sessPath)
+        $r2b = $null; try { $r2b = Invoke-End "s-S2" } catch { $r2b = $null }
+        Assert-True ((Get-PropValue $r2b "scope" "") -eq "other" -and [IO.File]::ReadAllText($sessPath) -ceq $wallT2 -and (Get-ShellVerdictNow) -eq "held") "X3b with no ended-session list, the record decides: the End of s-S2 while s-T2 plays leaves the wall alone, and the shell holds"
+    } finally { $lockY.Dispose() }
+    Release-IntentLock
+    [void](Invoke-End "s-T2")
+    # A late End of a booking that never played here, and an End naming no session, while s-T3 plays: nothing touched.
+    [void](Invoke-Start "s-T3")
+    $wallT3 = [IO.File]::ReadAllText($sessPath); $script:Fac = @()
+    $rU = Invoke-End "s-U3"
+    $rN = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","closeLauncher":false}' -BayLabel "Bay"
+    Assert-True ([IO.File]::ReadAllText($sessPath) -ceq $wallT3 -and $script:Fac.Count -eq 0 -and (Get-RecSid) -eq "s-T3" -and (Get-IntentNow).Wanted -and (Get-PropValue $rU "scope" "") -eq "other" -and (Get-PropValue $rN "scope" "") -eq "other") "an End of another booking, or naming no session, while s-T3 plays: wall, facility, record and intent untouched"
+    [void](Invoke-End "s-T3")
+
+    # ---- F1-R3: an ON-TIME End after the next booking's Prep (session.json moved to the next booking).
+    Clear-Bay
+    [void](Invoke-Start "s-A4"); [void](Invoke-Start "s-B4" "Prep")
+    $r4 = Invoke-End "s-A4"
+    $w4 = Get-IntentNow
+    Assert-True ($w4.Closed -and $w4.SessionId -eq "s-A4" -and (Get-PropValue (Get-PropValue $r4 "launcherStopped" $null) "reason" "") -ne "late_old_session_skip" -and (Get-RecSid) -eq "<none>") "F1-R3 the on-time End of s-A4 after s-B4's Prep is A4's own End: intent closed, the launcher not skipped as 'late', record cleared"
+
+    # ---- F1-R1: after an End, the next Prep or a cancel Reset on the idle bay must not open free play until the next Start.
+    Assert-True ((Get-ShellVerdictNow) -eq "close") "F1-R1 (setup) after A4's End the shell closes a relaunched launcher (ENDED/s-A4)"
+    [void](Invoke-Start "s-B5" "Prep")
+    Assert-True ((Get-SessStatus) -eq "PREP/s-B5" -and (Get-ShellVerdictNow) -eq "close") "F1-R1 after the next booking's Prep (PREP/s-B5, nobody plays): a relaunched launcher is still closed (held before)"
+    [void](Invoke-Start "s-B5"); [void](Invoke-End "s-B5")
+    $x = Invoke-CancelReset ""
+    Assert-True ($x.Reset -and (Get-SessStatus) -match "^READY" -and (Get-ShellVerdictNow) -eq "close") "F1-R1 after an End and a canceled booking's Reset on the idle bay (READY): a relaunched launcher is closed (held before: free play until the next Start)"
+    [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"engage","reason":"t"}' -BayLabel "Bay")
+    Assert-True ((Get-ShellVerdictNow) -eq "held") "F1-R1 an emergency stop on the idle bay (STOP): still held (A0.457: a stop never leads to a close; named residual)"
+    [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"clear"}' -BayLabel "Bay")
+    # Never on a paying game: a stale closed, s-T6 playing with its intent write failing, then the next Prep, a Reset of
+    # another booking, an operator's force Reset and an emergency stop.
+    Clear-Bay
+    [void](Invoke-Start "s-P6"); [void](Invoke-End "s-P6")
+    $lockY = Lock-Intent
+    try {
+        [void](Invoke-Start "s-T6")
+        [void](Invoke-Start "s-N6" "Prep")
+        Assert-True ((Get-SessStatus) -eq "PREP/s-N6" -and (Get-ShellVerdictNow) -eq "held") "F1-R1 never on a paying game: stale closed s-P6, s-T6 playing, the next Prep: held (the stamp says s-T6 plays)"
+        [void](Invoke-CancelReset "s-other")
+        Assert-True ((Get-ShellVerdictNow) -eq "held") "F1-R1 ...then another booking's Reset: held"
+        [void](Execute-Command -CommandType $CMD_RESET -PayloadJson '{"mode":"Full","force":true}' -BayLabel "Bay")
+        Assert-True ((Get-SessStatus) -match "^READY" -and (Get-ShellVerdictNow) -eq "held") "F1-R1 ...then an operator's force Reset (READY, but the stamp says s-T6 plays): held"
+        [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"engage","reason":"t"}' -BayLabel "Bay")
+        [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"clear"}' -BayLabel "Bay")
+        Assert-True ((Get-ShellVerdictNow) -eq "held") "F1-R1 ...then an emergency stop and its clear: held"
+    } finally { $lockY.Dispose() }
+    Release-IntentLock
+    [void](Invoke-End "s-T6")
+    # The stamp itself, on every wall write.
+    Clear-Bay
+    [void](Invoke-Start "s-st")
+    $st1 = Get-Stamp
+    Assert-True ((Get-PropValue $st1 "running" $null) -eq $true -and (Get-PropValue $st1 "baySessionId" "") -eq "s-st" -and (Get-PropValue $st1 "status" "") -eq "ACTIVE" -and (Get-PropValue $st1 "forSessionId" "") -eq "s-st" -and $null -ne (ConvertTo-KioskUtc (Get-PropValue $st1 "writtenUtc" $null))) "stamp: Start's wall write says s-st plays, for ACTIVE/s-st"
+    [void](Invoke-End "s-st")
+    $st2 = Get-Stamp
+    Assert-True ((Get-PropValue $st2 "running" $null) -eq $false -and (Get-PropValue $st2 "status" "") -eq "ENDED") "stamp: the End's wall write says nobody plays, for ENDED"
+    # The shell's rule, pure (every refusal shape).
+    $nS = (Get-Date).ToUniversalTime(); $sinceS = $nS.AddMinutes(-1)
+    function New-Wall([string]$status, $wallSid, $stamp) { $h = [ordered]@{ status = $status }; if ($null -ne $wallSid) { $h["baySessionId"] = $wallSid }; if ($null -ne $stamp) { $h["agentRunning"] = [pscustomobject]$stamp }; return [pscustomobject]$h }
+    function New-St($running, [string]$status, $for, $at) { $h = [ordered]@{ schema = 1; running = $running; baySessionId = ""; status = $status; writtenUtc = $at }; if ($null -ne $for) { $h["forSessionId"] = $for }; return $h }
+    function Get-GG($wall, [string]$closedSid, $since) {
+        $a = @{ SessionRead = @{ Ok = $true; Why = ""; Obj = $wall }; ClosedSessionId = $closedSid; NowUtc = $nS }
+        if ((Get-Command Get-KioskSessionGuard).Parameters.ContainsKey("ClosedSinceUtc")) { $a["ClosedSinceUtc"] = $since }
+        return (Get-KioskSessionGuard @a).AllowClose
+    }
+    $atOk = $nS.ToString($fmtZ); $atOld = $nS.AddMinutes(-5).ToString($fmtZ)
+    Assert-True (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-n" $atOk)) "s-a" $sinceS) "guard: PREP stamped nobody-plays, after the closed intent: close"
+    Assert-True (Get-GG (New-Wall "READY" $null (New-St $false "READY" "" $atOk)) "s-a" $sinceS) "guard: READY (no session) stamped nobody-plays: close"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $true "PREP" "s-n" $atOk)) "s-a" $sinceS)) "guard: PREP stamped someone-plays: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St "false" "PREP" "s-n" $atOk)) "s-a" $sinceS)) "guard: running as the text 'false': hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "READY" "s-n" $atOk)) "s-a" $sinceS)) "guard: a stamp for another status (merged forward): hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-m" $atOk)) "s-a" $sinceS)) "guard: a stamp for another session: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" $null $atOk)) "s-a" $sinceS)) "guard: a stamp with no forSessionId: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-n" $atOld)) "s-a" $sinceS)) "guard: a stamp older than the closed intent: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-n" "not a time")) "s-a" $sinceS)) "guard: a stamp with no readable time: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" $null) "s-a" $sinceS)) "guard: no stamp (an older agent's wall): hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-n" $atOk)) "s-a" $null)) "guard: no closed-intent time: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" "s-n" (New-St $false "PREP" "s-n" $atOk)) "" $sinceS)) "guard: a closed intent naming no session: hold"
+    Assert-True (-not (Get-GG (New-Wall "STOP" "s-n" (New-St $false "STOP" "s-n" $atOk)) "s-a" $sinceS)) "guard: STOP even stamped nobody-plays: hold (A0.457)"
+    Assert-True (-not (Get-GG (New-Wall "ACTIVE" "s-n" (New-St $false "ACTIVE" "s-n" $atOk)) "s-a" $sinceS)) "guard: ACTIVE even stamped nobody-plays: hold"
+    Assert-True (-not (Get-GG (New-Wall "ENDING" "s-n" (New-St $false "ENDING" "s-n" $atOk)) "s-a" $sinceS)) "guard: ENDING even stamped nobody-plays: hold"
+    Assert-True (-not (Get-GG (New-Wall "prep" "s-n" (New-St $false "prep" "s-n" $atOk)) "s-a" $sinceS)) "guard: a lower-case prep: hold"
+    Assert-True (-not (Get-GG (New-Wall "PREP" 7 (New-St $false "PREP" "7" $atOk)) "s-a" $sinceS)) "guard: a wall session id that is not text: hold"
+    # ---- RV2: a restart while the record file's write was failing.
+    Clear-Bay
+    Set-TestFile $RunningSessionPath ('{"schema":1,"running":false,"baySessionId":null,"endUtc":null,"since":null,"writtenUtc":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString($fmtZ) + '"}')
+    $lockR2 = New-Object IO.FileStream($RunningSessionPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        [void](Invoke-Start "s-r2")
+        Assert-True ($Global:RunningSessionPending) "RV2 precondition: s-r2's record write failed (file held open)"
+    } finally { $lockR2.Dispose() }
+    $Global:RunningSession = $null; $Global:RunningSessionPending = $false
+    Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Get-RecSid) -eq "s-r2") "RV2 the restart keeps s-r2 playing: the wall's newer stamp wins over the stale file (it read 'nobody' before)"
+    $x = Invoke-CancelReset "s-other"
+    Assert-True ($x.Skipped -and $x.WallSame) "RV2 ...so another booking's Reset is still held after the restart"
+    $rfR2 = Read-KioskJsonFile -Path $RunningSessionPath
+    Assert-True ($rfR2.Ok -and (Get-KioskProp $rfR2.Obj "baySessionId" "") -eq "s-r2") "RV2 ...and the record file is rewritten to agree"
+    [void](Invoke-End "s-r2")
+    $endK2 = (Get-Date).ToUniversalTime().AddMinutes(30).ToString($fmtZ)
+    $stOld = '{"schema":1,"running":true,"baySessionId":"s-old","endUtc":"' + $endK2 + '","status":"ACTIVE","forSessionId":"s-old","writtenUtc":"' + (Get-Date).ToUniversalTime().AddMinutes(-20).ToString($fmtZ) + '"}'
+    Set-TestFile $sessPath ('{"status":"ACTIVE","baySessionId":"s-old","sessionEndUtc":"' + $endK2 + '","agentRunning":' + $stOld + '}')
+    Set-TestFile $RunningSessionPath ('{"schema":1,"running":false,"baySessionId":null,"endUtc":null,"writtenUtc":"' + (Get-Date).ToUniversalTime().AddMinutes(-1).ToString($fmtZ) + '"}')
+    $Global:RunningSession = $null; Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Get-RecSid) -eq "<none>") "RV2 a stamp OLDER than the record file loses (the file's later 'nobody' wins)"
+    $tEq = (Get-Date).ToUniversalTime().AddMinutes(-2).ToString($fmtZ)
+    Set-TestFile $sessPath ('{"status":"ACTIVE","baySessionId":"s-eq","sessionEndUtc":"' + $endK2 + '","agentRunning":{"schema":1,"running":true,"baySessionId":"s-eq","endUtc":"' + $endK2 + '","status":"ACTIVE","forSessionId":"s-eq","writtenUtc":"' + $tEq + '"}}')
+    Set-TestFile $RunningSessionPath ('{"schema":1,"running":false,"baySessionId":null,"endUtc":null,"writtenUtc":"' + $tEq + '"}')
+    $Global:RunningSession = $null; Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Get-RecSid) -eq "s-eq") "RV2 equal times: the snapshot saying someone plays wins"
+    Set-TestFile $RunningSessionPath ('{"schema":1,"running":false,"baySessionId":null,"endUtc":null,"writtenUtc":"' + (Get-Date).ToUniversalTime().AddMinutes(-30).ToString($fmtZ) + '","finished":[{"id":"s-eq","utc":"' + $tEq + '"}]}')
+    $Global:RunningSession = $null; Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Get-RecSid) -eq "<none>") "RV2 a newer stamp naming a session this bay already ended: nobody"
+    Set-TestFile $sessPath ('{"status":"ACTIVE","baySessionId":"s-bad","sessionEndUtc":"' + $endK2 + '","agentRunning":{"schema":1,"running":"yes","baySessionId":"s-bad","writtenUtc":"' + (Get-Date).ToUniversalTime().ToString($fmtZ) + '"}}')
+    Set-TestFile $RunningSessionPath ('{"schema":1,"running":false,"baySessionId":null,"endUtc":null,"writtenUtc":"' + (Get-Date).ToUniversalTime().AddMinutes(-30).ToString($fmtZ) + '"}')
+    $Global:RunningSession = $null; Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Get-RecSid) -eq "<none>") "RV2 a malformed stamp is not a snapshot (the file decides)"
+    Clear-Bay
+
+    # ---- RV3: a Start refused by an emergency stop is recorded (when it names its session).
+    [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"engage","reason":"t"}' -BayLabel "Bay")
+    $rb3 = Invoke-Start "s-b3"
+    Assert-True ((Get-PropValue $rb3 "note" "") -eq "emergency_stop_engaged" -and (Get-RecSid) -eq "s-b3") "RV3 the refused Start of s-b3 is recorded (the stop refuses the launcher, not the booking)"
+    [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"clear"}' -BayLabel "Bay")
+    $x = Invoke-CancelReset "s-other"
+    Assert-True ($x.Skipped -and $x.WallSame) "RV3 after the clear, another booking's Reset is held (it reset s-b3's wall before)"
+    [void](Invoke-End "s-b3")
+    Assert-True ((Get-RecSid) -eq "<none>") "RV3 s-b3's own End clears it"
+    [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"engage","reason":"t"}' -BayLabel "Bay")
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson '{"mode":"Start","closeLauncher":false}' -BayLabel "Bay")
+    Assert-True ((Get-RecSid) -eq "<none>") "RV3 an unnamed refused Start is not recorded (nothing to protect; it would hold every unbound Reset)"
+    [void](Execute-Command -CommandType $CMD_EMERGENCY_STOP -PayloadJson '{"action":"clear"}' -BayLabel "Bay")
+
+    # ---- RV4: a Start with no session id leaves an empty-id record; an End with no id now clears it.
+    Clear-Bay
+    $eN = (Get-Date).ToUniversalTime().AddMinutes(40).ToString($fmtZ)
+    [void](Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson ('{"mode":"Start","playEndUtc":"' + $eN + '","closeLauncher":false}') -BayLabel "Bay")
+    Assert-True ($null -ne $Global:RunningSession -and (Get-RecSid) -eq "") "RV4 precondition: an unnamed Start records an unnamed session"
+    [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","closeLauncher":false}' -BayLabel "Bay")
+    Assert-True ((Get-RecSid) -eq "<none>") "RV4 an End naming no session clears the unnamed record (it stayed until the next Start before)"
+    $x = Invoke-CancelReset ""
+    Assert-True ($x.Reset) "RV4 ...so the next unbound Reset is no longer held"
+
+    # ---- RV1: replays of a session this bay already ended, while the next one plays.
+    Clear-Bay
+    [void](Invoke-Start "s-R"); [void](Invoke-End "s-R")
+    [void](Invoke-Start "s-T7")
+    $wallT7 = [IO.File]::ReadAllText($sessPath); $script:Fac = @()
+    $rp = Invoke-Start "s-R" "Prep"
+    $rs = Invoke-Start "s-R"
+    $rw = Execute-Command -CommandType $CMD_UPDATESESSIONDISPLAY -PayloadJson ('{"mode":"Warn5","baySessionId":"s-R","playEndUtc":"' + $endIso + '"}') -BayLabel "Bay"
+    $re = Invoke-End "s-R"
+    $allSkipped = ((Get-PropValue $rp "skipped" $null) -eq $true -and (Get-PropValue $rs "skipped" $null) -eq $true -and (Get-PropValue $rw "skipped" $null) -eq $true -and (Get-PropValue $re "skipped" $null) -eq $true)
+    Assert-True ($allSkipped -and [IO.File]::ReadAllText($sessPath) -ceq $wallT7 -and $script:Fac.Count -eq 0 -and (Get-RecSid) -eq "s-T7" -and (Get-IntentNow).Wanted -and (Get-IntentNow).SessionId -eq "s-T7") "RV1 a replayed Prep, Start, Warn5 and End of the ended s-R while s-T7 plays: each refused, s-T7's wall, record and intent untouched"
+    $Global:RunningSession = $null; Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+    Assert-True ((Test-SessionFinished "s-R" $Global:RunningSessionFinished) -and (Get-RecSid) -eq "s-T7") "RV1 the ended-session list survives a restart (record file)"
+    $l60 = @(); for ($i = 1; $i -le 60; $i++) { $l60 = @(Add-FinishedSessionToList -Finished $l60 -SessionId ("s-" + $i) -NowUtc $nC -Max 50) }
+    $l60b = @(Add-FinishedSessionToList -Finished $l60 -SessionId "S-20" -NowUtc $nC -Max 50)
+    Assert-True ($l60.Count -eq 50 -and -not (Test-SessionFinished "s-10" $l60) -and (Test-SessionFinished "s-11" $l60) -and (Test-SessionFinished "s-60" $l60) -and $l60b.Count -eq 50 -and [string](Get-KioskProp $l60b[49] "id" "") -eq "S-20") "RV1 the list keeps the newest 50; a re-added session moves to newest (no duplicate)"
+    Assert-True (-not (Test-SessionFinished "" $l60) -and -not (Test-SessionFinished $null @())) "RV1 an empty id is never 'ended'"
+    # Process-Command: a refused replay writes NO booking status (it would move a completed booking back to in-process);
+    # a late End of another booking still writes its booking complete.
+    $script:Patches2 = New-Object System.Collections.ArrayList
+    function Patch-Row { param($token, $entitySet, $id, $bodyObj, $ifMatch) [void]$script:Patches2.Add(@{ Set = $entitySet; Id = $id; Body = $bodyObj }) }
+    function New-CmdRow([int]$type, [string]$payloadText) {
+        $row = [ordered]@{ "@odata.etag" = 'W/"7"' }
+        $row[$Col_CommandId] = "c0ffee00-0000-0000-0000-000000000021"; $row[$Col_CommandType] = $type; $row[$Col_AttemptCount] = 0; $row[$Col_Payload] = $payloadText
+        return [pscustomobject]$row
+    }
+    $bkPay = '{"mode":"Start","baySessionId":"s-R","bookingId":"b0000000-0000-0000-0000-0000000000r1","playEndUtc":"' + $endIso + '","closeLauncher":false}'
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_STARTSESSION $bkPay)
+    Assert-True (@($script:Patches2 | Where-Object { $_.Set -eq "build_bookings" }).Count -eq 0 -and (Get-RecSid) -eq "s-T7") "RV1 Process-Command: the replayed Start of s-R writes no booking status"
+    $script:Patches2.Clear()
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION ('{"mode":"End","baySessionId":"s-U8","bookingId":"b0000000-0000-0000-0000-0000000000u8","closeLauncher":false}'))
+    Assert-True (@($script:Patches2 | Where-Object { $_.Set -eq "build_bookings" }).Count -eq 1 -and (Get-RecSid) -eq "s-T7") "Process-Command: a late End of another booking (left alone) still writes that booking complete"
+    [void](Invoke-End "s-T7")
+
+    # ---- An End whose wall write fails still closes (A0.360; a canceled booking never becomes free play).
+    Clear-Bay
+    [void](Invoke-Start "s-w")
+    $realWsf = Get-DefText $AgentDefs "Write-SessionFiles"
+    function Write-SessionFiles($modelObj) { throw "simulated disk failure" }
+    $rwf = $null; try { $rwf = Invoke-End "s-w" } catch { $rwf = $null }
+    . ([scriptblock]::Create($realWsf))
+    Assert-True ($null -ne $rwf -and -not [string]::IsNullOrWhiteSpace([string](Get-PropValue $rwf "wallError" $null)) -and (Get-IntentNow).Closed -and (Get-RecSid) -eq "<none>") "an End whose wall write fails still closes the launcher and the intent, and the result says the wall failed (it threw before)"
+    Clear-Bay
 
     # restore the suite's e-stop stubs for the sections below
     function Invoke-EmergencyStopInternal { param($payloadObj) $Global:EmergencyStopEngaged = $true; return @{ ok = $true; engaged = $true } }

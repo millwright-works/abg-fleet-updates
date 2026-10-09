@@ -22,7 +22,8 @@ RULES IT KEEPS (each one is a test)
   - It restarts the launcher only while state\kiosk-intent.json says "wanted" AND the time is before its untilUtc.
   - It closes a launcher ONLY under an explicit "closed" intent (written only by the EndSession of the running session),
     15 s after it was written (EndSession closes the launcher itself first), AND only while session.json shows that same
-    session ENDED: the backstop for a member who relaunches the launcher from the desktop after the end (bench Part B
+    session ENDED, or READY or PREP with the agent's own stamp on that write saying nobody plays (kiosk round 2, F1-R1):
+    the backstop for a member who relaunches the launcher from the desktop after the end (bench Part B
     Test 11; A0.360 "the launcher appears only from session start to play end"). By process id, only the configured
     launcher (name and path) in this session.
   - Anything unreadable, absent, expired, "unmanaged" or unknown means hands off: never restart, never close. It stops
@@ -227,7 +228,7 @@ function Get-KioskLauncherWanted($IntentRead, [DateTime]$NowUtc) {
     return $w
 }
 
-function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime]$NowUtc, [int]$GraceSeconds = 120) {
+function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime]$NowUtc, [int]$GraceSeconds = 120, $ClosedSinceUtc = $null) {
     # The SECOND source a close needs (attack RF1/RF2, 2026-10-08; RF-K2, 2026-10-09): session.json, which BayAgent writes
     # at every session command, must show the closed intent's own session ENDED. A closed intent left over from session A
     # while session B plays (a failed intent write) is then never acted on, whatever else rewrote session.json since.
@@ -250,7 +251,27 @@ function Get-KioskSessionGuard($SessionRead, [string]$ClosedSessionId, [DateTime
     if ($status -ceq "ENDED" -and $sid -is [string] -and -not [string]::IsNullOrWhiteSpace($sid) -and $sid -ceq $ClosedSessionId) {
         return @{ AllowClose = $true; Why = "session.json says session '$sid' ENDED, the session the closed intent names" }
     }
-    return @{ AllowClose = $false; Why = ("session.json says '{0}' (session '{1}'), not ENDED for the closed intent's session '{2}': nothing closed" -f $status, $sid, $ClosedSessionId) }
+    # F1-R1 (kiosk round 2, A0.360 "the launcher appears only from session start to play end"): after an End, the next
+    # booking's Prep (PREP) or a canceled booking's Reset on an idle bay (READY) rewrites the wall, and a member could
+    # relaunch the launcher and play until the next Start. Those two statuses also allow a close, but only with POSITIVE
+    # evidence carried by that SAME write: the agent's stamp (agentRunning) saying nobody plays, echoing this very status
+    # and session id (a stamp merged forward by another writer no longer matches), written no earlier than the closed
+    # intent. The stamp is the agent's in-memory record of who plays, which only that session's own Start, End and a
+    # canceled booking's warning move, and which every wall write carries: a member who plays is stamped as playing.
+    # STOP never allows it (A0.457: an emergency stop does not close the golf program).
+    if (($status -ceq "READY" -or $status -ceq "PREP") -and -not [string]::IsNullOrWhiteSpace($ClosedSessionId) -and $null -ne $ClosedSinceUtc) {
+        $ar = Get-KioskProp $o "agentRunning" $null
+        $arRunning = Get-KioskProp $ar "running" $null
+        $arStatus = Get-KioskProp $ar "status" $null
+        $arFor = Get-KioskProp $ar "forSessionId" $null
+        $arAt = ConvertTo-KioskUtc (Get-KioskProp $ar "writtenUtc" $null)
+        $wallSid = $(if ($null -eq $sid) { "" } elseif ($sid -is [string]) { $sid } else { $null })
+        if ($arRunning -is [bool] -and -not $arRunning -and $arStatus -is [string] -and $arStatus -ceq $status -and
+            $arFor -is [string] -and $null -ne $wallSid -and $arFor -ceq $wallSid -and $null -ne $arAt -and $arAt -ge $ClosedSinceUtc) {
+            return @{ AllowClose = $true; Why = ("session.json says '{0}' and the agent's stamp on that same write says nobody plays (after the closed intent for '{1}')" -f $status, $ClosedSessionId) }
+        }
+    }
+    return @{ AllowClose = $false; Why = ("session.json says '{0}' (session '{1}'), not ENDED for the closed intent's session '{2}', and no stamp saying nobody plays: nothing closed" -f $status, $sid, $ClosedSessionId) }
 }
 
 function Get-KioskSessionBacksWanted($SessionRead, [string]$WantedSessionId) {
@@ -895,7 +916,7 @@ function Invoke-KioskTick($S, [DateTime]$NowUtc) {
     switch ($action) {
         "close" {
             # Two sources must agree before a game is ended: the closed intent AND session.json showing that session ENDED.
-            $guard = Get-KioskSessionGuard -SessionRead (Read-KioskJsonFile -Path $S.Cfg.SessionJsonPath -MaxBytes 262144) -ClosedSessionId ([string]$S.Wanted.SessionId) -NowUtc $NowUtc
+            $guard = Get-KioskSessionGuard -SessionRead (Read-KioskJsonFile -Path $S.Cfg.SessionJsonPath -MaxBytes 262144) -ClosedSessionId ([string]$S.Wanted.SessionId) -NowUtc $NowUtc -ClosedSinceUtc $S.Wanted.ClosedSinceUtc
             $S.CloseHeld = $(if ($guard.AllowClose) { $null } else { $guard.Why })
             if ($guard.AllowClose) { Close-KioskLauncher -S $S -Procs $procs -NowUtc $NowUtc }
             else { $S.Closing.Clear(); Write-KioskLog ("close held: " + $guard.Why) "WARN" "close-held" }

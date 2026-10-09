@@ -130,6 +130,8 @@ try {
     $Global:EmergencyStopReason = $null
     # The agent's script-level running-session state (RF-K1, 2026-10-09): nobody playing, its file in this sandbox.
     $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $RunningSessionPath = Join-Path $tmp "state\running-session.json"
+    # Kiosk round 2: the ended-session list and the canceled-booking warning length (script-level in the agent).
+    $Global:RunningSessionFinished = @(); $RunningSessionFinishedMax = 50; $RunningSessionCancelWarningSeconds = 300
 
     function Invoke-Cmd([int]$type, [string]$json) { return (Execute-Command -CommandType $type -PayloadJson $json -BayLabel "TestBay") }
     function Reset-Latch { $Global:EmergencyStopEngaged = $false; $Global:EmergencyStopReason = $null; $Global:EmergencyStopPersistOk = $true; $Global:EmergencyStopStatePath = $statePath }
