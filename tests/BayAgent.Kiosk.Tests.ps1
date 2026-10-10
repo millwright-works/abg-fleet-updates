@@ -790,7 +790,8 @@ try {
     # Kiosk round 2 (A0.467, F1-R1, F1-R2, RV1-RV4). Lifted when present, so this file also runs against the base
     # release (4c8851ac), where the K21 scenarios then FAIL for the reason they exist instead of the lift throwing.
     foreach ($n in @("Set-AgentRunningStamp", "ConvertTo-RunningSnapshot", "Test-SessionFinished", "Add-FinishedSessionToList", "Add-FinishedSession",
-                     "Get-EndSessionScope", "Get-CancelEndUtc", "Get-CancelWarningText", "Send-ControlScreenWarning", "Start-CancelWarning", "Invoke-CancelEndIfDue")) {
+                     "Get-EndSessionScope", "Get-CancelEndUtc", "Get-CancelWarningText", "Send-ControlScreenWarning", "Start-CancelWarning", "Invoke-CancelEndIfDue",
+                     "Test-EndPendingFor", "Get-CommandRefusal", "Add-EndPending", "Clear-EndPending", "Invoke-PendingEndRetry", "Start-ControlScreenSender")) {
         if (@($AgentDefs | Where-Object { $_.Name -eq $n }).Count -eq 1) { . ([scriptblock]::Create((Get-DefText $AgentDefs $n))) }
         else { . ([scriptblock]::Create("function $n { return `$null }")) }
     }
@@ -1245,7 +1246,7 @@ try {
     function Stop-SessionDisplay { return @{ stopped = $false; reason = "stub" } }
     function Get-Sess { try { return ([IO.File]::ReadAllText($sessPath) | ConvertFrom-Json) } catch { return $null } }
     function Get-RecCancel { if ($null -eq $Global:RunningSession) { return $null }; return (Get-KioskProp $Global:RunningSession "cancelEndUtc" $null) }
-    function Clear-Bay { $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $Global:RunningSessionFinished = @(); Remove-Item -LiteralPath $RunningSessionPath -Force -ErrorAction SilentlyContinue; $Global:EmergencyStopEngaged = $false }
+    function Clear-Bay { $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $Global:RunningSessionFinished = @(); $Global:RunningSessionEndPending = @(); $Global:RunningSessionOwnEnd = $false; Remove-Item -LiteralPath $RunningSessionPath -Force -ErrorAction SilentlyContinue; $Global:EmergencyStopEngaged = $false }
     function Invoke-Start([string]$sid, [string]$mode = "Start") { return (Execute-Command -CommandType $CMD_STARTSESSION -PayloadJson (New-Payload $mode $sid) -BayLabel "Bay") }
     function Invoke-End([string]$sid) { return (Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson (New-Payload "End" $sid) -BayLabel "Bay") }
     function Invoke-BoundReset([string]$bound) { try { return (Execute-Command -CommandType $CMD_RESET -PayloadJson $resetJson -BayLabel "Bay" -BoundSessionId $bound) } catch { return $null } }
@@ -1360,11 +1361,20 @@ try {
     Assert-True ([string]$wt5 -match "^This booking was canceled\. Play ends in 5 minutes, at " -and [string]$wt1 -match "in 1 minute, at " -and [string]$wt5 -notmatch '["&|<>]') "A0.467 the control-screen text (got: $wt5)"
     if (Get-Command Test-RealSendControlScreenWarning -ErrorAction SilentlyContinue) {
         $script:MsgStarts = New-Object System.Collections.ArrayList
-        $sw = Test-RealSendControlScreenWarning -Text 'This booking was canceled. Play ends in 5 minutes, at 7:42 PM. "x" & y' -Seconds 300 -Starter { param($f, $a) [void]$script:MsgStarts.Add(@($f, $a)); return 4321 }
+        $sw = Test-RealSendControlScreenWarning -Text 'This booking was canceled. Play ends in 5 minutes, at 7:42 PM. "x" & y' -Seconds 300 -Starter { param($f, $a) [void]$script:MsgStarts.Add(@($f, $a)); return @{ pid = 4321; exitCode = 0 } }
         $ownSess = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
         $wantArgs = ('{0} /TIME:300 "This booking was canceled. Play ends in 5 minutes, at 7:42 PM. x  y"' -f $ownSess)
         $gotArgs = $(if ($script:MsgStarts.Count -gt 0) { [string]$script:MsgStarts[0][1] } else { "" })
         Assert-True ($sw["shown"] -eq $true -and $sw["pid"] -eq 4321 -and $script:MsgStarts.Count -eq 1 -and [string]$script:MsgStarts[0][0] -like "*\System32\msg.exe" -and $gotArgs -ceq $wantArgs) "A0.467 the real control-screen sender: msg.exe to this desktop session, for the warning's seconds, only safe characters on its command line (got: $gotArgs)"
+        # Item 5 (2026-10-10): "shown" is the sender's exit code, not the fact that a process started.
+        $swX = Test-RealSendControlScreenWarning -Text "t" -Seconds 30 -Starter { param($f, $a) return @{ pid = 11; exitCode = 1 } }
+        Assert-True ($swX["shown"] -eq $false -and $swX["exitCode"] -eq 1 -and [string]$swX["why"] -match "exited with code 1") "item 5 msg.exe exiting 1: shown is false and the result says the code (it read true once the process started)"
+        $swN = Test-RealSendControlScreenWarning -Text "t" -Seconds 30 -Starter { param($f, $a) return @{ pid = 12; exitCode = $null } }
+        Assert-True ($swN["shown"] -eq $false -and $null -eq $swN["exitCode"] -and [string]$swN["why"] -match "no exit code") "item 5 a starter that got no exit code (msg.exe still running, or unreadable): not confirmed, shown is false"
+        $swL = Test-RealSendControlScreenWarning -Text "t" -Seconds 30 -Starter { param($f, $a) return 4321 }
+        Assert-True ($swL["shown"] -eq $false) "item 5 a starter that returns only a process id (no exit code): shown is false"
+        $swOk = Test-RealSendControlScreenWarning -Text "t" -Seconds 30 -Starter { param($f, $a) return @{ pid = 13; exitCode = 0 } }
+        Assert-True ($swOk["shown"] -eq $true -and $swOk["exitCode"] -eq 0) "item 5 msg.exe exiting 0: shown is true"
         $swF = $null; try { $swF = Test-RealSendControlScreenWarning -Text "t" -Seconds 0 -Starter { param($f, $a) throw "no desktop" } } catch { $swF = $null }
         Assert-True ($null -ne $swF -and $swF["shown"] -eq $false -and [string]$swF["why"] -match "no desktop") "A0.467 a sender that fails is reported, never thrown"
     } else { Assert-True $false "A0.467 the real control-screen sender exists" }
@@ -1582,6 +1592,281 @@ try {
     . ([scriptblock]::Create($realWsf))
     Assert-True ($null -ne $rwf -and -not [string]::IsNullOrWhiteSpace([string](Get-PropValue $rwf "wallError" $null)) -and (Get-IntentNow).Closed -and (Get-RecSid) -eq "<none>") "an End whose wall write fails still closes the launcher and the intent, and the result says the wall failed (it threw before)"
     Clear-Bay
+
+    # ============================================================ K22 (kiosk round 2 FIX, 2026-10-10)
+    # A0.489 (a cancel is final on that bay), the refusal shown on the command row, R2 (an End that fails after the session
+    # was listed as ended is retried into closing the launcher), R1 (the attack's four surviving mutants: the main-loop call,
+    # the cancel End closing a real launcher, the cancel End naming the recorded session). Each assertion names what it pins.
+    Section "K22 round 2 fix: a cancel is final (A0.489); a refusal shows on the row; a failed End is retried (R2); the headline claims are pinned (R1)"
+    $script:Patches3 = New-Object System.Collections.ArrayList
+    $script:FailSkip3 = $false
+    function Patch-Row { param($token, $entitySet, $id, $bodyObj, $ifMatch)
+        [void]$script:Patches3.Add(@{ Set = $entitySet; Id = $id; Body = $bodyObj })
+        if ($script:FailSkip3 -and $bodyObj[$Col_Status] -eq $STATUS_SKIPPED) { throw "simulated guard refusal" }
+    }
+    function New-StandInLauncher {
+        # A real process the agent's End can find by path and close: a renamed copy of ping.exe in the sandbox.
+        $d = Join-Path $Sandbox ("standin-" + [guid]::NewGuid().ToString("N").Substring(0, 8)); New-Item -ItemType Directory -Force -Path $d | Out-Null
+        $nm = "AbgStandIn" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        $exe = Join-Path $d ($nm + ".exe")
+        Copy-Item -LiteralPath (Join-Path $env:WINDIR "System32\ping.exe") -Destination $exe
+        $p = Start-Process -FilePath $exe -ArgumentList "-t 127.0.0.1" -WindowStyle Hidden -PassThru
+        Start-Sleep -Milliseconds 600
+        $cfg | Add-Member -NotePropertyName launcher -NotePropertyValue ([pscustomobject]@{ path = $exe; processName = $nm }) -Force
+        return [pscustomobject]@{ Proc = $p; Exe = $exe; Name = $nm }
+    }
+    function Test-StandInAlive($s) { try { $s.Proc.Refresh(); return (-not $s.Proc.HasExited) } catch { return $false } }
+    function Remove-StandInLauncher($s) {
+        try { if ($null -ne $s -and (Test-StandInAlive $s)) { Stop-Process -Id $s.Proc.Id -Force -ErrorAction SilentlyContinue } } catch { }
+        try { if ($null -ne $cfg.PSObject.Properties["launcher"]) { $cfg.PSObject.Properties.Remove("launcher") } } catch { }
+    }
+    function Get-BookingWrites { return @($script:Patches3 | Where-Object { $_.Set -eq "build_bookings" }).Count }
+    $realGetLauncherCfg = Get-DefText $AgentDefs "Get-LauncherConfigFromPayloadOrConfig"
+    $script:GlThrows = 0
+    # A step between the ended list and the launcher close that fails, and its repair (both define the function in script scope).
+    $brokenGetLauncherCfg = 'function script:Get-LauncherConfigFromPayloadOrConfig($payloadObj) { $script:GlThrows++; throw "simulated failure after the session was listed as ended" }'
+    $repairGetLauncherCfg = $realGetLauncherCfg.Replace("function Get-LauncherConfigFromPayloadOrConfig", "function script:Get-LauncherConfigFromPayloadOrConfig")
+    function Break-LauncherStep { . ([scriptblock]::Create($brokenGetLauncherCfg)) }
+    function Repair-LauncherStep { . ([scriptblock]::Create($repairGetLauncherCfg)) }
+
+    # ---- A0.489: a Start, Prep, display update or End for the canceled booking during its warning is refused.
+    Clear-Bay
+    [void](Invoke-Start "s-h1")
+    $script:Fac = @(); $script:ControlWarnings.Clear()
+    $rh = Invoke-BoundReset "s-h1"; $endsH = Get-EndsOf $rh
+    $wallH = [IO.File]::ReadAllText($sessPath); $recH = [IO.File]::ReadAllText($RunningSessionPath); $intH = [IO.File]::ReadAllText($KioskIntentPath); $facH = @($script:Fac).Count
+    $hPrep = Invoke-Start "s-h1" "Prep"
+    $hStart = Invoke-Start "s-h1"
+    $hUpd = Execute-Command -CommandType $CMD_UPDATESESSIONDISPLAY -PayloadJson ('{"mode":"Warn5","baySessionId":"s-h1","playEndUtc":"' + $endIso + '"}') -BayLabel "Bay"
+    $hEnd = Invoke-End "s-h1"
+    $allHeld = $true
+    foreach ($hr in @($hPrep, $hStart, $hUpd, $hEnd)) { if (-not ((Get-PropValue $hr "skipped" $null) -eq $true -and (Get-PropValue $hr "refusal" "") -eq "cancel-warning")) { $allHeld = $false } }
+    Assert-True $allHeld "A0.489 a Prep, a Start, a display update and an End for the canceled s-h1 during its warning: each refused (skipped, refusal cancel-warning)"
+    Assert-True ([IO.File]::ReadAllText($sessPath) -ceq $wallH -and [IO.File]::ReadAllText($RunningSessionPath) -ceq $recH -and [IO.File]::ReadAllText($KioskIntentPath) -ceq $intH -and @($script:Fac).Count -eq $facH) "A0.489 ...and nothing is touched: the warning wall, the record file, the intent file and the facility are as the cancel left them"
+    Assert-True ((Get-SessStatus) -eq "ENDING/s-h1" -and (Get-PropValue (Get-Sess) "bannerText" "") -eq "Booking canceled" -and $null -ne $endsH -and (ConvertTo-KioskUtc (Get-RecCancel)) -eq $endsH -and (Get-IntentNow).Wanted) "A0.489 ...the warning stays on the wall with the end set at the cancel (never back to 'In progress' with the full countdown: the middle state)"
+    $endH = Invoke-CancelEndIfDue -NowUtc $endsH.AddSeconds(1)
+    Assert-True ((Get-SessStatus) -eq "ENDED/s-h1" -and (Get-IntentNow).Closed -and (Get-RecSid) -eq "<none>" -and (Get-PropValue $endH "scope" "") -eq "running" -and (Test-SessionFinished "s-h1" $Global:RunningSessionFinished)) "A0.489 ...and the game still ends at the warning's mark: the agent's own End is not refused by the hold"
+    Assert-True (-not $Global:RunningSessionOwnEnd) "A0.489 ...and the 'agent's own End' flag is off again afterwards (it would switch the hold off for every later command)"
+    $hAfter = Invoke-Start "s-h1"
+    Assert-True ((Get-PropValue $hAfter "skipped" $null) -eq $true -and (Get-PropValue $hAfter "refusal" "") -eq "ended-replay" -and (Get-SessStatus) -eq "ENDED/s-h1") "A0.489 a booking reinstated after the bay ended it stays refused"
+    # Only that booking: the next booking's Prep and Start still run during the warning (the hold is per session).
+    Clear-Bay
+    [void](Invoke-Start "s-h5")
+    $endsH5 = Get-EndsOf (Invoke-BoundReset "s-h5")
+    $nPrep = Invoke-Start "s-n5" "Prep"
+    Assert-True ($null -eq (Get-PropValue $nPrep "skipped" $null) -and (Get-SessStatus) -eq "PREP/s-n5" -and (Get-RecSid) -eq "s-h5") "A0.489 the hold is for the canceled booking only: the next booking's Prep during the warning still runs"
+    $nStart = Invoke-Start "s-n5"
+    Assert-True ($null -eq (Get-PropValue $nStart "skipped" $null) -and (Get-RecSid) -eq "s-n5" -and $null -eq (Get-RecCancel)) "A0.489 ...and the next booking's Start takes the bay (the canceled booking's warning is over for it)"
+    [void](Invoke-End "s-n5")
+    # The pure rule, every branch.
+    $recW = [ordered]@{ baySessionId = "s-a"; endUtc = "2026-10-09T13:00:00Z"; since = "2026-10-09T11:00:00Z"; cancelEndUtc = "2026-10-09T12:05:00Z" }
+    $recP = [ordered]@{ baySessionId = "s-a"; endUtc = "2026-10-09T13:00:00Z"; since = "2026-10-09T11:00:00Z" }
+    foreach ($ct in @($CMD_STARTSESSION, $CMD_UPDATESESSIONDISPLAY, $CMD_ENDSESSION)) {
+        $gW = Get-CommandRefusal -CommandType $ct -Payload ([pscustomobject]@{ baySessionId = " S-A " }) -Running $recW -Finished @() -Pending @()
+        Assert-True ($null -ne $gW -and $gW.Kind -eq "cancel-warning") "A0.489 rule: command type $ct for the canceled running session (id compared the way the bay compares ids): refused"
+    }
+    Assert-True ($null -eq (Get-CommandRefusal -CommandType $CMD_ENDSESSION -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $recW -Finished @() -Pending @() -OwnEnd $true)) "A0.489 rule: the agent's own End of the canceled session is not refused"
+    Assert-True ($null -eq (Get-CommandRefusal -CommandType $CMD_STARTSESSION -Payload ([pscustomobject]@{ baySessionId = "s-b" }) -Running $recW -Finished @() -Pending @())) "A0.489 rule: another session's Start is not refused"
+    Assert-True ($null -eq (Get-CommandRefusal -CommandType $CMD_STARTSESSION -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $recP -Finished @() -Pending @())) "A0.489 rule: the running session that was NOT canceled is not refused"
+    Assert-True ($null -eq (Get-CommandRefusal -CommandType $CMD_STARTSESSION -Payload ([pscustomobject]@{ mode = "Start" }) -Running $recW -Finished @() -Pending @())) "A0.489 rule: a command naming no session is not refused"
+    Assert-True ($null -eq (Get-CommandRefusal -CommandType $CMD_RESET -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $recW -Finished @() -Pending @())) "A0.489 rule: a Reset is not this rule's (the Reset gate decides)"
+    $finA = @([ordered]@{ id = "s-a"; utc = "2026-10-09T12:00:00Z" })
+    $gF = Get-CommandRefusal -CommandType $CMD_STARTSESSION -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $null -Finished $finA -Pending @()
+    Assert-True ($null -ne $gF -and $gF.Kind -eq "ended-replay") "RV1 rule: a session the bay ended: refused"
+    Assert-True ($null -eq (Get-CommandRefusal -CommandType $CMD_ENDSESSION -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $null -Finished $finA -Pending @([ordered]@{ id = "s-a"; payload = "{}"; tries = 0 }))) "R2 rule: an End of an ended session whose protective act is pending, nobody playing: not refused (the retry)"
+    Assert-True ($null -ne (Get-CommandRefusal -CommandType $CMD_ENDSESSION -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $recP -Finished $finA -Pending @([ordered]@{ id = "s-a"; payload = "{}"; tries = 0 }))) "R2 rule: ...but refused while another session is recorded as playing"
+    Assert-True ($null -ne (Get-CommandRefusal -CommandType $CMD_STARTSESSION -Payload ([pscustomobject]@{ baySessionId = "s-a" }) -Running $null -Finished $finA -Pending @([ordered]@{ id = "s-a"; payload = "{}"; tries = 0 }))) "R2 rule: a pending End never lets a Start of the ended session through"
+
+    # ---- Item 2: the refusal is visible on the command row (Skipped), not only inside a Succeeded row's result text.
+    function Get-FirstPatch { if ($script:Patches3.Count -gt 0) { return $script:Patches3[0] }; return @{ Body = @{}; Set = ""; Id = "" } }
+    Clear-Bay
+    [void](Invoke-Start "s-h2"); [void](Invoke-BoundReset "s-h2")
+    $bkH2 = 'b0000000-0000-0000-0000-0000000000h2'
+    foreach ($rowSpec in @(
+        @{ T = $CMD_STARTSESSION; N = "Start"; P = ('{"mode":"Start","baySessionId":"s-h2","bookingId":"' + $bkH2 + '","playEndUtc":"' + $endIso + '","closeLauncher":false}') },
+        @{ T = $CMD_STARTSESSION; N = "Prep"; P = ('{"mode":"Prep","baySessionId":"s-h2","bookingId":"' + $bkH2 + '","playEndUtc":"' + $endIso + '"}') },
+        @{ T = $CMD_UPDATESESSIONDISPLAY; N = "display update"; P = ('{"mode":"Warn5","baySessionId":"s-h2","playEndUtc":"' + $endIso + '"}') },
+        @{ T = $CMD_ENDSESSION; N = "End"; P = ('{"mode":"End","baySessionId":"s-h2","bookingId":"' + $bkH2 + '","closeLauncher":false}') })) {
+        $script:Patches3.Clear()
+        Process-Command -token "t" -cmd (New-CmdRow $rowSpec.T $rowSpec.P)
+        $p1 = Get-FirstPatch
+        Assert-True ($script:Patches3.Count -eq 1 -and @($p1.Body.Keys).Count -eq 1 -and $p1.Body[$Col_Status] -eq 100000005 -and (Get-BookingWrites) -eq 0) "item 2 the canceled s-h2's $($rowSpec.N) row during its warning: ONE write, status Skipped only (no lock, no execution fields, no booking write)"
+    }
+    Assert-True ((Get-RecSid) -eq "s-h2" -and (Get-SessStatus) -eq "ENDING/s-h2") "item 2 ...and none of them moved the warning"
+    $script:FailSkip3 = $true; $script:Patches3.Clear()
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_STARTSESSION ('{"mode":"Start","baySessionId":"s-h2","bookingId":"' + $bkH2 + '","playEndUtc":"' + $endIso + '","closeLauncher":false}'))
+    $script:FailSkip3 = $false
+    $lastP = $(if ($script:Patches3.Count -gt 0) { $script:Patches3[$script:Patches3.Count - 1] } else { @{ Body = @{}; Set = "" } })
+    Assert-True ($script:Patches3.Count -eq 3 -and $script:Patches3[1].Body[$Col_Status] -eq $STATUS_INPROGRESS -and $lastP.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$lastP.Body[$Col_Result] -match '"skipped":true' -and (Get-BookingWrites) -eq 0 -and (Get-SessStatus) -eq "ENDING/s-h2") "item 2 if the Skipped write is refused: the command runs, the handler refuses it, Succeeded with skipped in the result, no booking write, the warning stands"
+    [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime().AddMinutes(6)))
+    # An ended session's replay is visible the same way; a fresh Start is NOT turned away.
+    Clear-Bay
+    [void](Invoke-Start "s-h3"); [void](Invoke-End "s-h3")
+    $script:Patches3.Clear()
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION '{"mode":"End","baySessionId":"s-h3","closeLauncher":false}')
+    $p3 = Get-FirstPatch
+    Assert-True ($script:Patches3.Count -eq 1 -and $p3.Body[$Col_Status] -eq 100000005 -and @($p3.Body.Keys).Count -eq 1) "item 2 a repeated End of the ended s-h3: one write, Skipped"
+    $script:Patches3.Clear()
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_STARTSESSION ('{"mode":"Start","baySessionId":"s-h4","bookingId":"b0000000-0000-0000-0000-0000000000h4","playEndUtc":"' + $endIso + '","closeLauncher":false}'))
+    Assert-True ($script:Patches3.Count -ge 2 -and $script:Patches3[0].Body[$Col_Status] -eq $STATUS_INPROGRESS -and (Get-BookingWrites) -eq 1 -and (Get-RecSid) -eq "s-h4") "item 2 a fresh booking's Start is not turned away: locked, run, booking written In-process"
+    [void](Invoke-End "s-h4")
+
+    # ---- R1 (VM04, VM05): the cancel End, run against a REAL launcher process, naming the recorded session.
+    Clear-Bay
+    $sl1 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-c10")
+        $endsC10 = Get-EndsOf (Invoke-BoundReset "s-c10")
+        [void](Invoke-Start "s-n10" "Prep")
+        Assert-True ((Get-SessStatus) -eq "PREP/s-n10" -and (Get-RecSid) -eq "s-c10") "R1 setup: the next booking's Prep rewrote the wall (PREP/s-n10) while s-c10, canceled, plays out its warning"
+        $dueEarly = Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime().AddMinutes(4))
+        Assert-True ($null -eq $dueEarly -and (Test-StandInAlive $sl1)) "R1 4 minutes into the warning: nothing ended, the real launcher process is still running"
+        $dueRes = Invoke-CancelEndIfDue -NowUtc $endsC10.AddSeconds(1)
+        Start-Sleep -Milliseconds 500
+        Assert-True (-not (Test-StandInAlive $sl1)) "R1 (VM04) the cancel End closes the real launcher process when the warning is over"
+        $iC = Get-IntentNow
+        Assert-True ((Get-PropValue $dueRes "scope" "") -eq "running" -and $iC.Closed -and $iC.SessionId -eq "s-c10" -and (Test-SessionFinished "s-c10" $Global:RunningSessionFinished) -and -not (Test-SessionFinished "s-n10" $Global:RunningSessionFinished) -and (Get-RecSid) -eq "<none>") "R1 (VM05) the cancel End names the RECORDED session (s-c10), not the session the wall shows (s-n10): intent closed for s-c10, s-c10 listed as ended, s-n10 not"
+    } finally { Remove-StandInLauncher $sl1 }
+
+    # ---- R2: an End that fails after the session was listed as ended is retried into closing the launcher.
+    # (a) the cancel End.
+    Clear-Bay
+    $sl2 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-r2a")
+        $endsR2a = Get-EndsOf (Invoke-BoundReset "s-r2a")
+        Break-LauncherStep; $script:GlThrows = 0
+        $failRes = Invoke-CancelEndIfDue -NowUtc $endsR2a.AddSeconds(1)
+        Assert-True ($null -eq $failRes -and $script:GlThrows -eq 1 -and (Test-StandInAlive $sl2) -and (Test-SessionFinished "s-r2a" $Global:RunningSessionFinished) -and (Test-EndPendingFor "s-r2a" $Global:RunningSessionEndPending) -and (Get-RecSid) -eq "<none>") "R2 setup: the cancel End failed between the ended list and the launcher close: launcher still open, session listed as ended, End pending"
+        Assert-True (-not $Global:RunningSessionOwnEnd) "A0.489 ...and the 'agent's own End' flag is off after an End that threw too"
+        Repair-LauncherStep
+        $retry = Invoke-CancelEndIfDue -NowUtc $endsR2a.AddSeconds(4)
+        Start-Sleep -Milliseconds 500
+        Assert-True ($null -ne $retry -and (Get-PropValue $retry "scope" "") -eq "retry" -and -not (Test-StandInAlive $sl2) -and (Get-IntentNow).Closed -and -not (Test-EndPendingFor "s-r2a" $Global:RunningSessionEndPending)) "R2 the next pass retries the cancel End: the real launcher is closed, the intent closed, the mark dropped (the ended list no longer makes the protective act a no-op)"
+        Assert-True ($null -eq (Invoke-CancelEndIfDue -NowUtc $endsR2a.AddSeconds(8))) "R2 ...and a pass after that does nothing"
+    } finally { Remove-StandInLauncher $sl2 }
+    # (b) a platform End, through Process-Command rows, with the next booking's Prep arriving in between: the retry does
+    # not rewrite the next booking's wall.
+    Clear-Bay
+    $sl3 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-r2b")
+        $endRowPayload = '{"mode":"End","baySessionId":"s-r2b","bookingId":"b0000000-0000-0000-0000-0000000000b2"}'
+        Break-LauncherStep; $script:GlThrows = 0; $script:Patches3.Clear()
+        Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION $endRowPayload)
+        $lastF = $(if ($script:Patches3.Count -gt 0) { $script:Patches3[$script:Patches3.Count - 1] } else { @{ Body = @{} } })
+        Assert-True ($lastF.Body[$Col_Status] -eq $STATUS_FAILED -and (Test-StandInAlive $sl3) -and (Test-EndPendingFor "s-r2b" $Global:RunningSessionEndPending)) "R2 setup: a platform End failed mid-way: its row is Failed, the launcher still open, End pending"
+        Repair-LauncherStep
+        [void](Invoke-Start "s-n11" "Prep")
+        $wallBeforeRetry = [IO.File]::ReadAllText($sessPath)
+        $script:Patches3.Clear()
+        Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION $endRowPayload)
+        Start-Sleep -Milliseconds 500
+        $p0b = Get-FirstPatch; $lastR = @($script:Patches3 | Where-Object { $_.Set -ne "build_bookings" })[-1]
+        Assert-True ($p0b.Body[$Col_Status] -eq $STATUS_INPROGRESS -and $lastR.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$lastR.Body[$Col_Result] -match '"scope":"retry"') "R2 the platform sends the same End again: not turned away as 'already ended' (a lock, a run, Succeeded as a retry)"
+        Assert-True (-not (Test-StandInAlive $sl3) -and (Get-IntentNow).Closed -and (Get-IntentNow).SessionId -eq "s-r2b" -and -not (Test-EndPendingFor "s-r2b" $Global:RunningSessionEndPending)) "R2 ...the real launcher is closed, the intent closed, the mark dropped"
+        Assert-True ((Get-SessStatus) -eq "PREP/s-n11" -and [IO.File]::ReadAllText($sessPath) -ceq $wallBeforeRetry -and (Get-BookingWrites) -eq 1) "R2 ...the retry left the next booking's wall alone (PREP/s-n11) and, as the first run never got that far, wrote the booking Complete once"
+        $script:Patches3.Clear()
+        Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION $endRowPayload)
+        Assert-True ($script:Patches3.Count -eq 1 -and $script:Patches3[0].Body[$Col_Status] -eq 100000005) "R2 a third send of that End, now finished for good: refused as Skipped"
+    } finally { Remove-StandInLauncher $sl3 }
+    # (c) the retry stops after its cap; (d) a session that plays now ends the retry without touching its launcher.
+    Clear-Bay
+    $sl4 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-r2c")
+        Break-LauncherStep; $script:GlThrows = 0; $script:LogLines.Clear()
+        try { [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","baySessionId":"s-r2c"}' -BayLabel "Bay") } catch { }
+        for ($i = 0; $i -lt 8; $i++) { [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime())) }
+        $dropLogged = @($script:LogLines | Where-Object { $_ -match "could not finish its protective act after 5 tries" }).Count
+        Assert-True ($script:GlThrows -eq 6 -and @($Global:RunningSessionEndPending).Count -eq 0 -and $dropLogged -eq 1 -and (Test-StandInAlive $sl4)) "R2 a step that keeps failing: the first run plus exactly 5 retries (6 attempts), then dropped with one WARN; no endless loop (got $($script:GlThrows) attempts, drop logged $dropLogged)"
+        Repair-LauncherStep
+    } finally { Remove-StandInLauncher $sl4 }
+    Clear-Bay
+    $sl5 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-r2d")
+        Break-LauncherStep; $script:GlThrows = 0
+        try { [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","baySessionId":"s-r2d"}' -BayLabel "Bay") } catch { }
+        Repair-LauncherStep
+        [void](Invoke-Start "s-r2e")
+        [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime()))
+        Assert-True (@($Global:RunningSessionEndPending).Count -eq 0 -and (Test-StandInAlive $sl5) -and (Get-RecSid) -eq "s-r2e" -and (Get-IntentNow).Wanted -and (Get-IntentNow).SessionId -eq "s-r2e") "R2 another session started meanwhile: the old End's retry is dropped and s-r2e's launcher is not touched"
+        [void](Invoke-End "s-r2e")
+    } finally { Remove-StandInLauncher $sl5 }
+    Clear-Bay
+
+    # ---- R1 (VM01, VM02): the REAL BayAgent.ps1, one main-loop pass (-Once), no network, a canceled booking whose warning is over.
+    $realLoopOk = $true
+    function Invoke-RealLoopCase([string]$Name, [int]$CancelEndOffsetSeconds) {
+        $root = Join-Path $Sandbox ("realloop-" + $Name)
+        foreach ($d in @("", "logs", "secrets", "state")) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null }
+        $text = [IO.File]::ReadAllText($AgentScript)
+        $needle = '$BaseDir = "C:\AllBirdies\BayAgent"'
+        if (-not $text.Contains($needle)) { throw "the BaseDir literal was not found in the agent" }
+        $agent = Join-Path $root "BayAgent.ps1"
+        [IO.File]::WriteAllText($agent, $text.Replace($needle, ('$BaseDir = "{0}"' -f $root)), (New-Object Text.UTF8Encoding($true)))
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\src\BayAgent\manifest.json") -Destination (Join-Path $root "manifest.json") -Force
+        try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } catch { }
+        $plain = [Text.Encoding]::UTF8.GetBytes("not-a-real-secret-" + [guid]::NewGuid().ToString("N"))
+        $prot = [System.Security.Cryptography.ProtectedData]::Protect($plain, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+        [IO.File]::WriteAllBytes((Join-Path $root "secrets\clientsecret.dpapi"), $prot)
+        $sl = New-StandInLauncher
+        $sessP = Join-Path $root "session.json"
+        $c = [ordered]@{
+            environmentUrl = "http://127.0.0.1:9"; tenantId = "11111111-1111-1111-1111-111111111111"; clientId = "22222222-2222-2222-2222-222222222222"
+            clientSecretDpapiPath = (Join-Path $root "secrets\clientsecret.dpapi"); clientCertThumbprint = ""; bayId = "33333333-3333-3333-3333-333333333333"
+            pollSeconds = 3; heartbeatSeconds = 60; tokenAuthorityHost = "http://127.0.0.1:9"; logLevel = "DEBUG"; sessionJsonPath = $sessP
+            launcher = [ordered]@{ path = $sl.Exe; args = ""; processName = $sl.Name; displayRole = "control"; startOnPrep = $false; startOnStart = $true }
+            sessionDisplay = [ordered]@{ enabled = $false }
+        }
+        $u8 = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $root "agent-config.json"), ($c | ConvertTo-Json -Depth 5), $u8)
+        $now = (Get-Date).ToUniversalTime()
+        $cEnd = $now.AddSeconds($CancelEndOffsetSeconds).ToString($fmtZ); $bEnd = $now.AddMinutes(40).ToString($fmtZ); $wr = $now.AddMinutes(-4).ToString($fmtZ); $since = $now.AddMinutes(-30).ToString($fmtZ)
+        $stamp = [ordered]@{ schema = 1; running = $true; baySessionId = "s-live"; endUtc = $bEnd; since = $since; cancelEndUtc = $cEnd; status = "ENDING"; forSessionId = "s-live"; writtenUtc = $wr }
+        $wall = [ordered]@{ schema = 1; status = "ENDING"; baySessionId = "s-live"; displayName = "Guest"; playEndUtc = $cEnd; sessionEndUtc = $cEnd; endUtc = $cEnd; bannerText = "Booking canceled"; statusDetail = "This booking was canceled."; agentRunning = $stamp }
+        [IO.File]::WriteAllText($sessP, ($wall | ConvertTo-Json -Depth 6), $u8)
+        $rec = [ordered]@{ schema = 1; running = $true; baySessionId = "s-live"; endUtc = $bEnd; since = $since; cancelEndUtc = $cEnd; finished = @(); writtenUtc = $wr }
+        [IO.File]::WriteAllText((Join-Path $root "state\running-session.json"), ($rec | ConvertTo-Json -Depth 4), $u8)
+        $intent = [ordered]@{ schema = 1; launcher = "wanted"; untilUtc = $now.AddSeconds($CancelEndOffsetSeconds + 120).ToString($fmtZ); baySessionId = "s-live"; reason = "booking canceled mid-play: wanted until its warning ends (A0.467)"; writtenUtc = $wr; agentPid = 1 }
+        [IO.File]::WriteAllText((Join-Path $root "state\kiosk-intent.json"), ($intent | ConvertTo-Json -Depth 3), $u8)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$agent`" -Once"
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true; $psi.WorkingDirectory = $root
+        if ($psi.EnvironmentVariables.ContainsKey("PSModulePath")) { $psi.EnvironmentVariables.Remove("PSModulePath") }
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $so = $proc.StandardOutput.ReadToEndAsync(); $se = $proc.StandardError.ReadToEndAsync()
+        $exited = $proc.WaitForExit(180000)
+        if (-not $exited) { try { $proc.Kill() } catch { } }
+        Start-Sleep -Milliseconds 300
+        $log = ""
+        foreach ($lf in @(Get-ChildItem -LiteralPath (Join-Path $root "logs") -Filter "*.log" -ErrorAction SilentlyContinue)) { $log += [IO.File]::ReadAllText($lf.FullName) }
+        $w = $null; try { $w = [IO.File]::ReadAllText($sessP) | ConvertFrom-Json } catch { }
+        $ik = $null; try { $ik = [IO.File]::ReadAllText((Join-Path $root "state\kiosk-intent.json")) | ConvertFrom-Json } catch { }
+        $rc = $null; try { $rc = [IO.File]::ReadAllText((Join-Path $root "state\running-session.json")) | ConvertFrom-Json } catch { }
+        $fin = ""; try { $fin = (@($rc.finished) | ForEach-Object { $_.id }) -join "," } catch { }
+        $alive = Test-StandInAlive $sl
+        Remove-StandInLauncher $sl
+        return [pscustomobject]@{ Exited = $exited; Wall = $(if ($w) { "{0}/{1}" -f $w.status, $w.baySessionId } else { "?" }); Intent = $(if ($ik) { "{0}/{1}" -f $ik.launcher, $ik.baySessionId } else { "?" }); Running = $(if ($rc) { $rc.running } else { "?" }); Finished = $fin; LauncherAlive = $alive; EndLogged = ($log -match "ended after its warning") }
+    }
+    $rlDue = $null; $rlNot = $null
+    try { $rlDue = Invoke-RealLoopCase "due" -60; $rlNot = Invoke-RealLoopCase "notdue" 600 } catch { $realLoopOk = $false; Write-Host ("  real-loop setup failed: " + $_.Exception.Message) }
+    Assert-True ($realLoopOk -and $null -ne $rlDue -and $rlDue.Exited -and $rlDue.Wall -eq "ENDED/s-live" -and $rlDue.Intent -eq "closed/s-live" -and $rlDue.Running -eq $false -and $rlDue.Finished -match "s-live" -and -not $rlDue.LauncherAlive -and $rlDue.EndLogged) "R1 (VM01, VM02) the REAL agent script, one main-loop pass with no network, a canceled booking whose warning is over: wall ENDED, intent closed, record cleared and listed, the real launcher process closed (got: $(if ($rlDue) { '{0} | {1} | running={2} | finished={3} | launcher alive={4} | logged={5}' -f $rlDue.Wall, $rlDue.Intent, $rlDue.Running, $rlDue.Finished, $rlDue.LauncherAlive, $rlDue.EndLogged } else { 'no result' }))"
+    Assert-True ($realLoopOk -and $null -ne $rlNot -and $rlNot.Exited -and $rlNot.Wall -eq "ENDING/s-live" -and $rlNot.Intent -eq "wanted/s-live" -and $rlNot.Running -eq $true -and $rlNot.LauncherAlive -and -not $rlNot.EndLogged) "R1 ...and with 10 minutes of the warning left, the same pass ends nothing (the control: the check is on the clock)"
+
+    # ---- Item 5: the default sender's process handling, against real processes (a renamed copy of ping.exe stands in for msg.exe).
+    $slS = New-StandInLauncher
+    try {
+        $sOk = Start-ControlScreenSender -Exe $slS.Exe -ArgLine "127.0.0.1 -n 1"
+        Assert-True ($null -ne $sOk -and $sOk["exitCode"] -eq 0 -and $sOk["pid"] -gt 0) "item 5 the default sender reads exit code 0 from a process that exits 0 (got: $($sOk['exitCode']))"
+        $sBad = Start-ControlScreenSender -Exe $slS.Exe -ArgLine "/bogus-option"
+        Assert-True ($null -ne $sBad -and $sBad["exitCode"] -is [int] -and $sBad["exitCode"] -ne 0) "item 5 ...and the non-zero code of one that fails (got: $($sBad['exitCode']))"
+        $sSlow = Start-ControlScreenSender -Exe $slS.Exe -ArgLine "-t 127.0.0.1" -WaitMs 400
+        Assert-True ($null -ne $sSlow -and $null -eq $sSlow["exitCode"] -and $sSlow["pid"] -gt 0) "item 5 ...and no exit code at all for one still running when the wait ends"
+        try { Stop-Process -Id $sSlow["pid"] -Force -ErrorAction SilentlyContinue } catch { }
+    } finally { Remove-StandInLauncher $slS }
 
     # restore the suite's e-stop stubs for the sections below
     function Invoke-EmergencyStopInternal { param($payloadObj) $Global:EmergencyStopEngaged = $true; return @{ ok = $true; engaged = $true } }

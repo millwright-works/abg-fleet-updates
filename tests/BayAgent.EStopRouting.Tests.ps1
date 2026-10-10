@@ -249,6 +249,8 @@ try {
     $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $RunningSessionPath = Join-Path $tmp "state\running-session.json"
     # Kiosk round 2: the ended-session list and the canceled-booking warning length (script-level in the agent).
     $Global:RunningSessionFinished = @(); $RunningSessionFinishedMax = 50; $RunningSessionCancelWarningSeconds = 300
+    # Kiosk round 2 fix (2026-10-10): the pending-End list, its retry cap and the agent's-own-End flag (A0.489, R2).
+    $Global:RunningSessionEndPending = @(); $RunningSessionEndRetryMax = 5; $Global:RunningSessionOwnEnd = $false
 
     function Invoke-Cmd([int]$type, [string]$json) { return (Execute-Command -CommandType $type -PayloadJson $json -BayLabel "TestBay") }
     function New-Victim {

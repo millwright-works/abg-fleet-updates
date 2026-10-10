@@ -4770,9 +4770,10 @@ $CMD_EMERGENCY_STOP {
 
             # RV1 (kiosk round 2): a display update (Warn5, an extension) for a session this bay already ended is a replay:
             # it would put that session's countdown and Warning scene over whoever plays now. Nothing is touched.
-            $updSid = [string](Get-PropValue $payloadObj "baySessionId" "")
-            if (Test-SessionFinished $updSid $Global:RunningSessionFinished) {
-                return @{ updated = $false; skipped = $true; reason = "session '$updSid' already ended on this bay: a replayed display update is not run" }
+            # A0.489: the same refusal for a canceled booking in its warning (an extension must not restore its countdown).
+            $updRef = Get-CommandRefusal -CommandType $CMD_UPDATESESSIONDISPLAY -Payload $payloadObj -Running $Global:RunningSession -Finished $Global:RunningSessionFinished -Pending $Global:RunningSessionEndPending
+            if ($null -ne $updRef) {
+                return @{ updated = $false; skipped = $true; refusal = $updRef.Kind; reason = $updRef.Why }
             }
 
             # A0.363: a later end for the SAME running session extends the launcher intent (never creates one).
@@ -4839,9 +4840,12 @@ $CMD_EMERGENCY_STOP {
             # RV1 (kiosk round 2): a session this bay already ended is never prepped or started again. A re-run of the
             # platform's command upsert replays a finished booking's Prep and Start with notBefore = now, and a replayed
             # Start would take the bay from whoever plays now. Nothing is touched.
+            # A0.489 (Kevin, 2026-10-10): the same for a canceled booking in its 5-minute warning. A Prep or Start for it is
+            # refused, the warning stays on the wall and the game ends at the warning's mark. Nothing is touched.
             $startSid = [string](Get-PropValue $payloadObj "baySessionId" "")
-            if (Test-SessionFinished $startSid $Global:RunningSessionFinished) {
-                return @{ ok = $true; skipped = $true; mode = $mode; reason = "session '$startSid' already ended on this bay: a replayed $mode is not run" }
+            $startRef = Get-CommandRefusal -CommandType $CMD_STARTSESSION -Payload $payloadObj -Running $Global:RunningSession -Finished $Global:RunningSessionFinished -Pending $Global:RunningSessionEndPending
+            if ($null -ne $startRef) {
+                return @{ ok = $true; skipped = $true; mode = $mode; refusal = $startRef.Kind; reason = $startRef.Why }
             }
 
             # Facility scene tied to the session (Step 5).
@@ -4966,7 +4970,14 @@ $CMD_EMERGENCY_STOP {
             # a late End of an older booking while another plays leaves that member's wall, facility, launcher and intent
             # alone (and still writes the booking back as complete).
             $endSid = [string](Get-PropValue $payloadObj "baySessionId" "")
-            $endScope = Get-EndSessionScope -Running $Global:RunningSession -SessionId $endSid -Finished $Global:RunningSessionFinished
+            # A0.489: a platform End of a canceled booking in its warning is refused too (the agent's own End, at the
+            # warning's mark, is not: -OwnEnd). A replayed End of an ended session is refused (RV1) unless it is the retry
+            # of an End whose launcher close did not finish (R2: scope "retry" below).
+            $endRef = Get-CommandRefusal -CommandType $CMD_ENDSESSION -Payload $payloadObj -Running $Global:RunningSession -Finished $Global:RunningSessionFinished -Pending $Global:RunningSessionEndPending -OwnEnd ([bool]$Global:RunningSessionOwnEnd)
+            if ($null -ne $endRef) {
+                return @{ ok = $true; skipped = $true; scope = $(if ($endRef.Kind -eq "cancel-warning") { "held" } else { "finished" }); refusal = $endRef.Kind; reason = $endRef.Why; kiosk = $null; launcherStopped = @{ stopped = $false; reason = $(if ($endRef.Kind -eq "cancel-warning") { "cancel_warning_holds" } else { "session_already_ended" }) } }
+            }
+            $endScope = Get-EndSessionScope -Running $Global:RunningSession -SessionId $endSid -Finished $Global:RunningSessionFinished -Pending $Global:RunningSessionEndPending
             if ($endScope.Scope -eq "finished") {
                 return @{ ok = $true; skipped = $true; scope = "finished"; reason = $endScope.Why; kiosk = $null; launcherStopped = @{ stopped = $false; reason = "session_already_ended" } }
             }
@@ -4975,12 +4986,14 @@ $CMD_EMERGENCY_STOP {
                 return @{ ok = $true; leftAlone = $true; scope = "other"; reason = $endScope.Why; runningSessionId = [string](Get-KioskProp $Global:RunningSession "baySessionId" ""); kiosk = $null; launcherStopped = @{ stopped = $false; reason = "late_old_session_skip" } }
             }
 
-            # Facility: EndSession always moves the bay to the Cleanup scene (Step 5).
+            # Facility: EndSession always moves the bay to the Cleanup scene (Step 5). Not on a retry (R2): the first run did it.
             $facility = $null
-            try {
-                $facility = Invoke-FacilitySetMode -Mode "Cleanup" -payloadObj $payloadObj
-            } catch {
-                $facility = @{ ok = $false; error = $_.Exception.Message }
+            if ($endScope.Scope -ne "retry") {
+                try {
+                    $facility = Invoke-FacilitySetMode -Mode "Cleanup" -payloadObj $payloadObj
+                } catch {
+                    $facility = @{ ok = $false; error = $_.Exception.Message }
+                }
             }
 
             function Get-ProcessesByExePathOrName([string]$exePath) {
@@ -5099,23 +5112,36 @@ $CMD_EMERGENCY_STOP {
             # RF-K1: only the End of the running session clears the record (a late End of an older booking returned above).
             # Cleared BEFORE the wall is written, so the wall's stamp (agentRunning) says nobody plays; the session is
             # listed as ended here (RV1).
-            Add-FinishedSession -SessionId $endSid -Why "EndSession"
-            if ($endScope.Scope -eq "running") { $null = Set-RunningSessionForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payloadObj }
-            # A wall that cannot be written must not leave the launcher open (A0.360; a canceled booking never becomes free
-            # play, A0.467): the End goes on to the intent and the launcher, and the result says the wall failed.
+            # R2 (2026-10-10): the session is also marked "End pending" here, and the mark is dropped only after the intent is
+            # written and the launcher closed (below). The ended list alone refuses a repeated End, so without the mark a
+            # failure between the list and the launcher close left the launcher open for good. A retry (scope "retry",
+            # run by the main loop) skips the wall, the record and the list: the first run did them.
             $wallError = $null
             $paths = @{ sessionJsonPath = $null; sessionJsPath = $null }
-            try { $paths = Write-SessionFiles $model }
-            catch { $wallError = $_.Exception.Message; try { Write-Log ("[SESSION] EndSession {0}: the wall could not be written ({1}); the launcher is still closed" -f $endSid, $wallError) "WARN" } catch { } }
+            if ($endScope.Scope -ne "retry") {
+                Add-FinishedSession -SessionId $endSid -Why "EndSession"
+                $endPayloadJson = $null
+                try { $endPayloadJson = ConvertTo-Json -Compress -Depth 6 -InputObject $payloadObj } catch { $endPayloadJson = $null }
+                if ([string]::IsNullOrWhiteSpace($endPayloadJson)) { $endPayloadJson = ConvertTo-Json -Compress -InputObject ([ordered]@{ mode = "End"; baySessionId = $endSid }) }
+                Add-EndPending -SessionId $endSid -PayloadJson $endPayloadJson
+                if ($endScope.Scope -eq "running") { $null = Set-RunningSessionForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payloadObj }
+                # A wall that cannot be written must not leave the launcher open (A0.360; a canceled booking never becomes free
+                # play, A0.467): the End goes on to the intent and the launcher, and the result says the wall failed.
+                try { $paths = Write-SessionFiles $model }
+                catch { $wallError = $_.Exception.Message; try { Write-Log ("[SESSION] EndSession {0}: the wall could not be written ({1}); the launcher is still closed" -f $endSid, $wallError) "WARN" } catch { } }
+            }
 
-            $apps = Stop-AppsIfRequested $payloadObj
+            # Stopping the apps the payload asks for is optional work; a failure there must not stop the protective act below.
+            $apps = $null
+            try { $apps = Stop-AppsIfRequested $payloadObj }
+            catch { $apps = @{ ok = $false; error = $_.Exception.Message }; try { Write-Log ("[SESSION] EndSession {0}: stopping apps failed ({1}); the launcher is still closed" -f $endSid, $_.Exception.Message) "WARN" } catch { } }
 
             # Guard against late/out-of-order EndSession for an older session (e.g., back-to-back bookings). With a
             # running-session record the scope above decided it; with none, judged from session.json as before.
             $payloadSessionId = $endSid
             $currentSessionId = [string](Get-PropValue $existing "baySessionId" "")
             $sameSession = $true
-            if ($endScope.Scope -ne "running" -and -not [string]::IsNullOrWhiteSpace($payloadSessionId) -and -not [string]::IsNullOrWhiteSpace($currentSessionId) -and ($payloadSessionId -ne $currentSessionId)) {
+            if ($endScope.Scope -ne "running" -and $endScope.Scope -ne "retry" -and -not [string]::IsNullOrWhiteSpace($payloadSessionId) -and -not [string]::IsNullOrWhiteSpace($currentSessionId) -and ($payloadSessionId -ne $currentSessionId)) {
                 $sameSession = $false
             }
 
@@ -5144,6 +5170,8 @@ $CMD_EMERGENCY_STOP {
                 $launcherStopped = @{ stopped = $false; reason = "late_old_session_skip" }
             }
             }
+            # The protective act (the intent, then the launcher) is done: the End no longer needs a retry (R2).
+            if (-not [string]::IsNullOrWhiteSpace($endSid)) { Clear-EndPending $endSid }
 
             # Keep Session Display open by default, showing the thank-you state.
             $closeDisplay = [bool](Get-PropValue $payloadObj "closeDisplay" $false)
@@ -5296,6 +5324,24 @@ function Process-Command {
             catch { Write-Log ("Reset {0}: could not mark it Skipped ({1}); it runs, and its gate skips it" -f $cmdId, $_.Exception.Message) "WARN" }
             if ($skippedOk) {
                 Write-Log ("Reset {0} Skipped: {1}" -f $cmdId, $preGate.Why) "INFO"
+                return
+            }
+        }
+    }
+
+    # 0b) A Start, Prep, display update or End the bay refuses outright (a session it already ended, or a canceled booking in
+    # its 5-minute warning: A0.489) is closed out as Skipped the same way, so the row says Skipped instead of Succeeded with
+    # "skipped" buried in its result text. Same limits as above: Pending -> Skipped carries no execution fields (so the reason
+    # is in the agent log, not on the row), and if the write fails the command runs and its handler refuses it.
+    if ($type -eq $CMD_STARTSESSION -or $type -eq $CMD_UPDATESESSIONDISPLAY -or $type -eq $CMD_ENDSESSION) {
+        $preRef = $null
+        try { $preRef = Get-CommandRefusal -CommandType $type -Payload (Try-ParseJson ([string]$cmd.$Col_Payload)) -Running $Global:RunningSession -Finished $Global:RunningSessionFinished -Pending $Global:RunningSessionEndPending } catch { $preRef = $null }
+        if ($null -ne $preRef) {
+            $refSkippedOk = $false
+            try { Patch-Row $token $BayCommandEntitySet $cmdId @{ $Col_Status = $STATUS_SKIPPED } $etag; $refSkippedOk = $true }
+            catch { Write-Log ("Command {0}: could not mark it Skipped ({1}); it runs, and its handler refuses it" -f $cmdId, $_.Exception.Message) "WARN" }
+            if ($refSkippedOk) {
+                Write-Log ("Command {0} (type {1}) Skipped: {2}" -f $cmdId, $type, $preRef.Why) "INFO"
                 return
             }
         }
@@ -5455,6 +5501,13 @@ $Global:RunningSessionPending  = $false
 # booking's commands with notBefore = now). At most this many are kept.
 $Global:RunningSessionFinished = @()
 $RunningSessionFinishedMax     = 50
+# Kiosk round 2 fix (R2, 2026-10-10): an End whose protective act (the intent write and the launcher close) did not finish
+# stays "pending" here, in memory, and the main loop retries it; at most this many tries per End, then it is dropped with a WARN.
+$Global:RunningSessionEndPending = @()
+$RunningSessionEndRetryMax     = 5
+# A0.489 (Kevin, 2026-10-10): true only while the agent runs the End that ends a canceled booking after its warning, so
+# that End is not refused by the very hold that keeps every other command for that booking out (Get-CommandRefusal).
+$Global:RunningSessionOwnEnd   = $false
 # A0.467 (Kevin, 2026-10-09): a booking canceled while its member plays ends after this warning, never past its own end.
 $RunningSessionCancelWarningSeconds = 300
 $KioskReconcileEverySeconds = 60
@@ -5941,6 +5994,95 @@ function Test-SessionFinished([string]$SessionId, $Finished) {
     return $false
 }
 
+function Test-EndPendingFor([string]$SessionId, $Pending) {
+    # Pure. True when an End of that session was started here and its protective act (the intent write and the launcher
+    # close) has not finished. An empty id is never pending (nothing to retry against).
+    if ([string]::IsNullOrWhiteSpace($SessionId)) { return $false }
+    foreach ($p in @($Pending)) { if ($null -ne $p -and (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $p "id" "")))) { return $true } }
+    return $false
+}
+
+function Get-CommandRefusal {
+    # Pure. Whether the bay refuses a Start, Prep, display update or End outright, and why (kiosk round 2, RV1 + A0.489):
+    #   cancel-warning  A0.489 (Kevin, 2026-10-10): "a cancel is final on that bay". The session in the running-session
+    #                   record was canceled and is in its warning: nothing for that session is accepted (no Prep, Start,
+    #                   display update, or platform End). The warning stays on the wall and the agent's own End runs at the
+    #                   mark (-OwnEnd). Another booking's Start is not named here: it takes the bay as before.
+    #   ended-replay    this bay already ended that session (a replay of a finished booking's command, or a booking
+    #                   reinstated after the bay ended it). An End whose protective act is still pending is NOT refused
+    #                   while nobody plays: it is the retry (R2).
+    # @{ Kind; Why } or $null.
+    param([int]$CommandType, $Payload, $Running, $Finished, $Pending, [bool]$OwnEnd = $false)
+    if ($CommandType -ne $CMD_STARTSESSION -and $CommandType -ne $CMD_UPDATESESSIONDISPLAY -and $CommandType -ne $CMD_ENDSESSION) { return $null }
+    $sid = [string](Get-KioskProp $Payload "baySessionId" "")
+    if ([string]::IsNullOrWhiteSpace($sid)) { return $null }
+    if (-not $OwnEnd -and $null -ne $Running) {
+        $runSid = [string](Get-KioskProp $Running "baySessionId" "")
+        $ce = ConvertTo-KioskUtc (Get-KioskProp $Running "cancelEndUtc" $null)
+        if ($null -ne $ce -and (Test-BaySessionIdMatch $sid $runSid)) {
+            return @{ Kind = "cancel-warning"; Why = "session '$sid' was canceled and is in its 5-minute warning: this command is refused, the warning stays on the wall and the game ends at its mark (A0.489)" }
+        }
+    }
+    if (Test-SessionFinished $sid $Finished) {
+        if ($CommandType -eq $CMD_ENDSESSION -and $null -eq $Running -and (Test-EndPendingFor $sid $Pending)) { return $null }
+        return @{ Kind = "ended-replay"; Why = "session '$sid' already ended on this bay: a replayed command is not run" }
+    }
+    return $null
+}
+
+function Add-EndPending([string]$SessionId, [string]$PayloadJson) {
+    # An End of that session began and has not yet done its protective act (R2, 2026-10-10: the "ended" list is written
+    # before the launcher is closed, so a failure in between used to make every retry a refused no-op). In memory; the
+    # main loop retries it (Invoke-PendingEndRetry). Never throws.
+    try {
+        if ([string]::IsNullOrWhiteSpace($SessionId)) { return }
+        $keep = @(@($Global:RunningSessionEndPending) | Where-Object { $null -ne $_ -and -not (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $_ "id" ""))) })
+        $keep += [ordered]@{ id = $SessionId.Trim(); payload = $PayloadJson; tries = 0 }
+        $Global:RunningSessionEndPending = @($keep)
+    } catch { }
+}
+
+function Clear-EndPending([string]$SessionId) {
+    # The protective act is done (or moot): drop the mark. An empty id drops every mark. Never throws.
+    try {
+        if ([string]::IsNullOrWhiteSpace($SessionId)) { $Global:RunningSessionEndPending = @(); return }
+        $Global:RunningSessionEndPending = @(@($Global:RunningSessionEndPending) | Where-Object { $null -ne $_ -and -not (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $_ "id" ""))) })
+    } catch { }
+}
+
+function Invoke-PendingEndRetry {
+    # R2: re-runs the End whose protective act did not finish, once per main-loop pass, while nobody is recorded as
+    # playing. The End handler recognizes it ("retry" scope), leaves the wall and facility alone, and does the intent and
+    # the launcher. At most $RunningSessionEndRetryMax tries; a session that plays now drops the mark (the launcher
+    # belongs to that session). Returns the End's result or $null. Never throws.
+    try {
+        $p = @($Global:RunningSessionEndPending)
+        if ($p.Count -eq 0) { return $null }
+        if ($null -ne $Global:RunningSession) {
+            Clear-EndPending ""
+            try { Write-Log "[SESSION] a pending End was dropped: another session is recorded as playing now" "INFO" } catch { }
+            return $null
+        }
+        $e = $p[0]
+        $sid = [string](Get-KioskProp $e "id" "")
+        $tries = [int](Get-KioskProp $e "tries" 0)
+        if ($tries -ge $RunningSessionEndRetryMax) {
+            Clear-EndPending $sid
+            try { Write-Log ("[SESSION] the End of session {0} could not finish its protective act after {1} tries; dropped (a StopProcess command closes the launcher)" -f $sid, $tries) "WARN" } catch { }
+            return $null
+        }
+        $e["tries"] = $tries + 1
+        $payload = [string](Get-KioskProp $e "payload" "")
+        if ([string]::IsNullOrWhiteSpace($payload)) { $payload = ConvertTo-Json -Compress -InputObject ([ordered]@{ mode = "End"; baySessionId = $sid; reason = "EndRetry" }) }
+        $res = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson $payload -BayLabel ""
+        try { Write-Log ("[SESSION] retried the End of session {0} (try {1})" -f $sid, ($tries + 1)) "INFO" } catch { }
+        return $res
+    } catch {
+        try { Write-Log ("[SESSION] the retry of a pending End failed: {0}" -f $_.Exception.Message) "WARN" } catch { }
+        return $null
+    }
+}
+
 function Add-FinishedSessionToList($Finished, [string]$SessionId, [DateTime]$NowUtc, [int]$Max) {
     # Pure. The list with this session as its newest entry (moved there if present); the oldest dropped past Max.
     $keep = @(@($Finished) | Where-Object { $null -ne $_ -and -not (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $_ "id" ""))) })
@@ -5973,8 +6115,13 @@ function Get-EndSessionScope {
     #   running   the End names the recorded session (or both name none: RV4). End it, whatever session.json says.
     #   none      nobody is recorded as playing: judged from session.json as before.
     # @{ Scope; Why }
-    param($Running, [string]$SessionId, $Finished)
-    if (Test-SessionFinished $SessionId $Finished) { return @{ Scope = "finished"; Why = "session '$SessionId' already ended on this bay: a replayed or duplicate End is not run" } }
+    #   retry     (R2) this bay began that End and its protective act did not finish (the session is listed as ended, nobody
+    #             plays): do the intent and the launcher again, nothing else.
+    param($Running, [string]$SessionId, $Finished, $Pending = @())
+    if (Test-SessionFinished $SessionId $Finished) {
+        if ($null -eq $Running -and (Test-EndPendingFor $SessionId $Pending)) { return @{ Scope = "retry"; Why = "the End of session '$SessionId' began here and did not finish closing the launcher: retried" } }
+        return @{ Scope = "finished"; Why = "session '$SessionId' already ended on this bay: a replayed or duplicate End is not run" }
+    }
     if ($null -eq $Running) { return @{ Scope = "none"; Why = "nobody is recorded as playing" } }
     $runSid = [string](Get-KioskProp $Running "baySessionId" "")
     if (Test-BaySessionIdMatch $SessionId $runSid) { return @{ Scope = "running"; Why = "the End of the running session $runSid" } }
@@ -6001,26 +6148,44 @@ function Get-CancelWarningText([DateTime]$EndsUtc, [DateTime]$NowUtc) {
     return ("This booking was canceled. Play ends in {0} {1}, at {2}." -f $mins, $unit, $at)
 }
 
+function Start-ControlScreenSender {
+    # Runs the sender (msg.exe) hidden, waits up to $WaitMs for it to exit, and returns @{ pid; exitCode }; exitCode is $null
+    # when it did not exit in time. msg.exe returns as soon as Windows has taken the message, so the wait is short.
+    param([string]$Exe, [string]$ArgLine, [int]$WaitMs = 8000)
+    $p = Start-Process -FilePath $Exe -ArgumentList $ArgLine -WindowStyle Hidden -PassThru
+    $null = $p.Handle
+    $done = $p.WaitForExit($WaitMs)
+    return @{ pid = $p.Id; exitCode = $(if ($done) { $p.ExitCode } else { $null }) }
+}
+
 function Send-ControlScreenWarning {
     # A0.467: the warning on the control screen (the touchscreen the golf launcher runs on), on top of whatever is there,
     # without blocking this agent: Windows' own msg.exe to this desktop session, dismissed on its own when the warning
     # ends. Only this agent's fixed text reaches the command line (anything but letters, digits and . , : and spaces is
     # dropped). @{ shown; via; why; pid }. Never throws.
+    # "shown" is true ONLY when msg.exe ran and exited 0 (the 2026-10-10 fix: it used to read true once the process was
+    # started, so a box that never appeared read as shown). The starter returns @{ pid; exitCode }; a starter that reports
+    # no exit code (or none within the wait) leaves shown false. Exit 0 means Windows accepted the message for that
+    # desktop session; that it is visible on the bay's touchscreen is not something the exit code can say.
     param([string]$Text, [int]$Seconds, [scriptblock]$Starter = $null)
-    $r = [ordered]@{ shown = $false; via = "msg.exe"; why = ""; pid = $null }
+    $r = [ordered]@{ shown = $false; via = "msg.exe"; why = ""; pid = $null; exitCode = $null }
     try {
         $exe = Join-Path $env:WINDIR "System32\msg.exe"
         if ($null -eq $Starter) {
             if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { $r["why"] = "msg.exe not found"; return $r }
-            $Starter = { param($f, $a) (Start-Process -FilePath $f -ArgumentList $a -WindowStyle Hidden -PassThru).Id }
+            $Starter = { param($f, $a) Start-ControlScreenSender -Exe $f -ArgLine $a }
         }
         $sess = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
         $safe = ([string]$Text -replace '[^A-Za-z0-9 .,:]', '')
         $secs = [Math]::Max(1, $Seconds)
         $argLine = ('{0} /TIME:{1} "{2}"' -f $sess, $secs, $safe)
-        $r["pid"] = & $Starter $exe $argLine
-        $r["shown"] = $true
-        $r["why"] = "sent to desktop session $sess for $secs s"
+        $out = & $Starter $exe $argLine
+        $r["pid"] = Get-KioskProp $out "pid" $null
+        $code = Get-KioskProp $out "exitCode" $null
+        $r["exitCode"] = $code
+        if ($null -eq $code) { $r["why"] = "msg.exe reported no exit code: not confirmed shown" }
+        elseif ([int]$code -eq 0) { $r["shown"] = $true; $r["why"] = "msg.exe exited 0: accepted for desktop session $sess for $secs s" }
+        else { $r["why"] = "msg.exe exited with code $([int]$code): not shown" }
     } catch { $r["why"] = "could not be shown: " + $_.Exception.Message }
     return $r
 }
@@ -6087,12 +6252,18 @@ function Invoke-CancelEndIfDue([DateTime]$NowUtc) {
     # or $null when nothing is due. Never throws.
     try {
         $r = $Global:RunningSession
-        if ($null -eq $r) { return $null }
+        # R2: nobody is recorded as playing, but an End (this one, or a platform End) began and did not finish closing the
+        # launcher: try that again first. It is a no-op when no End is pending.
+        if ($null -eq $r) { return (Invoke-PendingEndRetry) }
+        if (@($Global:RunningSessionEndPending).Count -gt 0) { Clear-EndPending "" }
         $ce = ConvertTo-KioskUtc (Get-KioskProp $r "cancelEndUtc" $null)
         if ($null -eq $ce -or $NowUtc -lt $ce) { return $null }
         $sid = [string](Get-KioskProp $r "baySessionId" "")
         $payload = ConvertTo-Json -Compress -InputObject ([ordered]@{ mode = "End"; baySessionId = $sid; reason = "BookingCanceled" })
-        $res = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson $payload -BayLabel ""
+        # A0.489: this End is the agent's own and is not refused by the cancel hold that keeps every other command out.
+        $Global:RunningSessionOwnEnd = $true
+        try { $res = Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson $payload -BayLabel "" }
+        finally { $Global:RunningSessionOwnEnd = $false }
         try { Write-Log ("[SESSION] booking canceled mid-play: session {0} ended after its warning (A0.467)" -f $sid) "INFO" } catch { }
         return $res
     } catch {
