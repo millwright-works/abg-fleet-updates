@@ -1759,9 +1759,10 @@ try {
         Repair-LauncherStep
         [void](Invoke-Start "s-n11" "Prep")
         $wallBeforeRetry = [IO.File]::ReadAllText($sessPath)
-        $script:Patches3.Clear()
+        $script:Patches3.Clear(); $script:Fac = @()
         Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION $endRowPayload)
         Start-Sleep -Milliseconds 500
+        Assert-True (@($script:Fac).Count -eq 0) "R2 ...and the retry did not move the facility to Cleanup again (the first run did)"
         $p0b = Get-FirstPatch; $lastR = @($script:Patches3 | Where-Object { $_.Set -ne "build_bookings" })[-1]
         Assert-True ($p0b.Body[$Col_Status] -eq $STATUS_INPROGRESS -and $lastR.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$lastR.Body[$Col_Result] -match '"scope":"retry"') "R2 the platform sends the same End again: not turned away as 'already ended' (a lock, a run, Succeeded as a retry)"
         Assert-True (-not (Test-StandInAlive $sl3) -and (Get-IntentNow).Closed -and (Get-IntentNow).SessionId -eq "s-r2b" -and -not (Test-EndPendingFor "s-r2b" $Global:RunningSessionEndPending)) "R2 ...the real launcher is closed, the intent closed, the mark dropped"
@@ -1794,6 +1795,19 @@ try {
         Assert-True (@($Global:RunningSessionEndPending).Count -eq 0 -and (Test-StandInAlive $sl5) -and (Get-RecSid) -eq "s-r2e" -and (Get-IntentNow).Wanted -and (Get-IntentNow).SessionId -eq "s-r2e") "R2 another session started meanwhile: the old End's retry is dropped and s-r2e's launcher is not touched"
         [void](Invoke-End "s-r2e")
     } finally { Remove-StandInLauncher $sl5 }
+    # (d2) the retry function itself, called directly while another session is recorded as playing: it does nothing.
+    Clear-Bay
+    $sl6 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-r2f")
+        Break-LauncherStep; $script:GlThrows = 0
+        try { [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","baySessionId":"s-r2f"}' -BayLabel "Bay") } catch { }
+        Repair-LauncherStep
+        [void](Invoke-Start "s-r2g")
+        $drRes = Invoke-PendingEndRetry
+        Assert-True ($null -eq $drRes -and @($Global:RunningSessionEndPending).Count -eq 0 -and (Test-StandInAlive $sl6) -and (Get-RecSid) -eq "s-r2g") "R2 the retry called while s-r2g plays: it runs nothing, drops the old mark, and s-r2g's launcher is not touched"
+        [void](Invoke-End "s-r2g")
+    } finally { Remove-StandInLauncher $sl6 }
     Clear-Bay
 
     # ---- R1 (VM01, VM02): the REAL BayAgent.ps1, one main-loop pass (-Once), no network, a canceled booking whose warning is over.
@@ -1806,7 +1820,10 @@ try {
         if (-not $text.Contains($needle)) { throw "the BaseDir literal was not found in the agent" }
         $agent = Join-Path $root "BayAgent.ps1"
         [IO.File]::WriteAllText($agent, $text.Replace($needle, ('$BaseDir = "{0}"' -f $root)), (New-Object Text.UTF8Encoding($true)))
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\src\BayAgent\manifest.json") -Destination (Join-Path $root "manifest.json") -Force
+        # The manifest sits beside the agent in the tree (a mutated copy of the agent has none beside it: use the tree's).
+        $manifestSrc = Join-Path (Split-Path -Parent $AgentScript) "manifest.json"
+        if (-not (Test-Path -LiteralPath $manifestSrc)) { $manifestSrc = Join-Path $PSScriptRoot "..\src\BayAgent\manifest.json" }
+        Copy-Item -LiteralPath $manifestSrc -Destination (Join-Path $root "manifest.json") -Force
         try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } catch { }
         $plain = [Text.Encoding]::UTF8.GetBytes("not-a-real-secret-" + [guid]::NewGuid().ToString("N"))
         $prot = [System.Security.Cryptography.ProtectedData]::Protect($plain, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
