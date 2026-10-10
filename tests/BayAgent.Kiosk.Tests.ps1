@@ -1365,8 +1365,8 @@ try {
         $wantArgs = ('{0} /TIME:300 "This booking was canceled. Play ends in 5 minutes, at 7:42 PM. x  y"' -f $ownSess)
         $gotArgs = $(if ($script:MsgStarts.Count -gt 0) { [string]$script:MsgStarts[0][1] } else { "" })
         Assert-True ($sw["shown"] -eq $true -and $sw["pid"] -eq 4321 -and $script:MsgStarts.Count -eq 1 -and [string]$script:MsgStarts[0][0] -like "*\System32\msg.exe" -and $gotArgs -ceq $wantArgs) "A0.467 the real control-screen sender: msg.exe to this desktop session, for the warning's seconds, only safe characters on its command line (got: $gotArgs)"
-        $swF = Test-RealSendControlScreenWarning -Text "t" -Seconds 0 -Starter { param($f, $a) throw "no desktop" }
-        Assert-True ($swF["shown"] -eq $false -and [string]$swF["why"] -match "no desktop") "A0.467 a sender that fails is reported, never thrown"
+        $swF = $null; try { $swF = Test-RealSendControlScreenWarning -Text "t" -Seconds 0 -Starter { param($f, $a) throw "no desktop" } } catch { $swF = $null }
+        Assert-True ($null -ne $swF -and $swF["shown"] -eq $false -and [string]$swF["why"] -match "no desktop") "A0.467 a sender that fails is reported, never thrown"
     } else { Assert-True $false "A0.467 the real control-screen sender exists" }
 
     # ---- F1-R2 / X3b: a SECOND End of an ended session S arrives while T plays and T's intent write keeps failing.
