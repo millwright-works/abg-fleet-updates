@@ -1287,7 +1287,7 @@ try {
     $agentText = [IO.File]::ReadAllText($AgentScript)
     $iLoop = $agentText.IndexOf("# ---------------- Main Loop")
     $iDue = $(if ($iLoop -ge 0) { $agentText.IndexOf("Invoke-CancelEndIfDue -NowUtc", $iLoop) } else { -1 })
-    $iTok = $(if ($iLoop -ge 0) { $agentText.IndexOf("`$token = Get-AccessToken", $iLoop) } else { -1 })
+    $iTok = $(if ($iLoop -ge 0) { $agentText.IndexOf("Get-AccessToken", $iLoop) } else { -1 })
     Assert-True ($iLoop -gt 0 -and $iDue -gt $iLoop -and $iDue -lt $iTok) "A0.467 the main loop runs the due check every pass, before the token (no network needed)"
     $script:Fac = @()
     $endRes = $(if ($null -ne $ends) { Invoke-CancelEndIfDue -NowUtc $ends.AddSeconds(1) } else { $null })
