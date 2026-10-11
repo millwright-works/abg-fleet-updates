@@ -455,9 +455,11 @@ try {
         @{ label = "all-zero GUID";   arguments = "-EnrollCert -EnrollClientId 00000000-0000-0000-0000-000000000000"; reason = "ABG_OWNID_CLIENT_ID_NOT_A_GUID" },
         @{ label = "a short id";      arguments = "-EnrollCert -EnrollClientId 12345"; reason = "ABG_OWNID_CLIENT_ID_NOT_A_GUID" }
     )
+    $allRefusalText = ""
     foreach ($case in $refusals) {
         $before = Get-D0InstallFingerprint $b2.Root; $mark = Get-D0Mark
         $r = Invoke-D0Agent -Bay $b2 -Arguments $case.arguments -Sheet
+        $allRefusalText += ($r.StdOut + "`n" + $r.StdErr + "`n" + $r.Log + "`n")
         Show-D0Run $r ("S2 " + $case.label)
         Assert-True (-not $r.TimedOut -and $r.ExitCode -eq 2) "[$($case.label)] exit code 2 (got $($r.ExitCode))"
         $resLines = @(Get-D0ResultLines $r.StdOut)
@@ -467,7 +469,9 @@ try {
         Assert-True ((Get-D0InstallFingerprint $b2.Root) -eq $before) "[$($case.label)] ...and nothing was: no key, no state file, no .cer"
         Assert-True (@(Get-D0RequestsSince $mark).Count -eq 0) "[$($case.label)] nothing was sent anywhere"
     }
-    Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($typedMarker))) "a refused value is never echoed (the last refusal's console and log do not carry what was typed)"
+    # Every refusal's console text and log, not only the last one's: the value typed by mistake is in the FIRST case.
+    Assert-True ($allRefusalText.Contains("ABG_OWNID_CLIENT_ID_NOT_A_GUID") -and -not $allRefusalText.Contains($typedMarker)) "a refused value is never echoed: nothing any of these refusals printed or logged carries what was typed"
+    Assert-True ($allRefusalText -match "What was typed is 52 characters long") "...the refusal says how long the value was instead"
     $allS2Log = ""
     foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $b2.Root "logs") -Filter "*.log" -ErrorAction SilentlyContinue)) { $allS2Log += [IO.File]::ReadAllText($f.FullName) }
     Assert-True (-not $allS2Log.Contains($typedMarker)) "...and the bay's log never carries it either"
