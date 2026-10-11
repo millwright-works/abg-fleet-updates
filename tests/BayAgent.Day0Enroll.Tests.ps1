@@ -300,7 +300,8 @@ function New-D0Bay {
     $cfg | Add-Member -NotePropertyName tokenAuthorityHost -NotePropertyValue $MockUrl
     $cfg.logLevel = "DEBUG"
     if ($PlaintextSecret) { $cfg | Add-Member -NotePropertyName clientSecret -NotePropertyValue $PlaintextSecret; $cfg.PSObject.Properties.Remove("clientSecretDpapiPath") }
-    [IO.File]::WriteAllText((Join-Path $root "agent-config.json"), ($cfg | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    # With a byte-order mark, as Day0 writes it (Set-Content -Encoding UTF8 under Windows PowerShell 5.1).
+    [IO.File]::WriteAllText((Join-Path $root "agent-config.json"), ($cfg | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($true)))
     if ($SeedStateJson) {
         # NOT a blank bay: a state file something earlier left. Used only by the refusal scenarios that say so.
         New-Item -ItemType Directory -Force -Path (Join-Path $root "state") | Out-Null
@@ -358,6 +359,12 @@ function Show-D0Run($r, [string]$label) {
 function Read-D0State($Bay) {
     if (-not (Test-Path -LiteralPath $Bay.State)) { return $null }
     return ([IO.File]::ReadAllText($Bay.State) | ConvertFrom-Json)
+}
+function Set-D0EnrolledAccount($Bay, [string]$Account) {
+    # MODELS another Windows account: rewrites, in the bay's state file, which account the record says enrolled.
+    $s = Read-D0State $Bay
+    $s.ownIdentityEnrolled.account = $Account
+    [IO.File]::WriteAllText($Bay.State, ($s | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
 }
 function Get-D0Prop($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
@@ -740,6 +747,43 @@ try {
     Assert-True ($r.ExitCode -eq 0 -and $tpNew -ne $tpGone -and $r.StdOut -match "NOT removed: it is not in this account's stores") "-EnrollForce enrolls again under this account and says the old key was not removed"
     $st = Read-D0State $ba
     Assert-True (@(Get-D0Prop $st "superseded") -contains $tpGone -and [string](Get-D0Prop $st "activeThumbprint") -eq $tpNew) "the unreachable certificate stays on record as superseded; the new one is active"
+
+    Section "S12b a bay that HAS RUN is never re-enrolled from another Windows account, even with -EnrollForce"
+    $bh = New-D0Bay -Name "has-run"
+    $r = Invoke-D0Agent -Bay $bh -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+    $tpRun = Get-D0ReportField $r.StdOut "Thumbprint"
+    if ($tpRun -notmatch '^[0-9A-F]{40}$') { throw "S12b could not enroll its bay" }
+    Register-D0Certificate -AppId $D0OwnApp -CerPath (Join-Path $bh.Root ("state\bay-cert-{0}.cer" -f $tpRun))
+    $r = Invoke-D0Agent -Bay $bh -Arguments "-Once"
+    Assert-True ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $bh.Root "state\agent-alive.json"))) "the bay ran one pass and left the record of it (state\agent-alive.json)"
+    $realAccount = [string](Get-D0Prop (Get-D0Prop (Read-D0State $bh) "ownIdentityEnrolled") "account")
+    # Modeled: this console is NOT the account that enrolled (the record names another), and so cannot see the key.
+    Set-D0EnrolledAccount $bh "BAY1KIOSK\SomeoneElse"
+    Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $tpRun) -DeleteKey -Force
+    $before = Get-D0InstallFingerprint $bh.Root; $mark = Get-D0Mark
+    $r = Invoke-D0Agent -Bay $bh -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
+    Show-D0Run $r "S12b force from another account"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_BAY_HAS_RUN") "refused: ABG_OWNID_BAY_HAS_RUN (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ($r.StdOut -match "enrolled by BAY1KIOSK\\SomeoneElse" -and $r.StdOut -match "Run this signed in as the account the agent runs as") "...naming the account that enrolled and what to do"
+    Assert-True ((Get-D0InstallFingerprint $bh.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "...nothing was changed and nothing was sent"
+    # The account that enrolled, whose own store no longer holds the key: the key is truly gone, so it may enroll again.
+    Set-D0EnrolledAccount $bh $realAccount
+    $r = Invoke-D0Agent -Bay $bh -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
+    Assert-True ($r.ExitCode -eq 0 -and $r.StdOut -match "ENROLLED AGAIN" -and (Get-D0ReportField $r.StdOut "Thumbprint") -ne $tpRun) "the account that enrolled, with its key gone from its own store, enrolls again (exit $($r.ExitCode))"
+
+    Section "S12c a bay that has NEVER run: a certificate made under another account is discarded with -EnrollForce"
+    $bv = New-D0Bay -Name "never-ran-other-account"
+    $r = Invoke-D0Agent -Bay $bv -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+    $tpNever = Get-D0ReportField $r.StdOut "Thumbprint"
+    if ($tpNever -notmatch '^[0-9A-F]{40}$') { throw "S12c could not enroll its bay" }
+    Set-D0EnrolledAccount $bv "BAY1KIOSK\TheAdministrator"
+    Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $tpNever) -DeleteKey -Force
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $bv.Root "state\agent-alive.json"))) "precondition: this bay has never run"
+    $r = Invoke-D0Agent -Bay $bv -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
+    Show-D0Run $r "S12c force, never ran"
+    Assert-True ($r.ExitCode -eq 0 -and $r.StdOut -match "ENROLLED AGAIN" -and $r.StdOut -match "NOT removed: it is not in this account's stores") "enrolled again under this account; the report says the other account's key was not removed (exit $($r.ExitCode))"
+    $st = Read-D0State $bv
+    Assert-True ([string](Get-D0Prop (Get-D0Prop $st "ownIdentityEnrolled") "account") -eq $realAccount) "the record now names this account as the one that enrolled"
 
     # ============================================================ S13 without the parameter, nothing new happens
     Section "S13 plain -EnrollCert is unchanged: no app id is written unless one was typed"

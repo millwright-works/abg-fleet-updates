@@ -34,9 +34,10 @@ Optional switches:
                  2  refused, nothing changed (the reason is printed)
                  4  already enrolled, but the bay cannot sign in yet (the reason is printed)
                  1  an unexpected failure; nothing is left enrolled
-               Add -EnrollForce to discard an enrollment that Entra refuses (a mistyped app id, a
-               certificate made under the wrong Windows account) and enroll again. An identity that works
-               is never replaced from the console.
+               Add -EnrollForce to discard an enrollment and enroll again. It is honored only when Entra
+               itself refuses the enrollment on record (a mistyped app id), or when its certificate cannot
+               be used from this Windows account and the bay has never run (a certificate made under the
+               wrong account on the first day). An identity that signs in is never replaced from the console.
 #>
 
 param(
@@ -1127,8 +1128,9 @@ function Write-CredentialStartupSummary {
         }
     }
 
-    # No certificate on record (in state\credential.json or in agent-config.json) and no secret: nothing to sign in
-    # with. Decided here, where the enrolled certificate can be read, and never from agent-config.json alone.
+    # With no certificate on record (in state\credential.json or in agent-config.json) and nothing else configured,
+    # there is nothing to sign in with. Decided here, where the enrolled certificate can be read, and never from
+    # agent-config.json alone.
     if (-not $activeTp -and -not $script:HasSecretCredential) {
         throw "Missing auth config: this bay has no credential. Enroll its certificate (BayAgent.ps1 -EnrollCert), or provide clientCertThumbprint (preferred), clientSecretDpapiPath, or clientSecret (deprecated) in agent-config.json"
     }
@@ -4687,7 +4689,7 @@ function Get-OwnIdentitySignInAdvice($proof) {
     # One plain sentence for the person at the bay. Never throws.
     $code = [string](Get-PropValue $proof "code" "")
     switch ([string](Get-PropValue $proof "outcome" "")) {
-        "works"   { return "Entra issued a token: this bay can sign in as its own app." }
+        "works"   { return "Entra accepted the sign-in, so this bay can sign in as its own app." }
         "absent"  { return "The certificate on record is not usable by this Windows account. Run this as the account the agent runs as (the one that enrolled)." }
         "unknown" { return "No answer from Entra, so it cannot be told yet. Check the network and run this again." }
         "refused" {
@@ -4825,6 +4827,19 @@ function Invoke-OwnIdentityEnroll {
         }
         if ($proof.outcome -eq "unknown") {
             return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CANNOT_TELL" ("Whether the enrollment on record works could not be told ({0}). It is discarded only when Entra itself refuses it. Check the network and run this again." -f $proof.detail))
+        }
+        if ($proof.outcome -eq "absent") {
+            # The certificate on record cannot be used from THIS Windows account, so whether the identity works cannot
+            # be asked from here. If this bay has ever run (the agent writes state\agent-alive.json after an accepted
+            # heartbeat), a working bay may be behind it under the agent's own account, and only the account that
+            # enrolled may discard it (for that account, "absent" means the key is truly gone). A bay that has never
+            # run has nothing behind it: that is the certificate made under the wrong account on the first day.
+            $enrolledBy = [string](Get-PropValue (Get-PropValue $st "ownIdentityEnrolled" $null) "account" "")
+            $sameAccount = (-not [string]::IsNullOrWhiteSpace($enrolledBy)) -and ($enrolledBy -ieq $account)
+            $hasRun = Test-Path -LiteralPath (Join-Path $BaseDir "state\agent-alive.json")
+            if ($hasRun -and -not $sameAccount) {
+                return (New-OwnIdentityEnrollRefusal "ABG_OWNID_BAY_HAS_RUN" ("This bay has run before, and the enrollment on record ({0}) cannot be checked from this Windows account ({1}){2}. Whether the bay's identity works cannot be told from here, so it is not discarded. Run this signed in as the account the agent runs as." -f $onRecord, $account, $(if ($enrolledBy) { "; it was enrolled by $enrolledBy" } else { "" })))
+            }
         }
         $discard = [ordered]@{ thumbprint = $stateTp; clientId = $recordedClient; why = $proof.outcome; code = $proof.code; removedFrom = @() }
     }
