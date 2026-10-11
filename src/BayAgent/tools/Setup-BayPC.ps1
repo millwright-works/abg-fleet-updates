@@ -14,7 +14,10 @@ Example:
 Notes:
   - Idempotent: safe to run multiple times on the same PC
   - Day0 is called with the src/BayAgent/ prefix for GitHub raw URLs
-  - DPAPI secret must be set separately via ABG.SetClientSecretDpapi.ps1
+  - The default credential is a certificate the bay mints itself (-Credential Certificate). Only the legacy
+    -Credential Secret path uses ABG.SetClientSecretDpapi.ps1, which Day0 places in bootstrap\ for that case.
+  - Remote Desktop is left OFF unless -EnableRemoteDesktop is given.
+  - A blank PC has no BayAgent.ps1 after this script: the first run of tools\Update-BayAgent.ps1 installs it.
   - ASCII-only comments (no em-dashes) for AllSigned compatibility
 #>
 
@@ -31,9 +34,19 @@ param(
   [switch]$SkipLockdown,
   [switch]$SkipReboot,
 
-  # Day0 pass-through
-  [string]$FleetRawBaseUrl = "https://raw.githubusercontent.com/kedaheaven/abg-fleet-updates/main/src/BayAgent",
+  # Day0 pass-through. Both addresses name the repository's CURRENT owner. They used to name the previous owner and
+  # worked only through GitHub's redirect for a moved repository (measured 2026-10-11: both still answer 200), which
+  # stops the day anyone creates a repository of the old name. The Day0 address was a literal in Phase 3; it is a
+  # parameter now so a fork or a pinned commit can be named without editing the script.
+  [string]$FleetRawBaseUrl = "https://raw.githubusercontent.com/millwright-works/abg-fleet-updates/main/src/BayAgent",
+  [string]$Day0Url = "https://raw.githubusercontent.com/millwright-works/abg-fleet-updates/main/tools/ABG-Day0-Setup.ps1",
   [string]$BayKioskUser = "BayKiosk",
+
+  # REMOTE DESKTOP IS OFF UNLESS ASKED FOR (A0.216: the designed lockdown has Remote Desktop off). Phase 5C used to
+  # turn it ON on every run and Phase 7 scored "enabled" as PASS, so a bay set up by this script contradicted the
+  # ruling and the script's own checklist said it was fine. A member-reachable PC with a stored auto-login password
+  # should not also listen for remote sessions by default. Pass this switch where remote hands are really wanted.
+  [switch]$EnableRemoteDesktop,
 
   # WHICH CREDENTIAL THIS BAY WILL AUTHENTICATE WITH, AND IT IS A CHOICE, NOT A REMINDER.
   # Phase 6 used to print "You must run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret"
@@ -139,6 +152,118 @@ function Get-ShellActivationPlan {
   }
 }
 
+function Get-RemoteDesktopPlan {
+  # What Phase 5C does about Remote Desktop, decided in one place so it can be tested and so the registry write and
+  # the firewall rule can never disagree. denyValue is what goes into fDenyTSConnections: 1 = Remote Desktop OFF.
+  param([bool]$Enable = $false)
+  if ($Enable) {
+    return [ordered]@{
+      enable         = $true
+      denyValue      = 0
+      firewallAction = "Enable"
+      message        = "Remote Desktop ENABLED (-EnableRemoteDesktop was given)."
+    }
+  }
+  return [ordered]@{
+    enable         = $false
+    denyValue      = 1
+    firewallAction = "Disable"
+    message        = "Remote Desktop OFF (the default). Pass -EnableRemoteDesktop to turn it on."
+  }
+}
+
+function Get-RemoteDesktopCheck {
+  # The Phase 7 row. It scores what was ASKED FOR, not "enabled is good": on a default run PASS means OFF.
+  # An unreadable value is never a PASS: unknown is not off.
+  param($DenyValue, [bool]$WantEnabled = $false)
+  $known = ($null -ne $DenyValue) -and ("$DenyValue" -match '^[01]$')
+  if ($WantEnabled) {
+    return [ordered]@{
+      Check  = "Remote Desktop enabled (-EnableRemoteDesktop)"
+      Result = $(if ($known -and [int]$DenyValue -eq 0) { "PASS" } elseif ($known) { "FAIL (Remote Desktop is off but -EnableRemoteDesktop was given)" } else { "FAIL (could not read fDenyTSConnections)" })
+    }
+  }
+  return [ordered]@{
+    Check  = "Remote Desktop off"
+    Result = $(if ($known -and [int]$DenyValue -eq 1) { "PASS" } elseif ($known) { "FAIL (Remote Desktop is ON; the lockdown has it off unless -EnableRemoteDesktop is given)" } else { "FAIL (could not read fDenyTSConnections)" })
+  }
+}
+
+function Get-CredentialFileCheck {
+  # The Phase 7 row about the DPAPI secret file. It used to read "PENDING (run SetClientSecretDpapi)" on every bay
+  # without the file -- which on a certificate bay (the default) tells the operator to do the one thing that stops the
+  # certificate activating. On a certificate bay the file's ABSENCE is the pass.
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("Certificate", "Secret")][string]$Mode,
+    [bool]$DpapiExists = $false
+  )
+  if ($Mode -eq "Certificate") {
+    return [ordered]@{
+      Check  = "No DPAPI secret file (certificate bay)"
+      Result = $(if ($DpapiExists) { "FAIL (a secret file exists on a bay set up for a certificate: remove it before -EnrollCert, or the certificate enrolls as waiting and cannot activate)" } else { "PASS" })
+    }
+  }
+  return [ordered]@{
+    Check  = "DPAPI secret exists"
+    Result = $(if ($DpapiExists) { "PASS" } else { "PENDING (run SetClientSecretDpapi)" })
+  }
+}
+
+function Get-Day0NextSteps {
+  # The "Next Steps" list as a function, so what it tells an operator can be tested. It used to say
+  # "1. Run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret" whenever the file was missing, in BOTH credential
+  # modes, directly under a Phase 6 that says DO NOT create one. And it never said that the agent itself is not on a
+  # blank PC yet: Day0 lays down the host, the watchdog and the updaters, and BayAgent.ps1 arrives only with the first
+  # run of Update-BayAgent.ps1.
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("Certificate", "Secret")][string]$Mode,
+    [bool]$DpapiExists = $false,
+    [bool]$NameOk = $true,
+    [string]$ExpectedName = "",
+    [bool]$AgentInstalled = $false,
+    [string]$Root = "C:\AllBirdies",
+    [string]$BayKioskUser = "BayKiosk"
+  )
+  $steps = @()
+  if (-not $NameOk) { $steps += "Reboot to apply the computer name change to '$ExpectedName'" }
+  $steps += "Check agent-config.json: environmentUrl, tenantId, clientId and bayId must hold this bay's values (no <placeholder> left)"
+  if (-not $AgentInstalled) {
+    $steps += @(
+      "Install the agent package (BayAgent.ps1 is not on this PC until this runs). As Administrator:",
+      "     powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\tools\Update-BayAgent.ps1`" -Version <version> -PackageUrl <release package address> -Sha256 <package sha256>",
+      "     (a first install has nothing to roll back to, so it runs without the rollback guard)"
+    )
+  }
+  if ($Mode -eq "Certificate") {
+    $steps += @(
+      "Enroll this bay's certificate, signed in as $BayKioskUser (see Phase 6 above). Do NOT create a DPAPI secret file. Run:",
+      "     powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\current\BayAgent.ps1`" -EnrollCert"
+    )
+  } elseif (-not $DpapiExists) {
+    $steps += "Run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret (see Phase 6 output above)"
+  }
+  $steps += @(
+    "Configure display arrangement:",
+    "     Display 1 = Touchscreen (primary, Launcher)",
+    "     Display 2 = Projector (gameplay)",
+    "     Display 3 = Monitor (SessionDisplay)",
+    "   Update displayRouting.roles in agent-config.json if display order differs",
+    "Reboot and verify kiosk mode:",
+    "     - $BayKioskUser auto-logs in",
+    "     - Uneekor Launcher appears on touchscreen (Display 1)",
+    "     - SessionDisplay appears on monitor (Display 3)",
+    "Check the MDA: Ops > Bays -- the new bay should appear Online within 2 minutes",
+    "Send a HealthCheck from the MDA to verify end-to-end",
+    "Install the launcher software and update agent-config.json launcher path"
+  )
+  # Number the top-level steps; lines that start with whitespace are continuations of the step above them.
+  $out = @(); $n = 0
+  foreach ($s in $steps) {
+    if ($s -match '^\s') { $out += $s } else { $n++; $out += ("{0}. {1}" -f $n, $s) }
+  }
+  return $out
+}
+
 # ==================================================================
 # PHASE 1: PRE-FLIGHT CHECKS
 # ==================================================================
@@ -218,7 +343,11 @@ if (-not $SkipKioskSetup) {
   Set-ItemProperty -Path $winlogonPath -Name "AutoAdminLogon" -Value "1"
   Set-ItemProperty -Path $winlogonPath -Name "DefaultUserName" -Value $BayKioskUser
   Set-ItemProperty -Path $winlogonPath -Name "DefaultPassword" -Value $plainPw
-  Set-ItemProperty -Path $winlogonPath -Name "DefaultDomainName" -Value $env:COMPUTERNAME
+  # The name this PC WILL have at the next sign-in, not the one it has now. Phase 1d may have just renamed the PC, and a
+  # rename takes effect at the reboot, which is also when Windows first reads this value: writing the old name here
+  # points the automatic sign-in at a computer name that no longer exists. On a PC already named correctly the two
+  # are the same.
+  Set-ItemProperty -Path $winlogonPath -Name "DefaultDomainName" -Value $expectedName
 
   # Clear password from memory
   $plainPw = $null
@@ -241,10 +370,9 @@ if (-not $SkipDay0) {
   $day0Path = Join-Path $day0Dir "ABG-Day0-Setup.ps1"
 
   # Download Day0 from GitHub (it lives at tools/ in the repo root, not under src/BayAgent/)
-  $day0Url = "https://raw.githubusercontent.com/kedaheaven/abg-fleet-updates/main/tools/ABG-Day0-Setup.ps1"
-  Write-Host "  Downloading Day0 from: $day0Url"
+  Write-Host "  Downloading Day0 from: $Day0Url"
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Invoke-WebRequest -Uri $day0Url -OutFile $day0Path -UseBasicParsing
+  Invoke-WebRequest -Uri $Day0Url -OutFile $day0Path -UseBasicParsing
 
   if (-not (Test-Path $day0Path)) {
     Write-Error "Failed to download ABG-Day0-Setup.ps1"
@@ -260,6 +388,12 @@ if (-not $SkipDay0) {
     CreateAgentTask       = $true
     WriteAgentConfigTemplate = $true
   }
+  # The values this script already knows go into the agent-config.json template, so nobody hand-edits JSON on a
+  # kiosk for values that were typed on this command line. Empty values are left as the template's placeholders.
+  if (-not [string]::IsNullOrWhiteSpace($EnvironmentUrl)) { $day0Args["EnvironmentUrl"] = $EnvironmentUrl }
+  if (-not [string]::IsNullOrWhiteSpace($TenantId))       { $day0Args["TenantId"] = $TenantId }
+  if (-not [string]::IsNullOrWhiteSpace($ClientId))       { $day0Args["ClientId"] = $ClientId }
+  if (-not [string]::IsNullOrWhiteSpace($BayId))          { $day0Args["BayId"] = $BayId }
 
   # Prompt for BayKiosk password for the scheduled task (Day0 needs it)
   $taskPw = Read-Host "  Enter $BayKioskUser password (for scheduled task registration)" -AsSecureString
@@ -373,7 +507,7 @@ if (-not $SkipLockdown) {
   Write-Host "  HKCU Shell for current admin set to explorer.exe" -ForegroundColor Green
 
   Write-Host ""
-  Write-Host "  NOTE: Additional admin accounts that log in via RDP must have" -ForegroundColor Yellow
+  Write-Host "  NOTE: Any other admin account that signs in on this PC must have" -ForegroundColor Yellow
   Write-Host "  HKCU Shell set to explorer.exe. Run this on each admin account:" -ForegroundColor Yellow
   Write-Host "    New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name Shell -Value explorer.exe -Force" -ForegroundColor White
 
@@ -399,7 +533,7 @@ if (-not $SkipLockdown) {
   Set-ItemProperty -Path $systemPolicyPath -Name "DisableLockWorkstation" -Value 1 -Type DWord
   Write-Host "  Win+L (lock screen) disabled." -ForegroundColor Green
 
-  # Disable Task Manager for all users (admin can re-enable via RDP if needed)
+  # Disable Task Manager for all users (an admin can re-enable it from an elevated window if needed)
   Set-ItemProperty -Path $systemPolicyPath -Name "DisableTaskMgr" -Value 1 -Type DWord
   Write-Host "  Task Manager disabled (Ctrl+Alt+Del limited)." -ForegroundColor Green
 
@@ -425,11 +559,14 @@ if (-not $SkipLockdown) {
   # ------------------------------------------------------------------
   Write-Host ""
 
-  # Enable Remote Desktop
-  Write-Host "  Enabling Remote Desktop..."
-  Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
-  Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-  Write-Host "  Remote Desktop enabled." -ForegroundColor Green
+  # Remote Desktop: OFF unless -EnableRemoteDesktop was given (A0.216). The value written and the firewall action both
+  # come from one plan, so they cannot disagree; see Get-RemoteDesktopPlan.
+  $rdpPlan = Get-RemoteDesktopPlan -Enable ([bool]$EnableRemoteDesktop)
+  Write-Host "  Setting Remote Desktop..."
+  Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value $rdpPlan.denyValue
+  if ($rdpPlan.enable) { Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue }
+  else { Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue }
+  Write-Host "  $($rdpPlan.message)" -ForegroundColor Green
 
   # Disable USB mass storage
   Write-Host "  Disabling USB mass storage..."
@@ -510,7 +647,8 @@ if (-not $SkipLockdown) {
   # ------------------------------------------------------------------
   Write-Host ""
   Write-Host "  Admin access:" -ForegroundColor Cyan
-  Write-Host "    - RDP from dev machine as admin account (not BayKiosk)" -ForegroundColor White
+  if ($EnableRemoteDesktop) { Write-Host "    - Remote Desktop as the admin account (not BayKiosk)" -ForegroundColor White }
+  else { Write-Host "    - Remote Desktop is OFF on this bay; updates and commands arrive through the agent" -ForegroundColor White }
   Write-Host "    - On-site: Ctrl+Alt+Del -> Switch User -> admin account" -ForegroundColor White
   Write-Host "    - Admin account retains full Explorer shell" -ForegroundColor White
 
@@ -543,12 +681,17 @@ function Get-Day0CredentialGuidance {
         "  cannot be activated, because activation has to mint a live token and the certificate is",
         "  not registered on the Entra app yet.",
         "",
-        "Next, as the agent account:",
-        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\BayAgent.ps1`" -EnrollCert",
+        "FIRST install the agent package (tools\Update-BayAgent.ps1, see Next Steps): -EnrollCert is part of",
+        "  BayAgent.ps1, and a blank PC does not have BayAgent.ps1 until the first install has run.",
         "",
-        "That prints a public certificate in base64. Send it to whoever holds the Entra app; they",
-        "register it as a certificate credential. Until that registration lands the agent will log",
-        "AADSTS700027 on every poll -- that is expected, not a fault."
+        "Next, signed in as the agent account ($BayKioskUser), because the key is made in that account's store:",
+        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\current\BayAgent.ps1`" -EnrollCert",
+        "",
+        "That prints a public certificate in base64 and writes it to $Root\BayAgent\state\bay-cert-<thumbprint>.cer.",
+        "Send it to whoever holds the Entra app; they register it as a certificate credential. Until that",
+        "registration lands the agent will log AADSTS700027 on every poll -- that is expected, not a fault.",
+        "The certificate signs in as the app agent-config.json names (clientId). Giving a bay its OWN app is the",
+        "  bay identity runbook's ladder (docs/aoc-bay-identity-runbook.md in the product repository)."
       )
     }
   }
@@ -678,10 +821,19 @@ foreach ($df in @("session.json", "promos.json")) {
   }
 }
 
-# DPAPI secret
+# The agent itself. Day0 lays down the host, the watchdog and the updaters; BayAgent.ps1 arrives with the first run of
+# Update-BayAgent.ps1. On a blank PC its absence here is the expected state, and it is a step still to do.
+$agentInstalled = Test-Path (Join-Path $AllBirdiesRoot "BayAgent\current\BayAgent.ps1")
 $checks += [PSCustomObject]@{
-  Check  = "DPAPI secret exists"
-  Result = if (Test-Path $dpapiPath) { "PASS" } else { "PENDING (run SetClientSecretDpapi)" }
+  Check  = "Agent package installed (current\BayAgent.ps1)"
+  Result = if ($agentInstalled) { "PASS" } else { "PENDING (first install: run tools\Update-BayAgent.ps1, see Next Steps)" }
+}
+
+# The DPAPI secret file row, scored for the credential this bay was set up for (see Get-CredentialFileCheck).
+$credentialFileCheck = Get-CredentialFileCheck -Mode $Credential -DpapiExists (Test-Path $dpapiPath)
+$checks += [PSCustomObject]@{
+  Check  = $credentialFileCheck.Check
+  Result = $credentialFileCheck.Result
 }
 
 # Code signing cert
@@ -717,11 +869,12 @@ $checks += [PSCustomObject]@{
   Result = if ($autoLogin -eq "1") { "PASS" } else { "FAIL" }
 }
 
-# RDP enabled
+# Remote Desktop: scored against what was asked for. On a default run PASS means OFF (A0.216).
 $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+$rdpCheck = Get-RemoteDesktopCheck -DenyValue $rdp -WantEnabled ([bool]$EnableRemoteDesktop)
 $checks += [PSCustomObject]@{
-  Check  = "Remote Desktop enabled"
-  Result = if ($rdp -eq 0) { "PASS" } else { "FAIL" }
+  Check  = $rdpCheck.Check
+  Result = $rdpCheck.Result
 }
 
 # USB storage disabled
@@ -830,28 +983,9 @@ if ($failCount -eq 0 -and $pendingCount -eq 0) {
 # ==================================================================
 Write-Step "Next Steps"
 
-$nextSteps = @()
-if (-not (Test-Path $dpapiPath)) {
-  $nextSteps += "1. Run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret (see Phase 6 output above)"
-}
-if ($env:COMPUTERNAME -ne $expectedName) {
-  $nextSteps += "2. Reboot to apply the computer name change to '$expectedName'"
-}
-$nextSteps += "3. Edit agent-config.json with bay-specific values (environmentUrl, bayId, tenantId, clientId)"
-$nextSteps += "4. Configure display arrangement:"
-$nextSteps += "     Display 1 = Touchscreen (primary, Launcher)"
-$nextSteps += "     Display 2 = Projector (gameplay)"
-$nextSteps += "     Display 3 = Monitor (SessionDisplay)"
-$nextSteps += "   Update displayRouting.roles in agent-config.json if display order differs"
-$nextSteps += "5. Reboot and verify kiosk mode:"
-$nextSteps += "     - BayKiosk auto-logs in (no desktop, no taskbar, no Start menu)"
-$nextSteps += "     - Uneekor Launcher appears on touchscreen (Display 1)"
-$nextSteps += "     - SessionDisplay appears on monitor (Display 3)"
-$nextSteps += "     - Windows key does nothing"
-$nextSteps += "     - Closing Launcher -> restarts in 2-3 seconds"
-$nextSteps += "6. Check the MDA: Ops > Bays -- the new bay should appear Online within 2 minutes"
-$nextSteps += "7. Send a HealthCheck from the MDA to verify end-to-end"
-$nextSteps += "8. Install Uneekor software and update agent-config.json launcher path"
+$nextSteps = Get-Day0NextSteps -Mode $Credential -DpapiExists (Test-Path $dpapiPath) `
+  -NameOk ($env:COMPUTERNAME -eq $expectedName) -ExpectedName $expectedName `
+  -AgentInstalled $agentInstalled -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser
 
 foreach ($step in $nextSteps) {
   Write-Host "  $step" -ForegroundColor White

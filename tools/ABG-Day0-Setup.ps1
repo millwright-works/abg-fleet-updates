@@ -6,7 +6,7 @@ Run as Administrator.
 
 Example:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ABG-Day0-Setup.ps1 `
-  -FleetRawBaseUrl "https://raw.githubusercontent.com/kedaheaven/abg-fleet-updates/main" `
+  -FleetRawBaseUrl "https://raw.githubusercontent.com/millwright-works/abg-fleet-updates/main/src/BayAgent" `
   -BayKioskUser "BayKiosk" `
   -RegisterConfigItems `
   -EnvironmentUrl "https://builds-apps-dev.crm.dynamics.com" `
@@ -151,7 +151,35 @@ function Sign-File([string]$path, $cert, [string]$timeStampServer) {
   }
 }
 
-function Write-AgentConfigTemplateIfMissing([string]$path) {
+function Set-AgentConfigTemplateValues {
+  # Put the values the installer already has into the template text, so nobody hand-edits JSON on a kiosk for values
+  # that were typed on the command line. A value that is empty, or that is not what its field needs (a GUID for the
+  # three ids, an https address for the org), is NOT written: its placeholder stays, visibly unfilled, instead of a
+  # typo becoming the bay's configuration. Returns the text and the list of fields still holding a placeholder.
+  param(
+    [Parameter(Mandatory = $true)][string]$Template,
+    [string]$EnvironmentUrl = "",
+    [string]$TenantId = "",
+    [string]$ClientId = "",
+    [string]$BayId = ""
+  )
+  $text = $Template
+  $g = [guid]::Empty
+  if (-not [string]::IsNullOrWhiteSpace($EnvironmentUrl) -and $EnvironmentUrl.Trim() -match '^https://[A-Za-z0-9.-]+/?$') {
+    $text = $text.Replace('https://<your-org>.crm.dynamics.com', $EnvironmentUrl.Trim().TrimEnd('/'))
+  }
+  foreach ($pair in @(@('<tenant-guid>', $TenantId), @('<app-client-id>', $ClientId), @('<bay-guid>', $BayId))) {
+    $value = [string]$pair[1]
+    if (-not [string]::IsNullOrWhiteSpace($value) -and [guid]::TryParse($value.Trim(), [ref]$g) -and $g -ne [guid]::Empty) {
+      $text = $text.Replace([string]$pair[0], $g.ToString("D"))
+    }
+  }
+  $left = @()
+  foreach ($ph in @('<your-org>', '<tenant-guid>', '<app-client-id>', '<bay-guid>')) { if ($text.Contains($ph)) { $left += $ph } }
+  return [ordered]@{ text = $text; unfilled = $left }
+}
+
+function Write-AgentConfigTemplateIfMissing([string]$path, [string]$envUrl = "", [string]$tenant = "", [string]$client = "", [string]$bay = "") {
   if (Test-Path -LiteralPath $path) { Write-Host "agent-config.json exists; not overwriting."; return }
 
   $template = @"
@@ -187,8 +215,14 @@ function Write-AgentConfigTemplateIfMissing([string]$path) {
 }
 "@
   Ensure-Dir (Split-Path -Parent $path)
-  $template | Set-Content -LiteralPath $path -Encoding UTF8
+  $filled = Set-AgentConfigTemplateValues -Template $template -EnvironmentUrl $envUrl -TenantId $tenant -ClientId $client -BayId $bay
+  $filled.text | Set-Content -LiteralPath $path -Encoding UTF8
   Write-Host "Wrote agent-config.json template to: $path"
+  if (@($filled.unfilled).Count -gt 0) {
+    Write-Host ("  STILL TO FILL IN by hand before the agent can start: " + (@($filled.unfilled) -join ", "))
+  } else {
+    Write-Host "  environmentUrl, tenantId, clientId and bayId were filled from this command line."
+  }
 }
 
 function Ensure-SessionDisplayPersistentFiles([string]$dataDir) {
@@ -358,6 +392,14 @@ Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-SessionDispla
 # NEW: download promos pack updater
 Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-PromosPack.ps1")        -outPath $updatePromosPath
 
+# The secret-credential tool, for the legacy -Credential Secret path and for falling back to it in the same sitting when
+# a certificate enrollment fails. Setup-BayPC.ps1 has always printed a command that runs it from bootstrap\, and nothing
+# ever put it there: Day0 did not download it and the release package does not ship it (measured 2026-10-11), so on a
+# blank PC the fallback pointed at a file that did not exist. It is DELIBERATELY NOT SIGNED (see the note at the top of
+# that script): it is run by hand with -ExecutionPolicy Bypass, and it creates nothing until someone runs it.
+$setSecretPath = Join-Path $bayAgentDir "bootstrap\ABG.SetClientSecretDpapi.ps1"
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.SetClientSecretDpapi.ps1") -outPath $setSecretPath
+
 Write-Step "Create/trust code-signing certificate"
 $cert = Get-CodeSigningCertOrCreate
 
@@ -381,7 +423,7 @@ Write-Host "All bootstrap/tools scripts signed and valid."
 Write-Step "Write agent-config.json template (if missing)"
 if ($WriteAgentConfigTemplate) {
   $cfgPath = Join-Path $bayAgentDir "agent-config.json"
-  Write-AgentConfigTemplateIfMissing -path $cfgPath
+  Write-AgentConfigTemplateIfMissing -path $cfgPath -envUrl $EnvironmentUrl -tenant $TenantId -client $ClientId -bay $BayId
 }
 
 Write-Step "Scheduled tasks"
