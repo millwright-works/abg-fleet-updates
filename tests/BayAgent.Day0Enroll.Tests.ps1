@@ -784,6 +784,8 @@ try {
     Assert-True ($r.ExitCode -eq 0 -and $r.StdOut -match "ENROLLED AGAIN" -and $r.StdOut -match "NOT removed: it is not in this account's stores") "enrolled again under this account; the report says the other account's key was not removed (exit $($r.ExitCode))"
     $st = Read-D0State $bv
     Assert-True ([string](Get-D0Prop (Get-D0Prop $st "ownIdentityEnrolled") "account") -eq $realAccount) "the record now names this account as the one that enrolled"
+    $cersLeft = @(Get-ChildItem -LiteralPath (Join-Path $bv.Root "state") -Filter "bay-cert-*.cer" | ForEach-Object { $_.Name })
+    Assert-True ($cersLeft.Count -eq 1 -and $cersLeft[0] -eq ("bay-cert-{0}.cer" -f (Get-D0ReportField $r.StdOut "Thumbprint"))) "exactly one public .cer is left in state\, the new one (the discarded one's file is gone: $($cersLeft -join ', '))"
 
     # ============================================================ S13 without the parameter, nothing new happens
     Section "S13 plain -EnrollCert is unchanged: no app id is written unless one was typed"
