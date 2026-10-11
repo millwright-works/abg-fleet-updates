@@ -24,7 +24,7 @@ WHAT IT PRODUCES
       tools/Publish-Current.ps1
       tools/Watch-BayAgentUpdate.ps1     (1.3.1: the update rollback guard)
       kiosk/ABG.KioskShell.ps1           (1.4.0, A0.363: the kiosk shell; signed on arrival like every .ps1)
-      kiosk/kiosk-policy.json            (1.4.0: the ONLY kiosk mode switch; 1.4.0 ships "explorer" = dormant)
+      kiosk/kiosk-policy.json            (1.4.0: the ONLY kiosk mode switch; "explorer" = dormant)
 
 SIGNING -- READ THIS BEFORE ADDING A SIGNING STEP HERE
   The package ships UNSIGNED, and that is correct, not an omission. MEASURED 2026-09-14
