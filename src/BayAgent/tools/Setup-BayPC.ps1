@@ -15,7 +15,11 @@ Notes:
   - Idempotent: safe to run multiple times on the same PC
   - Day0 is called with the src/BayAgent/ prefix for GitHub raw URLs
   - The default credential is a certificate the bay mints itself (-Credential Certificate). Only the legacy
-    -Credential Secret path uses ABG.SetClientSecretDpapi.ps1, which Day0 places in bootstrap\ for that case.
+    -Credential Secret path uses ABG.SetClientSecretDpapi.ps1, which Day0 places in bootstrap\ for that case
+    and for no other: a certificate bay is never given the shared secret or that tool.
+  - -EnvironmentUrl, -TenantId, -ClientId and -BayId reach agent-config.json only when they are passed. Their
+    defaults are never written into a bay's configuration.
+  - The machine script policy is set to AllSigned on every run (the two scheduled tasks need it).
   - Remote Desktop is left OFF unless -EnableRemoteDesktop is given.
   - A blank PC has no BayAgent.ps1 after this script: the first run of tools\Update-BayAgent.ps1 installs it.
   - ASCII-only comments (no em-dashes) for AllSigned compatibility
@@ -150,6 +154,83 @@ function Get-ShellActivationPlan {
                  "The wrapper is not deployed by Day0 or the current fleet package (AG-47 residual: nothing places it on a bay " +
                  "today); it must be placed at this exact path and pass this check before Setup-BayPC will activate it as the shell."
   }
+}
+
+function Get-RegistryValueOrNull {
+  # One registry value, or $null when the key or the value is not there. Never throws.
+  # WHY THIS EXISTS: this script runs under Set-StrictMode -Version Latest, where reading a property of nothing is a
+  # terminating error. Phase 7 used to read each value as (Get-ItemProperty ... -ErrorAction SilentlyContinue).Name,
+  # and on a blank PC three of those values do not exist yet (HKCU Shell, DisableLockWorkstation, DisableTaskMgr):
+  # a run with the lockdown skipped stopped there, before the checklist was printed (found by running the script
+  # against a modeled blank PC, 2026-10-11). A missing value is an answer the checklist has to be able to give.
+  param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Name)
+  $item = $null
+  try { $item = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue } catch { $item = $null }
+  if ($null -eq $item) { return $null }
+  $prop = $item.PSObject.Properties[$Name]
+  if ($null -eq $prop) { return $null }
+  return $prop.Value
+}
+
+function Set-MachineScriptPolicy {
+  # Sets the machine script policy and says, from a read-back, whether it took. Never throws.
+  # WHY IT CATCHES: this script is started with -ExecutionPolicy Bypass (its own header says so). In such a process
+  # Set-ExecutionPolicy -Scope LocalMachine WRITES the machine value and then raises a TERMINATING error ("updated
+  # your execution policy successfully, but the setting is overridden by a policy defined at a more specific scope").
+  # That error stopped every lockdown run at this line, before the checklist, the Next Steps and the reboot question
+  # (measured 2026-10-11; Kevin's 2026-09-21 run on Bay 1 printed the same message). The override is only about THIS
+  # process. What the scheduled tasks will meet is the machine value, so that is what is read back and returned.
+  param([string]$Wanted = "AllSigned")
+  $note = ""
+  try { Set-ExecutionPolicy -ExecutionPolicy $Wanted -Scope LocalMachine -Force -ErrorAction Stop }
+  catch { $note = (("$($_.Exception.Message) " + $(if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { "" })) -replace "\s+", " ").Trim() }
+  $now = ""
+  try { $now = [string](Get-ExecutionPolicy -Scope LocalMachine) } catch { $now = "" }
+  return [ordered]@{ ok = ($now -eq $Wanted); wanted = $Wanted; policy = $now; note = $note }
+}
+
+function Test-ScriptPolicyRunsTasks {
+  # Can the two scheduled tasks start under this machine script policy? Both run
+  # "powershell.exe -NoProfile -File <script>" with no policy switch (ABG.AgentHost.ps1's header: deliberate), and
+  # Day0 signs those scripts. A fresh Windows has the machine policy Undefined, which acts as Restricted: such a
+  # task is refused ("running scripts is disabled on this system", measured 2026-10-11).
+  param([string]$MachinePolicy)
+  return (@("AllSigned", "RemoteSigned", "Unrestricted", "Bypass") -contains "$MachinePolicy")
+}
+
+function Get-ScriptPolicyCheck {
+  # The Phase 7 row. It used to read "WARN (<policy>)", a text in none of the three summary buckets, so a bay whose
+  # tasks could not start counted as clean.
+  param([string]$MachinePolicy)
+  $shown = $(if ([string]::IsNullOrWhiteSpace($MachinePolicy)) { "unreadable" } else { $MachinePolicy })
+  return [ordered]@{
+    Check  = "Execution policy (AllSigned)"
+    Result = $(if ("$MachinePolicy" -eq "AllSigned") { "PASS" } else { "FAIL (the machine script policy is $shown; the two scheduled tasks start signed scripts with no policy switch and need AllSigned)" })
+  }
+}
+
+function Get-ScheduledTaskCheck {
+  # The Phase 7 row for one scheduled task. A task that is registered but cannot start is not a PASS: with the
+  # lockdown skipped the policy used to stay Undefined and both rows still read PASS (finding R3, 2026-10-11).
+  param(
+    [Parameter(Mandatory = $true)][string]$TaskName,
+    [bool]$Exists = $false,
+    [string]$State = "",
+    [string]$MachinePolicy = ""
+  )
+  $result = "FAIL"
+  if ($Exists -and (Test-ScriptPolicyRunsTasks -MachinePolicy $MachinePolicy)) { $result = "PASS ($State)" }
+  elseif ($Exists) { $result = "FAIL (registered, but the machine script policy '$MachinePolicy' will not let it start)" }
+  return [ordered]@{ Check = "Scheduled task: $TaskName"; Result = $result }
+}
+
+function Get-LockdownRowResult {
+  # The Phase 7 result for a row the lockdown phase sets. When the lockdown was skipped on purpose (-SkipLockdown,
+  # the first of two runs) "not set yet" is a step still to do, not a failure. When the lockdown ran, it is a FAIL.
+  param([bool]$Ok = $false, [bool]$LockdownSkipped = $false)
+  if ($Ok) { return "PASS" }
+  if ($LockdownSkipped) { return "PENDING (the lockdown was skipped on this run; run again without -SkipLockdown)" }
+  return "FAIL"
 }
 
 function Get-RemoteDesktopPlan {
@@ -388,12 +469,21 @@ if (-not $SkipDay0) {
     CreateAgentTask       = $true
     WriteAgentConfigTemplate = $true
   }
-  # The values this script already knows go into the agent-config.json template, so nobody hand-edits JSON on a
-  # kiosk for values that were typed on this command line. Empty values are left as the template's placeholders.
-  if (-not [string]::IsNullOrWhiteSpace($EnvironmentUrl)) { $day0Args["EnvironmentUrl"] = $EnvironmentUrl }
-  if (-not [string]::IsNullOrWhiteSpace($TenantId))       { $day0Args["TenantId"] = $TenantId }
-  if (-not [string]::IsNullOrWhiteSpace($ClientId))       { $day0Args["ClientId"] = $ClientId }
-  if (-not [string]::IsNullOrWhiteSpace($BayId))          { $day0Args["BayId"] = $BayId }
+  # Values TYPED ON THIS COMMAND LINE go into the agent-config.json template, so nobody hand-edits JSON on a kiosk
+  # for something already typed. A value the operator did not pass is NOT written, even where this script has a
+  # default for it: -EnvironmentUrl, -TenantId and -ClientId default to the vendor's own development organization,
+  # tenant and shared app (they exist for -RegisterConfigItems), and a default must never become a customer bay's
+  # configuration. $PSBoundParameters holds exactly what was passed. Anything not passed stays a visible
+  # <placeholder>, which Day0 reports by name.
+  if ($PSBoundParameters.ContainsKey("EnvironmentUrl") -and -not [string]::IsNullOrWhiteSpace($EnvironmentUrl)) { $day0Args["ConfigEnvironmentUrl"] = $EnvironmentUrl }
+  if ($PSBoundParameters.ContainsKey("TenantId") -and -not [string]::IsNullOrWhiteSpace($TenantId))             { $day0Args["ConfigTenantId"] = $TenantId }
+  if ($PSBoundParameters.ContainsKey("ClientId") -and -not [string]::IsNullOrWhiteSpace($ClientId))             { $day0Args["ConfigClientId"] = $ClientId }
+  if ($PSBoundParameters.ContainsKey("BayId") -and -not [string]::IsNullOrWhiteSpace($BayId))                   { $day0Args["ConfigBayId"] = $BayId }
+
+  # The secret-credential tool is placed ONLY on a bay being set up for the legacy secret credential. A certificate
+  # bay gets neither the shared secret nor the tool that seals one: if its enrollment fails, the setup stops there
+  # and the cause is fixed (A0.529); it is not switched to the shared secret.
+  if ($Credential -eq "Secret") { $day0Args["PlaceSecretTool"] = $true }
 
   # Prompt for BayKiosk password for the scheduled task (Day0 needs it)
   $taskPw = Read-Host "  Enter $BayKioskUser password (for scheduled task registration)" -AsSecureString
@@ -422,6 +512,18 @@ if (-not $SkipDay0) {
 } else {
   Write-Host "  Skipping Day0 (-SkipDay0)." -ForegroundColor Yellow
 }
+
+# ==================================================================
+# PHASE 3B: THE SCRIPT POLICY THE SCHEDULED TASKS NEED
+# ==================================================================
+# On EVERY run, lockdown or not. This used to sit inside the lockdown phase, so a run with -SkipLockdown registered
+# two scheduled tasks that the machine policy (Undefined on a fresh Windows, which acts as Restricted) would not
+# start, and scored them PASS. AllSigned is what lets the signed host and watchdog scripts run; it is a condition of
+# the tasks working, not a lockdown choice. Set-MachineScriptPolicy never throws; the checklist reports the read-back.
+Write-Step "Phase 3B: Script policy for the scheduled tasks"
+$scriptPolicy = Set-MachineScriptPolicy -Wanted "AllSigned"
+if ($scriptPolicy.ok) { Write-Host "  Machine script policy: AllSigned." -ForegroundColor Green }
+else { Write-Host "  The machine script policy reads '$($scriptPolicy.policy)', not AllSigned; the scheduled tasks will not start. $($scriptPolicy.note)" -ForegroundColor Red }
 
 # ==================================================================
 # PHASE 4: EDGE POLICIES (SessionDisplay launched by shell wrapper)
@@ -613,10 +715,8 @@ if (-not $SkipLockdown) {
   Set-ItemProperty -Path $pushPath -Name "DisableNotificationCenter" -Value 1 -Type DWord
   Write-Host "  Notification center disabled." -ForegroundColor Green
 
-  # Set execution policy to AllSigned
-  Write-Host "  Setting execution policy to AllSigned..."
-  Set-ExecutionPolicy -ExecutionPolicy AllSigned -Scope LocalMachine -Force
-  Write-Host "  Execution policy set to AllSigned." -ForegroundColor Green
+  # (The machine script policy is set in Phase 3B, on every run: the scheduled tasks need it whether or not this
+  # lockdown phase runs.)
 
   # ------------------------------------------------------------------
   # 5D: DISPLAY DETECTION
@@ -691,7 +791,10 @@ function Get-Day0CredentialGuidance {
         "Send it to whoever holds the Entra app; they register it as a certificate credential. Until that",
         "registration lands the agent will log AADSTS700027 on every poll -- that is expected, not a fault.",
         "The certificate signs in as the app agent-config.json names (clientId). Giving a bay its OWN app is the",
-        "  bay identity runbook's ladder (docs/aoc-bay-identity-runbook.md in the product repository)."
+        "  bay identity runbook's ladder (docs/aoc-bay-identity-runbook.md in the product repository).",
+        "",
+        "IF ENROLLMENT FAILS, STOP HERE and fix the cause. Do not switch this bay to the shared client secret.",
+        "  A certificate bay is given neither that secret nor the tool that seals one."
       )
     }
   }
@@ -847,12 +950,15 @@ $checks += [PSCustomObject]@{
   Result = if ($sigCert.Count -gt 0) { "PASS (Thumbprint=$($sigCert[0].Thumbprint))" } else { "FAIL" }
 }
 
-# Scheduled tasks
+# Scheduled tasks: registered AND able to start under the machine script policy (see Get-ScheduledTaskCheck).
+$execPolicy = ""
+try { $execPolicy = [string](Get-ExecutionPolicy -Scope LocalMachine) } catch { $execPolicy = "" }
 foreach ($taskName in @("ABG Bay Agent", "ABG Host Watchdog")) {
   $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  $taskCheck = Get-ScheduledTaskCheck -TaskName $taskName -Exists ([bool]$task) -State $(if ($task) { [string]$task.State } else { "" }) -MachinePolicy $execPolicy
   $checks += [PSCustomObject]@{
-    Check  = "Scheduled task: $taskName"
-    Result = if ($task) { "PASS ($($task.State))" } else { "FAIL" }
+    Check  = $taskCheck.Check
+    Result = $taskCheck.Result
   }
 }
 
@@ -863,14 +969,14 @@ $checks += [PSCustomObject]@{
 }
 
 # Auto-login
-$autoLogin = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name AutoAdminLogon -ErrorAction SilentlyContinue).AutoAdminLogon
+$autoLogin = Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "AutoAdminLogon"
 $checks += [PSCustomObject]@{
   Check  = "Auto-login enabled"
   Result = if ($autoLogin -eq "1") { "PASS" } else { "FAIL" }
 }
 
 # Remote Desktop: scored against what was asked for. On a default run PASS means OFF (A0.216).
-$rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+$rdp = Get-RegistryValueOrNull -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections"
 $rdpCheck = Get-RemoteDesktopCheck -DenyValue $rdp -WantEnabled ([bool]$EnableRemoteDesktop)
 $checks += [PSCustomObject]@{
   Check  = $rdpCheck.Check
@@ -878,10 +984,10 @@ $checks += [PSCustomObject]@{
 }
 
 # USB storage disabled
-$usb = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR" -Name Start -ErrorAction SilentlyContinue).Start
+$usb = Get-RegistryValueOrNull -Path "HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR" -Name "Start"
 $checks += [PSCustomObject]@{
   Check  = "USB storage disabled"
-  Result = if ($usb -eq 4) { "PASS" } else { "FAIL" }
+  Result = Get-LockdownRowResult -Ok ($usb -eq 4) -LockdownSkipped ([bool]$SkipLockdown)
 }
 
 # Network connectivity
@@ -908,7 +1014,7 @@ $checks += [PSCustomObject]@{
 # failure. Phase 5A only activates the launcher wrapper once Get-ShellActivationPlan has verified it; a
 # bay with the wrapper unverified is EXPECTED to be running explorer.exe. Only a third value -- neither
 # the wrapper nor explorer.exe -- means the machine cannot show a desktop.
-$hklmShell = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -ErrorAction SilentlyContinue).Shell
+$hklmShell = Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "Shell"
 $checks += [PSCustomObject]@{
   Check  = "Custom shell (HKLM)"
   Result =
@@ -923,24 +1029,24 @@ $checks += [PSCustomObject]@{
 }
 
 # Admin shell override (HKCU)
-$hkcuShell = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -ErrorAction SilentlyContinue).Shell
+$hkcuShell = Get-RegistryValueOrNull -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "Shell"
 $checks += [PSCustomObject]@{
   Check  = "Admin shell override (HKCU)"
-  Result = if ($hkcuShell -eq "explorer.exe") { "PASS" } else { "FAIL" }
+  Result = Get-LockdownRowResult -Ok ($hkcuShell -eq "explorer.exe") -LockdownSkipped ([bool]$SkipLockdown)
 }
 
 # Keyboard: Win+L disabled
-$lockWs = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name DisableLockWorkstation -ErrorAction SilentlyContinue).DisableLockWorkstation
+$lockWs = Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "DisableLockWorkstation"
 $checks += [PSCustomObject]@{
   Check  = "Win+L (lock) disabled"
-  Result = if ($lockWs -eq 1) { "PASS" } else { "FAIL" }
+  Result = Get-LockdownRowResult -Ok ($lockWs -eq 1) -LockdownSkipped ([bool]$SkipLockdown)
 }
 
 # Keyboard: Task Manager disabled
-$disTm = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name DisableTaskMgr -ErrorAction SilentlyContinue).DisableTaskMgr
+$disTm = Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "DisableTaskMgr"
 $checks += [PSCustomObject]@{
   Check  = "Task Manager disabled"
-  Result = if ($disTm -eq 1) { "PASS" } else { "FAIL" }
+  Result = Get-LockdownRowResult -Ok ($disTm -eq 1) -LockdownSkipped ([bool]$SkipLockdown)
 }
 
 # Display count
@@ -954,20 +1060,23 @@ $checks += [PSCustomObject]@{
   Result = if ($displayCount -ge 3) { "PASS ($displayCount displays)" } else { "SKIP ($displayCount displays -- connect all 3 for final verification)" }
 }
 
-# Execution policy
-$execPolicy = Get-ExecutionPolicy -Scope LocalMachine
+# Execution policy: PASS or FAIL, never a text outside the summary's buckets (see Get-ScriptPolicyCheck).
+$scriptPolicyCheck = Get-ScriptPolicyCheck -MachinePolicy $execPolicy
 $checks += [PSCustomObject]@{
-  Check  = "Execution policy (AllSigned)"
-  Result = if ($execPolicy -eq "AllSigned") { "PASS" } else { "WARN ($execPolicy)" }
+  Check  = $scriptPolicyCheck.Check
+  Result = $scriptPolicyCheck.Result
 }
 
 # Print summary
 Write-Host ""
-$checks | Format-Table -AutoSize -Property Check, Result
+# -Wrap: a FAIL row carries its reason, and a reason cut off at the window's edge is no use to the person at the bay.
+$checks | Format-Table -AutoSize -Wrap -Property Check, Result
 
-$failCount = ($checks | Where-Object { $_.Result -match "FAIL" }).Count
-$pendingCount = ($checks | Where-Object { $_.Result -match "PENDING" }).Count
-$passCount = ($checks | Where-Object { $_.Result -match "PASS" }).Count
+# @( ) on each: under strict mode .Count throws on nothing and on a single row, and a clean run has NO failed row --
+# so "ALL N CHECKS PASSED" could never print, and the run stopped here before Next Steps (measured 2026-10-11).
+$failCount = @($checks | Where-Object { $_.Result -match "FAIL" }).Count
+$pendingCount = @($checks | Where-Object { $_.Result -match "PENDING" }).Count
+$passCount = @($checks | Where-Object { $_.Result -match "PASS" }).Count
 
 Write-Host ""
 if ($failCount -eq 0 -and $pendingCount -eq 0) {

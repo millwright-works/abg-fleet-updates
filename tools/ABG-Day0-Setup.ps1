@@ -41,6 +41,18 @@ param(
 
   # Config template
   [switch]$WriteAgentConfigTemplate = $true,
+  # Values for the agent-config.json template, and for nothing else. Kept apart from -EnvironmentUrl, -TenantId,
+  # -ClientId and -BayId below (which drive -RegisterConfigItems) so that a caller's DEFAULT for those can never land
+  # in a bay's configuration: Setup-BayPC.ps1 passes these four only for values its operator typed. Empty = the
+  # template keeps its <placeholder>.
+  [string]$ConfigEnvironmentUrl = "",
+  [string]$ConfigTenantId = "",
+  [string]$ConfigClientId = "",
+  [string]$ConfigBayId = "",
+
+  # Place bootstrap\ABG.SetClientSecretDpapi.ps1 on this PC. Only for a bay being set up for the legacy secret
+  # credential; a certificate bay is given neither the shared secret nor the tool that seals one (A0.529).
+  [switch]$PlaceSecretTool = $false,
 
   # ---- Dataverse ConfigItem registration ----
   [switch]$RegisterConfigItems = $false,
@@ -392,13 +404,17 @@ Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-SessionDispla
 # NEW: download promos pack updater
 Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-PromosPack.ps1")        -outPath $updatePromosPath
 
-# The secret-credential tool, for the legacy -Credential Secret path and for falling back to it in the same sitting when
-# a certificate enrollment fails. Setup-BayPC.ps1 has always printed a command that runs it from bootstrap\, and nothing
-# ever put it there: Day0 did not download it and the release package does not ship it (measured 2026-10-11), so on a
-# blank PC the fallback pointed at a file that did not exist. It is DELIBERATELY NOT SIGNED (see the note at the top of
+# The secret-credential tool, ONLY for a bay being set up for the legacy secret credential (-PlaceSecretTool, which
+# Setup-BayPC.ps1 passes for -Credential Secret and for nothing else). Setup-BayPC.ps1 has always printed a command
+# that runs it from bootstrap\, and nothing ever put it there: Day0 did not download it and the release package does
+# not ship it (measured 2026-10-11). A certificate bay does not get it: such a bay never holds the shared secret, and
+# a failed enrollment is fixed, not worked around (A0.529). It is DELIBERATELY NOT SIGNED (see the note at the top of
 # that script): it is run by hand with -ExecutionPolicy Bypass, and it creates nothing until someone runs it.
+# Last of the downloads, so a fork or a pinned commit without this file cannot stop the five the bay needs.
 $setSecretPath = Join-Path $bayAgentDir "bootstrap\ABG.SetClientSecretDpapi.ps1"
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.SetClientSecretDpapi.ps1") -outPath $setSecretPath
+if ($PlaceSecretTool) {
+  Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.SetClientSecretDpapi.ps1") -outPath $setSecretPath
+}
 
 Write-Step "Create/trust code-signing certificate"
 $cert = Get-CodeSigningCertOrCreate
@@ -423,7 +439,7 @@ Write-Host "All bootstrap/tools scripts signed and valid."
 Write-Step "Write agent-config.json template (if missing)"
 if ($WriteAgentConfigTemplate) {
   $cfgPath = Join-Path $bayAgentDir "agent-config.json"
-  Write-AgentConfigTemplateIfMissing -path $cfgPath -envUrl $EnvironmentUrl -tenant $TenantId -client $ClientId -bay $BayId
+  Write-AgentConfigTemplateIfMissing -path $cfgPath -envUrl $ConfigEnvironmentUrl -tenant $ConfigTenantId -client $ConfigClientId -bay $ConfigBayId
 }
 
 Write-Step "Scheduled tasks"

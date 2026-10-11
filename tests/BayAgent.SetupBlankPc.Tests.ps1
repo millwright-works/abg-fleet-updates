@@ -21,6 +21,16 @@ would have hit:
 This suite lifts the decision functions out of both scripts by AST (the pattern of BayAgent.SetupShell.Tests.ps1) and
 checks the call sites bind to them. No registry write, no download, no admin rights.
 
+FIX ROUND (same day, after the independent attack). Three stops that kept the script from finishing any run are
+fixed and pinned here as functions: a missing registry value under strict mode, Set-ExecutionPolicy's terminating
+error in a process started with -ExecutionPolicy Bypass, and .Count on zero rows or one. Also here: the script policy
+is set on every run and the task rows fail when it cannot run them; only values the operator typed reach the
+configuration; a certificate bay gets neither the secret tool nor a fallback (A0.529).
+
+THIS SUITE CANNOT FAIL ON WHAT THE SCRIPT BODY DOES, only on its lifted functions and pinned call sites. The attack
+showed that: 17 of 17 changes planted in the body passed it. tests\BayAgent.SetupRun.Tests.ps1 runs the real text
+top to bottom and is the suite that answers for the script as a whole. Keep both.
+
 WHAT THIS DOES NOT PROVE
   It does not run either script. A blank-PC run on real hardware is still the first one. It does not prove that
   Windows accepts an automatic sign-in whose domain value is the new computer name before the first reboot (that
@@ -78,7 +88,7 @@ function Get-BlankPcStringLiterals($Ast) {
 
 $BaseDir = Join-Path $env:TEMP ("bayagent-blankpctest-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $BaseDir | Out-Null
-$planned = 79   # assertions scored as failures when a function this suite needs is missing (a pre-fix script)
+$planned = 118  # assertions scored as failures when a function this suite needs is missing (a pre-fix script)
 
 try {
     Section "AST: both scripts parse, and the decisions are functions"
@@ -89,7 +99,8 @@ try {
     $day0Ast = [System.Management.Automation.Language.Parser]::ParseFile($Day0Script, [ref]$tok2, [ref]$err2)
     Assert-True (@($err2).Count -eq 0) "ABG-Day0-Setup.ps1 parses cleanly"
 
-    $needSetup = @("Get-RemoteDesktopPlan", "Get-RemoteDesktopCheck", "Get-CredentialFileCheck", "Get-Day0NextSteps", "Get-Day0CredentialGuidance")
+    $needSetup = @("Get-RemoteDesktopPlan", "Get-RemoteDesktopCheck", "Get-CredentialFileCheck", "Get-Day0NextSteps", "Get-Day0CredentialGuidance",
+        "Get-RegistryValueOrNull", "Set-MachineScriptPolicy", "Test-ScriptPolicyRunsTasks", "Get-ScriptPolicyCheck", "Get-ScheduledTaskCheck", "Get-LockdownRowResult")
     $needDay0 = @("Set-AgentConfigTemplateValues", "Write-AgentConfigTemplateIfMissing", "Ensure-Dir")
     $missing = @()
     foreach ($f in $needSetup) { if ($null -eq (Get-BlankPcFunctionText $setupAst $f)) { $missing += "Setup-BayPC.ps1: $f" } }
@@ -199,8 +210,70 @@ try {
         $rows = @()
         foreach ($m in @("Certificate", "Secret")) { foreach ($e in @($true, $false)) { $rows += (Get-CredentialFileCheck -Mode $m -DpapiExists $e).Result } }
         foreach ($d in @(0, 1, $null)) { foreach ($w in @($true, $false)) { $rows += (Get-RemoteDesktopCheck -DenyValue $d -WantEnabled $w).Result } }
+        foreach ($pol in @("AllSigned", "Undefined", "Restricted", "")) {
+            $rows += (Get-ScriptPolicyCheck -MachinePolicy $pol).Result
+            foreach ($ex in @($true, $false)) { $rows += (Get-ScheduledTaskCheck -TaskName "T" -Exists $ex -State "Ready" -MachinePolicy $pol).Result }
+        }
+        foreach ($ok in @($true, $false)) { foreach ($sk in @($true, $false)) { $rows += (Get-LockdownRowResult -Ok $ok -LockdownSkipped $sk) } }
         $bad = @($rows | Where-Object { $row = $_; $n = 0; foreach ($k in @("PASS", "FAIL", "PENDING")) { if ($row -match $k) { $n++ } }; $n -ne 1 })
         Assert-True ($bad.Count -eq 0) ("each of the $($rows.Count) possible row texts matches exactly one summary bucket (offenders: " + $(if ($bad.Count) { $bad -join " | " } else { "none" }) + ")")
+
+        # ------------------------------------------------------------------------------------------ the three stops (fix round)
+        Section "A missing registry value is an answer, not a stop (strict mode)"
+        Assert-True ($null -eq (Get-RegistryValueOrNull -Path "HKCU:\Software\AocNoSuchKey-$([guid]::NewGuid().ToString('N'))" -Name "Anything")) "a key that does not exist: null, no error"
+        Assert-True ($null -eq (Get-RegistryValueOrNull -Path "HKCU:\Environment" -Name "AocNoSuchValue-$([guid]::NewGuid().ToString('N'))")) "a value that does not exist under a real key: null, no error (the read that stopped the run)"
+        Assert-True (-not [string]::IsNullOrWhiteSpace([string](Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "ProductName"))) "a value that exists comes back as its value"
+        $memberReads = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Expression -is [System.Management.Automation.Language.ParenExpressionAst] -and $n.Expression.Extent.Text -match 'Get-ItemProperty' }, $true))
+        Assert-True ($memberReads.Count -eq 0) ("no statement reads a property straight off (Get-ItemProperty ...) any more (found " + $memberReads.Count + ")")
+        $rawReads = @(Get-BlankPcCommands $setupAst "Get-ItemProperty")
+        $rawOutside = @($rawReads | Where-Object { $p = $_.Parent; $inHelper = $false; while ($p) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $p.Name -eq "Get-RegistryValueOrNull") { $inHelper = $true }; $p = $p.Parent }; -not $inHelper })
+        Assert-True ($rawReads.Count -eq 1 -and $rawOutside.Count -eq 0) "Get-ItemProperty is called in one place only: inside Get-RegistryValueOrNull"
+        Assert-True (@(Get-BlankPcCommands $setupAst "Get-RegistryValueOrNull").Count -eq 7) "the seven registry readings of the checklist all go through it"
+        $parenCounts = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and "$($n.Member.Extent.Text)" -eq "Count" -and $n.Expression -is [System.Management.Automation.Language.ParenExpressionAst] -and $n.Expression.Extent.Text -match 'Where-Object' }, $true))
+        Assert-True ($parenCounts.Count -eq 0) "no .Count is taken straight off a (... | Where-Object ...) pipeline (zero rows or one row stopped the summary)"
+
+        Section "The machine script policy: set through one function that cannot stop the run, on every run"
+        $spCalls = @(Get-BlankPcCommands $setupAst "Set-ExecutionPolicy")
+        $spInside = @($spCalls | Where-Object { $p = $_.Parent; $inFn = $false; $inTry = $false; while ($p) { if ($p -is [System.Management.Automation.Language.TryStatementAst]) { $inTry = $true }; if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $p.Name -eq "Set-MachineScriptPolicy") { $inFn = $true }; $p = $p.Parent }; $inFn -and $inTry })
+        Assert-True ($spCalls.Count -eq 1 -and $spInside.Count -eq 1) "Set-ExecutionPolicy is called once, inside Set-MachineScriptPolicy's try"
+        $smCalls = @(Get-BlankPcCommands $setupAst "Set-MachineScriptPolicy")
+        $smConditional = @($smCalls | Where-Object { $p = $_.Parent; $inIf = $false; while ($p) { if ($p -is [System.Management.Automation.Language.IfStatementAst] -or $p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $inIf = $true }; $p = $p.Parent }; $inIf })
+        Assert-True ($smCalls.Count -eq 1 -and $smConditional.Count -eq 0) "Set-MachineScriptPolicy is called once, under no if at all: not inside the lockdown phase, not behind any skip switch"
+        # The function, with the two cmdlets it calls replaced by stand-ins (a function outranks a cmdlet).
+        $script:FakePolicy = "Undefined"; $script:FakeTakes = $true; $script:FakeThrows = $true
+        function Get-ExecutionPolicy { param([string]$Scope) return $script:FakePolicy }
+        function Set-ExecutionPolicy {
+            [CmdletBinding()] param([string]$ExecutionPolicy, [string]$Scope, [switch]$Force)
+            if ($script:FakeTakes) { $script:FakePolicy = $ExecutionPolicy }
+            if ($script:FakeThrows) { throw "Windows PowerShell updated your execution policy successfully, but the setting is overridden by a policy defined at a more specific scope." }
+        }
+        $threw = $false; $res = $null
+        try { $res = Set-MachineScriptPolicy -Wanted "AllSigned" } catch { $threw = $true }
+        Assert-True (-not $threw -and $null -ne $res -and $res.ok -eq $true -and $res.policy -eq "AllSigned") "the override error after a write that took: no throw, ok, read back as AllSigned"
+        Assert-True ($null -ne $res -and "$($res.note)" -match "overridden") "...and the error text is kept as a note, not swallowed"
+        $script:FakePolicy = "Undefined"; $script:FakeTakes = $false; $script:FakeThrows = $true
+        $threw = $false; $res = $null
+        try { $res = Set-MachineScriptPolicy -Wanted "AllSigned" } catch { $threw = $true }
+        Assert-True (-not $threw -and $null -ne $res -and $res.ok -eq $false -and $res.policy -eq "Undefined") "an error after a write that did NOT take: no throw, and NOT ok (the read-back decides, never the absence of an error)"
+        $script:FakePolicy = "Undefined"; $script:FakeTakes = $true; $script:FakeThrows = $false
+        $res = Set-MachineScriptPolicy -Wanted "AllSigned"
+        Assert-True ($res.ok -eq $true -and "$($res.note)" -eq "") "no error and a write that took: ok, no note"
+        Remove-Item function:Get-ExecutionPolicy, function:Set-ExecutionPolicy -ErrorAction SilentlyContinue
+
+        Section "The checklist rows about the policy, the tasks and the lockdown"
+        Assert-True ((Get-ScriptPolicyCheck -MachinePolicy "AllSigned").Result -eq "PASS") "policy AllSigned: PASS"
+        foreach ($pol in @("Undefined", "Restricted", "")) { Assert-True ((Get-ScriptPolicyCheck -MachinePolicy $pol).Result -match "^FAIL") "policy '$pol': FAIL (it used to read WARN, a text in no summary bucket)" }
+        Assert-True ((Test-ScriptPolicyRunsTasks -MachinePolicy "AllSigned") -and -not (Test-ScriptPolicyRunsTasks -MachinePolicy "Undefined") -and -not (Test-ScriptPolicyRunsTasks -MachinePolicy "Restricted") -and -not (Test-ScriptPolicyRunsTasks -MachinePolicy "")) "the tasks can start under AllSigned; not under Undefined, Restricted or an unreadable policy"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Bay Agent" -Exists $true -State "Ready" -MachinePolicy "AllSigned").Result -eq "PASS (Ready)") "a registered task under AllSigned: PASS"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Bay Agent" -Exists $true -State "Ready" -MachinePolicy "Undefined").Result -match "^FAIL \(registered, but") "a registered task the policy will not start: FAIL, saying why (it used to read PASS)"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Bay Agent" -Exists $false -MachinePolicy "AllSigned").Result -eq "FAIL") "a task that is not registered: FAIL"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Host Watchdog" -Exists $true -State "Ready" -MachinePolicy "AllSigned").Check -eq "Scheduled task: ABG Host Watchdog") "the row keeps its name"
+        Assert-True ((Get-LockdownRowResult -Ok $true -LockdownSkipped $false) -eq "PASS" -and (Get-LockdownRowResult -Ok $true -LockdownSkipped $true) -eq "PASS") "a lockdown row that holds: PASS, skipped or not"
+        Assert-True ((Get-LockdownRowResult -Ok $false -LockdownSkipped $true) -match "^PENDING") "not set, and the lockdown was skipped on purpose: PENDING"
+        Assert-True ((Get-LockdownRowResult -Ok $false -LockdownSkipped $false) -eq "FAIL") "not set after a lockdown run: FAIL"
+        $lockCalls = @(Get-BlankPcCommands $setupAst "Get-LockdownRowResult")
+        Assert-True ($lockCalls.Count -eq 4 -and @($lockCalls | Where-Object { "$((Get-BlankPcParamValueAst $_ 'LockdownSkipped').Extent.Text)" -eq '([bool]$SkipLockdown)' }).Count -eq 4) "the four lockdown rows use it, each told from -SkipLockdown itself"
+        Assert-True (@(Get-BlankPcStringLiterals $setupAst | Where-Object { $_ -match '^WARN\b' }).Count -eq 0) "no string the code can print as a result starts with WARN any more"
 
         Section "Next Steps: the order a blank PC needs, and no secret on a certificate bay"
         $s = @(Get-Day0NextSteps -Mode "Certificate" -DpapiExists $false -NameOk $true -ExpectedName "BAY9KIOSK" -AgentInstalled $false -Root "C:\AllBirdies" -BayKioskUser "BayKiosk")
@@ -237,6 +310,7 @@ try {
         Assert-True ($gl -match "(?i)first install the agent package" -and $gl -match "Update-BayAgent\.ps1") "...and says the agent package is installed first"
         Assert-True ($gl -match "BayKiosk") "...and says which account runs it (the key is made in that account's store)"
         Assert-True ($gl -notmatch "SetClientSecretDpapi" -and $gl -match "(?i)do not create") "...and still forbids the secret (T28's rule kept)"
+        Assert-True ($gl -match "IF ENROLLMENT FAILS, STOP HERE" -and $gl -match "(?i)do not switch this bay to the shared client secret") "...and says a failed enrollment is a stop, not a reason to fall back to the shared secret (A0.529)"
         $gs = Get-Day0CredentialGuidance -Mode "Secret" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
         Assert-True (($gs.lines -join "`n").Contains('"C:\AllBirdies\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1"')) "secret guidance still runs the tool from bootstrap\ (where Day0 now puts it)"
 
@@ -259,16 +333,25 @@ try {
         $oldOwner = @((Get-BlankPcStringLiterals $setupAst) + (Get-BlankPcStringLiterals $day0Ast) | Where-Object { $_ -match "(?i)kedaheaven" })
         Assert-True ($oldOwner.Count -eq 0) "no string the code can act on, in either script, names the previous owner"
 
-        Section "Setup-BayPC hands Day0 the values it knows (so the config template is not hand-edited)"
+        Section "Only values the operator TYPED reach the configuration; a default never does"
+        $allAssign = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
         foreach ($k in @("EnvironmentUrl", "TenantId", "ClientId", "BayId")) {
-            $assign = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object {
-                $_.Left.Extent.Text -eq ('$day0Args["' + $k + '"]') -and $_.Right.Extent.Text -eq ('$' + $k) })
-            $outside = @($assign | Where-Object {
+            $cfgAssign = @($allAssign | Where-Object { $_.Left.Extent.Text -eq ('$day0Args["Config' + $k + '"]') -and $_.Right.Extent.Text -eq ('$' + $k) })
+            $guarded = @($cfgAssign | Where-Object {
+                $p = $_.Parent; $ok = $false
+                while ($p) { if ($p -is [System.Management.Automation.Language.IfStatementAst] -and $p.Clauses[0].Item1.Extent.Text -match ('^\s*\$PSBoundParameters\.ContainsKey\("' + $k + '"\)\s+-and\s')) { $ok = $true }; $p = $p.Parent }
+                $ok })
+            Assert-True ($cfgAssign.Count -eq 1 -and $guarded.Count -eq 1) "`$day0Args[`"Config$k`"] is set from `$$k, and only when -$k was actually passed (`$PSBoundParameters)"
+            $plain = @($allAssign | Where-Object { $_.Left.Extent.Text -eq ('$day0Args["' + $k + '"]') })
+            $plainOutside = @($plain | Where-Object {
                 $p = $_.Parent; $inRegister = $false
                 while ($p) { if ($p -is [System.Management.Automation.Language.IfStatementAst] -and $p.Clauses[0].Item1.Extent.Text -match '^\s*\$RegisterConfigItems\s*$') { $inRegister = $true }; $p = $p.Parent }
                 -not $inRegister })
-            Assert-True ($outside.Count -eq 1) "`$day0Args[`"$k`"] is set from `$$k outside the -RegisterConfigItems branch"
+            Assert-True ($plainOutside.Count -eq 0) "the registration value `$day0Args[`"$k`"] (which may be a default) is set nowhere outside the -RegisterConfigItems branch"
         }
+        $toolAssign = @($allAssign | Where-Object { $_.Left.Extent.Text -eq '$day0Args["PlaceSecretTool"]' })
+        $toolGuarded = @($toolAssign | Where-Object { $p = $_.Parent; $ok = $false; while ($p) { if ($p -is [System.Management.Automation.Language.IfStatementAst] -and $p.Clauses[0].Item1.Extent.Text -match '^\s*\$Credential\s+-eq\s+"Secret"\s*$') { $ok = $true }; $p = $p.Parent }; $ok })
+        Assert-True ($toolAssign.Count -eq 1 -and $toolGuarded.Count -eq 1) "Day0 is asked to place the secret tool in one place only: under if (`$Credential -eq `"Secret`")"
 
         # ------------------------------------------------------------------------------------------ Day0
         Section "Day0: the config template takes real values, and refuses a value that is not one"
@@ -296,12 +379,21 @@ try {
         Write-AgentConfigTemplateIfMissing -path $p1 -envUrl "https://other.crm.dynamics.com" -tenant $tenant -client $client -bay $bay 6>$null
         Assert-True ((Get-Content -LiteralPath $p1 -Raw).Trim() -eq '{"keep":"me"}') "an existing agent-config.json is never overwritten"
         $tplCalls = @(Get-BlankPcCommands $day0Ast "Write-AgentConfigTemplateIfMissing")
-        Assert-True ($tplCalls.Count -eq 1 -and "$((Get-BlankPcParamValueAst $tplCalls[0] 'bay').Extent.Text)" -eq '$BayId' -and "$((Get-BlankPcParamValueAst $tplCalls[0] 'client').Extent.Text)" -eq '$ClientId' -and
-            "$((Get-BlankPcParamValueAst $tplCalls[0] 'tenant').Extent.Text)" -eq '$TenantId' -and "$((Get-BlankPcParamValueAst $tplCalls[0] 'envUrl').Extent.Text)" -eq '$EnvironmentUrl') "Day0 calls the template writer once, each value bound to its own parameter"
+        Assert-True ($tplCalls.Count -eq 1 -and "$((Get-BlankPcParamValueAst $tplCalls[0] 'bay').Extent.Text)" -eq '$ConfigBayId' -and "$((Get-BlankPcParamValueAst $tplCalls[0] 'client').Extent.Text)" -eq '$ConfigClientId' -and
+            "$((Get-BlankPcParamValueAst $tplCalls[0] 'tenant').Extent.Text)" -eq '$ConfigTenantId' -and "$((Get-BlankPcParamValueAst $tplCalls[0] 'envUrl').Extent.Text)" -eq '$ConfigEnvironmentUrl') "Day0 calls the template writer once, each value bound to its own Config parameter (never to the registration parameters)"
+        foreach ($cp in @("ConfigEnvironmentUrl", "ConfigTenantId", "ConfigClientId", "ConfigBayId")) {
+            $dp = @($day0Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $cp })
+            Assert-True ($dp.Count -eq 1 -and "$($dp[0].DefaultValue.Value)" -eq "") "Day0 declares -$cp, empty by default"
+        }
 
-        Section "Day0: the secret-credential tool is placed on the bay, unsigned, and created by nobody"
+        Section "Day0: the secret-credential tool goes only where it is asked for, unsigned, and is run by nobody"
         $dl = @(Get-BlankPcCommands $day0Ast "Download-File" | Where-Object { $_.Extent.Text -match '/bootstrap/ABG\.SetClientSecretDpapi\.ps1' })
-        Assert-True ($dl.Count -eq 1) "Day0 downloads bootstrap/ABG.SetClientSecretDpapi.ps1 exactly once"
+        Assert-True ($dl.Count -eq 1) "Day0 downloads bootstrap/ABG.SetClientSecretDpapi.ps1 in exactly one place"
+        $dlGuarded = $false
+        if ($dl.Count -eq 1) { $p = $dl[0].Parent; while ($p) { if ($p -is [System.Management.Automation.Language.IfStatementAst] -and $p.Clauses[0].Item1.Extent.Text -match '^\s*\$PlaceSecretTool\s*$') { $dlGuarded = $true }; $p = $p.Parent } }
+        Assert-True $dlGuarded "...and only under if (`$PlaceSecretTool): a certificate bay does not get the tool (A0.529)"
+        $toolParam = @($day0Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "PlaceSecretTool" })
+        Assert-True ($toolParam.Count -eq 1 -and "$($toolParam[0].StaticType.Name)" -eq "SwitchParameter" -and "$($toolParam[0].DefaultValue)" -match '^\$false$') "-PlaceSecretTool is a switch that is off unless given"
         $outVar = $null
         if ($dl.Count -eq 1) { $o = Get-BlankPcParamValueAst $dl[0] "outPath"; if ($o -is [System.Management.Automation.Language.VariableExpressionAst]) { $outVar = $o.VariablePath.UserPath } }
         $outAssign = @($day0Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object { $outVar -and $_.Left.Extent.Text -eq ('$' + $outVar) })
