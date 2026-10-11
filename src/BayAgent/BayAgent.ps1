@@ -35,9 +35,10 @@ Optional switches:
                  4  already enrolled, but the bay cannot sign in yet (the reason is printed)
                  1  an unexpected failure; nothing is left enrolled
                Add -EnrollForce to discard an enrollment and enroll again. It is honored only when Entra
-               itself refuses the enrollment on record (a mistyped app id), or when its certificate cannot
-               be used from this Windows account and the bay has never run (a certificate made under the
-               wrong account on the first day). An identity that signs in is never replaced from the console.
+               itself says the app does not exist or does not hold the certificate (a mistyped app id, a
+               certificate never registered), or when the certificate cannot be used from this Windows
+               account and the bay has never run (a certificate made under the wrong account on the first
+               day). An identity that signs in is never replaced from the console.
 #>
 
 param(
@@ -4652,9 +4653,15 @@ function Get-OwnIdentitySignInProof {
     #   none    - nothing is recorded as active
     #   absent  - the recorded certificate, or its private key, is not usable by this Windows account
     #   works   - Entra issued a token
-    #   refused - Entra answered and said no, or the certificate can never work (expired, no app id to sign in as)
-    #   unknown - no answer (the network, a 5xx): whether the identity works cannot be told
-    $r = [ordered]@{ outcome = "none"; thumbprint = $null; clientId = $null; code = ""; detail = "" }
+    #   refused - Entra itself answered and said no (an AADSTS code), or the certificate can never work (expired, no
+    #             app id to sign in as)
+    #   unknown - anything else: no answer, a 5xx, or a 4xx that does not carry Entra's own code (a proxy, a sign-in
+    #             page in the way). Whether the identity works cannot be told.
+    # unusable is the narrower fact -EnrollForce needs: this enrollment cannot work AS IT IS, by Entra's own word that
+    # the app does not exist (AADSTS700016) or does not hold this certificate (AADSTS700027), or because nothing names
+    # an app or the certificate has expired. Any other refusal (a wrong clock, AADSTS700024; a disabled app; a passing
+    # fault) says nothing about the enrollment itself, and a working bay may be behind it.
+    $r = [ordered]@{ outcome = "none"; thumbprint = $null; clientId = $null; code = ""; detail = ""; unusable = $false }
     try { $r.thumbprint = Get-ActiveCertThumbprint } catch { $r.thumbprint = $null }
     try { $r.clientId = Get-ActiveClientId } catch { $r.clientId = $null }
     if (-not $r.thumbprint) { return $r }
@@ -4666,7 +4673,7 @@ function Get-OwnIdentitySignInProof {
         return $r
     }
     if (-not $r.clientId) {
-        $r.outcome = "refused"
+        $r.outcome = "refused"; $r.unusable = $true
         $r.detail = "no app id is recorded or configured to sign in as"
         return $r
     }
@@ -4677,8 +4684,11 @@ function Get-OwnIdentitySignInProof {
         $proofMsg = [string]$_.Exception.Message
         $r.detail = $proofMsg
         $r.code = Get-AadstsCode $proofMsg
-        if ($proofMsg -match '^Token request failed with HTTP 4\d\d') { $r.outcome = "refused" }
-        elseif ($proofMsg -match '^Certificate [0-9A-F]{40} expired ') { $r.outcome = "refused" }
+        if (($proofMsg -match '^Token request failed with HTTP 4\d\d') -and $r.code) {
+            $r.outcome = "refused"
+            $r.unusable = ($r.code -in @("AADSTS700016", "AADSTS700027"))
+        }
+        elseif ($proofMsg -match '^Certificate [0-9A-F]{40} expired ') { $r.outcome = "refused"; $r.unusable = $true }
         elseif ($proofMsg -match 'no usable RSA private key') { $r.outcome = "absent" }
         else { $r.outcome = "unknown" }
     }
@@ -4825,8 +4835,8 @@ function Invoke-OwnIdentityEnroll {
         if ($proof.outcome -eq "works") {
             return (New-OwnIdentityEnrollRefusal "ABG_OWNID_IDENTITY_WORKS" ("This bay just signed in with the enrollment on record ({0}). An identity that works is never replaced from the console; it changes only by the remote ladder (CredentialRotate), which proves the new one first." -f $onRecord))
         }
-        if ($proof.outcome -eq "unknown") {
-            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CANNOT_TELL" ("Whether the enrollment on record works could not be told ({0}). It is discarded only when Entra itself refuses it. Check the network and run this again." -f $proof.detail))
+        if ($proof.outcome -eq "unknown" -or ($proof.outcome -eq "refused" -and -not $proof.unusable)) {
+            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CANNOT_TELL" ("Whether the enrollment on record is unusable could not be told ({0}). It is discarded only when Entra itself says the app does not exist (AADSTS700016) or does not hold this certificate (AADSTS700027). Check the network and this PC's clock, and run this again." -f $proof.detail))
         }
         if ($proof.outcome -eq "absent") {
             # The certificate on record cannot be used from THIS Windows account, so whether the identity works cannot

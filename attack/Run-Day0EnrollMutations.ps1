@@ -100,11 +100,15 @@ $mutants = @(
     (New-D0Mutant "F05" "a WORKING identity is replaced with -EnrollForce" @(
         (New-D0Edit '        if ($proof.outcome -eq "works") {' '        if ($false) {'))),
     (New-D0Mutant "F06" "an identity whose state cannot be told is replaced with -EnrollForce" @(
-        (New-D0Edit '        if ($proof.outcome -eq "unknown") {' '        if ($false) {'))),
+        (New-D0Edit '        if ($proof.outcome -eq "unknown" -or ($proof.outcome -eq "refused" -and -not $proof.unusable)) {' '        if ($false) {'))),
     (New-D0Mutant "F07" "no answer from Entra is read as a refusal" @(
         (New-D0Edit '        else { $r.outcome = "unknown" }' '        else { $r.outcome = "refused" }'))),
-    (New-D0Mutant "F08" "a 5xx from Entra is read as a refusal" @(
-        (New-D0Edit "'^Token request failed with HTTP 4\d\d'" "'^Token request failed with HTTP \d\d\d'"))),
+    (New-D0Mutant "F08" "a 4xx that does not carry Entra's own code is read as Entra refusing" @(
+        (New-D0Edit "if ((`$proofMsg -match '^Token request failed with HTTP 4\d\d') -and `$r.code) {" "if (`$proofMsg -match '^Token request failed with HTTP 4\d\d') {"))),
+    (New-D0Mutant "F16" "any refusal by Entra makes the enrollment discardable (a wrong clock would discard a good one)" @(
+        (New-D0Edit '            $r.unusable = ($r.code -in @("AADSTS700016", "AADSTS700027"))' '            $r.unusable = $true'))),
+    (New-D0Mutant "F17" "a refusal that says nothing about the enrollment is still discarded with -EnrollForce" @(
+        (New-D0Edit 'if ($proof.outcome -eq "unknown" -or ($proof.outcome -eq "refused" -and -not $proof.unusable)) {' 'if ($proof.outcome -eq "unknown") {'))),
     (New-D0Mutant "F09" "the sign-in check signs in as the configured app, not the app on record" @(
         (New-D0Edit '$null = Acquire-TokenWithCertificate -Thumbprint $r.thumbprint -ForClientId $r.clientId' '$null = Acquire-TokenWithCertificate -Thumbprint $r.thumbprint -ForClientId $ClientId'))),
     (New-D0Mutant "F10" "the discarded certificate and its key stay on the PC" @(

@@ -133,7 +133,7 @@ function Start-D0Mock([hashtable]$Sync) {
         function ConvertTo-MockB64Url([byte[]]$b) { return [Convert]::ToBase64String($b).TrimEnd("=").Replace("+", "-").Replace("/", "_") }
         function Send-MockAnswer($stream, [int]$status, [string]$json) {
             $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-            $word = $(if ($status -eq 200) { "OK" } elseif ($status -eq 400) { "Bad Request" } elseif ($status -eq 401) { "Unauthorized" } elseif ($status -eq 503) { "Service Unavailable" } else { "Not Found" })
+            $word = $(if ($status -eq 200) { "OK" } elseif ($status -eq 400) { "Bad Request" } elseif ($status -eq 401) { "Unauthorized" } elseif ($status -eq 403) { "Forbidden" } elseif ($status -eq 503) { "Service Unavailable" } else { "Not Found" })
             $head = "HTTP/1.1 $status $word`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
             $hb = [Text.Encoding]::ASCII.GetBytes($head)
             $stream.Write($hb, 0, $hb.Length); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush()
@@ -166,6 +166,8 @@ function Start-D0Mock([hashtable]$Sync) {
                         $mode = [string]$sync["TokenMode"]
                         if ($mode -eq "503") { $status = 503; $answer = '{"error":"temporarily_unavailable"}'; $rec.outcome = "503" }
                         elseif ($mode -eq "drop") { $drop = $true; $rec.outcome = "dropped" }
+                        elseif ($mode -eq "proxy403") { $status = 403; $answer = '{"blocked":"by something that is not Entra (mock)"}'; $rec.outcome = "proxy403" }
+                        elseif ($mode -eq "clock") { $status = 401; $answer = '{"error":"invalid_client","error_description":"AADSTS700024: Client assertion is not within its valid time range (mock)."}'; $rec.outcome = "clock" }
                         elseif ($rec.hasSecret) { $status = 401; $answer = '{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret provided (mock)."}'; $rec.outcome = "secret-refused" }
                         elseif (-not $sync["Apps"].ContainsKey($cid)) {
                             $status = 400; $rec.outcome = "no-such-app"
@@ -686,14 +688,25 @@ try {
     Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_ALREADY_ENROLLED") "the right id without -EnrollForce is refused: ABG_OWNID_ALREADY_ENROLLED"
     Assert-True ($r.StdOut -match "-EnrollForce" -and $r.StdOut.Contains($tp1)) "...and the refusal names the certificate on record and -EnrollForce"
     Assert-True ((Get-D0InstallFingerprint $bw.Root) -eq $before) "...nothing was changed"
-    foreach ($mode in @("503", "drop")) {
+    # -EnrollForce discards only on Entra's own word that the enrollment cannot work as it is. Not on silence (503, a
+    # dropped connection), not on a 4xx that is not Entra's (a proxy), not on a refusal that says nothing about the
+    # enrollment (a wrong clock, AADSTS700024).
+    foreach ($mode in @("503", "drop", "proxy403", "clock")) {
         $sync["TokenMode"] = $mode
         $r = Invoke-D0Agent -Bay $bw -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
         $sync["TokenMode"] = "entra"
-        Show-D0Run $r ("S10 force, Entra " + $mode)
-        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CANNOT_TELL") "with Entra unreachable ($mode), -EnrollForce is refused: ABG_OWNID_CANNOT_TELL (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+        Show-D0Run $r ("S10 force, token endpoint answers: " + $mode)
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CANNOT_TELL") "when the answer is '$mode', -EnrollForce is refused: ABG_OWNID_CANNOT_TELL (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
         Assert-True ((Get-D0InstallFingerprint $bw.Root) -eq $before) "...nothing was changed"
     }
+    $sync["TokenMode"] = "proxy403"
+    $r = Invoke-D0Agent -Bay $bw -Arguments ($SheetEnroll -f $D0WrongApp) -Sheet
+    $sync["TokenMode"] = "clock"
+    $r2 = Invoke-D0Agent -Bay $bw -Arguments ($SheetEnroll -f $D0WrongApp) -Sheet
+    $sync["TokenMode"] = "entra"
+    Assert-True ($r.ExitCode -eq 4 -and (Get-D0ReportField $r.StdOut "Sign-in") -eq "UNKNOWN") "the second run reads a 403 that is not Entra's as UNKNOWN, not as a refusal (got '$(Get-D0ReportField $r.StdOut 'Sign-in')', exit $($r.ExitCode))"
+    Assert-True ($r2.ExitCode -eq 4 -and (Get-D0ReportField $r2.StdOut "Sign-in") -eq "REFUSED (AADSTS700024)") "...and Entra's clock refusal as REFUSED (AADSTS700024) (got '$(Get-D0ReportField $r2.StdOut 'Sign-in')', exit $($r2.ExitCode))"
+    Assert-True ((Get-D0InstallFingerprint $bw.Root) -eq $before) "...nothing was changed by either"
     $r = Invoke-D0Agent -Bay $bw -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
     Show-D0Run $r "S10 force, Entra answering"
     $tp2 = Get-D0ReportField $r.StdOut "Thumbprint"
