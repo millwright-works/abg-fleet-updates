@@ -791,7 +791,8 @@ try {
     # release (4c8851ac), where the K21 scenarios then FAIL for the reason they exist instead of the lift throwing.
     foreach ($n in @("Set-AgentRunningStamp", "ConvertTo-RunningSnapshot", "Test-SessionFinished", "Add-FinishedSessionToList", "Add-FinishedSession",
                      "Get-EndSessionScope", "Get-CancelEndUtc", "Get-CancelWarningText", "Send-ControlScreenWarning", "Start-CancelWarning", "Invoke-CancelEndIfDue",
-                     "Test-EndPendingFor", "Get-CommandRefusal", "Add-EndPending", "Clear-EndPending", "Invoke-PendingEndRetry", "Start-ControlScreenSender")) {
+                     "Test-EndPendingFor", "Get-CommandRefusal", "Add-EndPending", "Clear-EndPending", "Invoke-PendingEndRetry", "Start-ControlScreenSender",
+                     "Get-EndRetryPayloadJson", "Get-EndPendingEntry", "Save-EndPendingState")) {
         if (@($AgentDefs | Where-Object { $_.Name -eq $n }).Count -eq 1) { . ([scriptblock]::Create((Get-DefText $AgentDefs $n))) }
         else { . ([scriptblock]::Create("function $n { return `$null }")) }
     }
@@ -1812,14 +1813,24 @@ try {
 
     # ---- R1 (VM01, VM02): the REAL BayAgent.ps1, one main-loop pass (-Once), no network, a canceled booking whose warning is over.
     $realLoopOk = $true
-    function Invoke-RealLoopCase([string]$Name, [int]$CancelEndOffsetSeconds) {
-        $root = Join-Path $Sandbox ("realloop-" + $Name)
+    # KillAnchor / KillWhere: a copy of the agent with a hard process exit (code 77, no finally blocks) injected before or
+    # after that one line, to stop the REAL agent between two steps of an End (F3). Reuse: a second pass over the first
+    # pass's folder and launcher (a restart); Keep: leave the stand-in launcher running for the caller.
+    function Invoke-RealLoopCase([string]$Name, [int]$CancelEndOffsetSeconds, [string]$KillAnchor = "", [string]$KillWhere = "after", $Reuse = $null, [switch]$Keep) {
+        $root = $(if ($null -ne $Reuse) { $Reuse.Root } else { Join-Path $Sandbox ("realloop-" + $Name) })
         foreach ($d in @("", "logs", "secrets", "state")) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null }
         $text = [IO.File]::ReadAllText($AgentScript)
         $needle = '$BaseDir = "C:\AllBirdies\BayAgent"'
         if (-not $text.Contains($needle)) { throw "the BaseDir literal was not found in the agent" }
+        $text = $text.Replace($needle, ('$BaseDir = "{0}"' -f $root))
+        if (-not [string]::IsNullOrEmpty($KillAnchor)) {
+            $ia = $text.IndexOf($KillAnchor, [StringComparison]::Ordinal)
+            if ($ia -lt 0 -or $text.IndexOf($KillAnchor, $ia + 1, [StringComparison]::Ordinal) -ge 0) { throw "the kill anchor was not found exactly once: $KillAnchor" }
+            if ($KillWhere -eq "before") { $text = $text.Insert($ia, "[Environment]::Exit(77)`r`n") }
+            else { $eol = $text.IndexOf("`r`n", $ia, [StringComparison]::Ordinal); $text = $text.Insert($eol, "`r`n[Environment]::Exit(77)") }
+        }
         $agent = Join-Path $root "BayAgent.ps1"
-        [IO.File]::WriteAllText($agent, $text.Replace($needle, ('$BaseDir = "{0}"' -f $root)), (New-Object Text.UTF8Encoding($true)))
+        [IO.File]::WriteAllText($agent, $text, (New-Object Text.UTF8Encoding($true)))
         # The manifest sits beside the agent in the tree (a mutated copy of the agent has none beside it: use the tree's).
         $manifestSrc = Join-Path (Split-Path -Parent $AgentScript) "manifest.json"
         if (-not (Test-Path -LiteralPath $manifestSrc)) { $manifestSrc = Join-Path $PSScriptRoot "..\src\BayAgent\manifest.json" }
@@ -1828,7 +1839,7 @@ try {
         $plain = [Text.Encoding]::UTF8.GetBytes("not-a-real-secret-" + [guid]::NewGuid().ToString("N"))
         $prot = [System.Security.Cryptography.ProtectedData]::Protect($plain, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
         [IO.File]::WriteAllBytes((Join-Path $root "secrets\clientsecret.dpapi"), $prot)
-        $sl = New-StandInLauncher
+        $sl = $(if ($null -ne $Reuse) { $Reuse.Sl } else { New-StandInLauncher })
         $sessP = Join-Path $root "session.json"
         $c = [ordered]@{
             environmentUrl = "http://127.0.0.1:9"; tenantId = "11111111-1111-1111-1111-111111111111"; clientId = "22222222-2222-2222-2222-222222222222"
@@ -1839,6 +1850,7 @@ try {
         }
         $u8 = New-Object Text.UTF8Encoding($false)
         [IO.File]::WriteAllText((Join-Path $root "agent-config.json"), ($c | ConvertTo-Json -Depth 5), $u8)
+        if ($null -eq $Reuse) {
         $now = (Get-Date).ToUniversalTime()
         $cEnd = $now.AddSeconds($CancelEndOffsetSeconds).ToString($fmtZ); $bEnd = $now.AddMinutes(40).ToString($fmtZ); $wr = $now.AddMinutes(-4).ToString($fmtZ); $since = $now.AddMinutes(-30).ToString($fmtZ)
         $stamp = [ordered]@{ schema = 1; running = $true; baySessionId = "s-live"; endUtc = $bEnd; since = $since; cancelEndUtc = $cEnd; status = "ENDING"; forSessionId = "s-live"; writtenUtc = $wr }
@@ -1848,6 +1860,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $root "state\running-session.json"), ($rec | ConvertTo-Json -Depth 4), $u8)
         $intent = [ordered]@{ schema = 1; launcher = "wanted"; untilUtc = $now.AddSeconds($CancelEndOffsetSeconds + 120).ToString($fmtZ); baySessionId = "s-live"; reason = "booking canceled mid-play: wanted until its warning ends (A0.467)"; writtenUtc = $wr; agentPid = 1 }
         [IO.File]::WriteAllText((Join-Path $root "state\kiosk-intent.json"), ($intent | ConvertTo-Json -Depth 3), $u8)
+        }
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
         $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$agent`" -Once"
@@ -1865,13 +1878,95 @@ try {
         $rc = $null; try { $rc = [IO.File]::ReadAllText((Join-Path $root "state\running-session.json")) | ConvertFrom-Json } catch { }
         $fin = ""; try { $fin = (@($rc.finished) | ForEach-Object { $_.id }) -join "," } catch { }
         $alive = Test-StandInAlive $sl
-        Remove-StandInLauncher $sl
-        return [pscustomobject]@{ Exited = $exited; Wall = $(if ($w) { "{0}/{1}" -f $w.status, $w.baySessionId } else { "?" }); Intent = $(if ($ik) { "{0}/{1}" -f $ik.launcher, $ik.baySessionId } else { "?" }); Running = $(if ($rc) { $rc.running } else { "?" }); Finished = $fin; LauncherAlive = $alive; EndLogged = ($log -match "ended after its warning") }
+        $pendIds = ""; try { $pendIds = (@($rc.endPending) | Where-Object { $null -ne $_ } | ForEach-Object { $_.id }) -join "," } catch { }
+        if (-not $Keep) { Remove-StandInLauncher $sl }
+        return [pscustomobject]@{ Root = $root; Sl = $sl; ExitCode = $(if ($exited) { $proc.ExitCode } else { -1 }); Pending = $pendIds; Exited = $exited; Wall = $(if ($w) { "{0}/{1}" -f $w.status, $w.baySessionId } else { "?" }); Intent = $(if ($ik) { "{0}/{1}" -f $ik.launcher, $ik.baySessionId } else { "?" }); Running = $(if ($rc) { $rc.running } else { "?" }); Finished = $fin; LauncherAlive = $alive; EndLogged = ($log -match "ended after its warning") }
     }
     $rlDue = $null; $rlNot = $null
     try { $rlDue = Invoke-RealLoopCase "due" -60; $rlNot = Invoke-RealLoopCase "notdue" 600 } catch { $realLoopOk = $false; Write-Host ("  real-loop setup failed: " + $_.Exception.Message) }
     Assert-True ($realLoopOk -and $null -ne $rlDue -and $rlDue.Exited -and $rlDue.Wall -eq "ENDED/s-live" -and $rlDue.Intent -eq "closed/s-live" -and $rlDue.Running -eq $false -and $rlDue.Finished -match "s-live" -and -not $rlDue.LauncherAlive -and $rlDue.EndLogged) "R1 (VM01, VM02) the REAL agent script, one main-loop pass with no network, a canceled booking whose warning is over: wall ENDED, intent closed, record cleared and listed, the real launcher process closed (got: $(if ($rlDue) { '{0} | {1} | running={2} | finished={3} | launcher alive={4} | logged={5}' -f $rlDue.Wall, $rlDue.Intent, $rlDue.Running, $rlDue.Finished, $rlDue.LauncherAlive, $rlDue.EndLogged } else { 'no result' }))"
     Assert-True ($realLoopOk -and $null -ne $rlNot -and $rlNot.Exited -and $rlNot.Wall -eq "ENDING/s-live" -and $rlNot.Intent -eq "wanted/s-live" -and $rlNot.Running -eq $true -and $rlNot.LauncherAlive -and -not $rlNot.EndLogged) "R1 ...and with 10 minutes of the warning left, the same pass ends nothing (the control: the check is on the clock)"
+
+    # ---- F3: the REAL agent is stopped (hard exit, code 77) between each pair of steps of an End, then restarted. Whatever the
+    # point, the next pass closes the launcher and the intent, the pending mark is gone, and (for three points, in process,
+    # after the restart's own reads) a re-sent End is not refused as already done.
+    $killPoints = @(
+        @{ N = "before the End is marked"; A = 'Add-EndPending -SessionId $endSid -Payload $payloadObj -Scope $(if ($endOwns) { "owns" } else { "leaves" })'; W = "before"; Alive = $true; Resend = $false },
+        @{ N = "after the End is marked"; A = 'Add-EndPending -SessionId $endSid -Payload $payloadObj -Scope $(if ($endOwns) { "owns" } else { "leaves" })'; W = "after"; Alive = $true; Resend = $true },
+        @{ N = "after the session is listed ended"; A = 'Add-FinishedSession -SessionId $endSid -Why "EndSession"'; W = "after"; Alive = $true; Resend = $true },
+        @{ N = "after the record is cleared"; A = 'if ($endScope.Scope -eq "running") { $null = Set-RunningSessionForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payloadObj }'; W = "after"; Alive = $true; Resend = $false },
+        @{ N = "after the wall is written"; A = '# Stopping the apps the payload asks for is optional work; a failure there must not stop the protective act below.'; W = "before"; Alive = $true; Resend = $false },
+        @{ N = "after the apps step"; A = '$payloadSessionId = $endSid'; W = "before"; Alive = $true; Resend = $false },
+        @{ N = "after the intent is written"; A = '$kioskIntent = Set-KioskIntentForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payloadObj -SameSession $sameSession'; W = "after"; Alive = $true; Resend = $true },
+        @{ N = "after the launcher is closed"; A = '$launcherStopped = Stop-ProcessesGracefully $procs 8'; W = "after"; Alive = $false; Resend = $false }
+    )
+    $killIdx = 0
+    foreach ($kp in $killPoints) {
+        $killIdx++
+        $crash = $null; $recov = $null
+        try {
+            $crash = Invoke-RealLoopCase ("kill" + $killIdx) -60 -KillAnchor $kp.A -KillWhere $kp.W -Keep
+            $aliveAfterCrash = Test-StandInAlive $crash.Sl
+            Assert-True ($crash.Exited -and $crash.ExitCode -eq 77 -and ($aliveAfterCrash -eq $kp.Alive)) "F3 the real agent was stopped $($kp.N) (exit 77, launcher alive=$aliveAfterCrash, wanted $($kp.Alive))"
+            $recov = Invoke-RealLoopCase ("recover" + $killIdx) -60 -Reuse $crash
+            Assert-True ($recov.Exited -and $recov.ExitCode -ne 77 -and -not $recov.LauncherAlive -and $recov.Intent -eq "closed/s-live" -and $recov.Running -eq $false -and [string]::IsNullOrEmpty($recov.Pending)) "F3 restarted after a stop $($kp.N): the next pass closes the launcher and the intent, no End left pending (got: $($recov.Wall) | $($recov.Intent) | running=$($recov.Running) | pending=[$($recov.Pending)] | launcher alive=$($recov.LauncherAlive))"
+        } catch { Assert-True $false "F3 stop $($kp.N): the case could not run: $($_.Exception.Message)" }
+        finally { if ($null -ne $crash) { Remove-StandInLauncher $crash.Sl } }
+        if ($kp.Resend) {
+            $crash2 = $null
+            try {
+                $crash2 = Invoke-RealLoopCase ("resend" + $killIdx) -60 -KillAnchor $kp.A -KillWhere $kp.W -Keep
+                Clear-Bay
+                Copy-Item -LiteralPath (Join-Path $crash2.Root "state\running-session.json") -Destination $RunningSessionPath -Force
+                Copy-Item -LiteralPath (Join-Path $crash2.Root "state\kiosk-intent.json") -Destination $KioskIntentPath -Force
+                Copy-Item -LiteralPath (Join-Path $crash2.Root "session.json") -Destination $sessPath -Force
+                $cfg | Add-Member -NotePropertyName launcher -NotePropertyValue ([pscustomobject]@{ path = $crash2.Sl.Exe; processName = $crash2.Sl.Name }) -Force
+                Initialize-KioskIntent -NowUtc ((Get-Date).ToUniversalTime())
+                Initialize-RunningSession -NowUtc ((Get-Date).ToUniversalTime())
+                $aliveBefore = Test-StandInAlive $crash2.Sl
+                $script:Patches3.Clear()
+                Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION '{"mode":"End","baySessionId":"s-live"}')
+                Start-Sleep -Milliseconds 500
+                $rowLast = @($script:Patches3)[-1]
+                Assert-True ($aliveBefore -and -not (Test-StandInAlive $crash2.Sl) -and (Get-IntentNow).Closed -and $script:Patches3[0].Body[$Col_Status] -eq $STATUS_INPROGRESS -and $rowLast.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and -not (Test-EndPendingFor "s-live" $Global:RunningSessionEndPending)) "F3 after a stop $($kp.N) and a restart, the platform's End sent again is not refused as already done: it runs, closes the launcher and the intent"
+            } catch { Assert-True $false "F3 re-sent End after a stop $($kp.N): the case could not run: $($_.Exception.Message)" }
+            finally {
+                if ($null -ne $crash2) { Remove-StandInLauncher $crash2.Sl }
+                Clear-Bay; Remove-Item -LiteralPath $KioskIntentPath -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $sessPath -Force -ErrorAction SilentlyContinue
+                $Global:KioskIntentExpectedText = $null; $Global:KioskIntentPending = $false
+                Initialize-KioskIntent -NowUtc ((Get-Date).ToUniversalTime())
+            }
+        }
+    }
+
+    # ---- F1: the row path for a PAYING member (running, not canceled): a display update, a repeated Start and an End must RUN.
+    Clear-Bay
+    [void](Invoke-Start "s-f1")
+    $ext30 = (Get-Date).ToUniversalTime().AddMinutes(80).ToString($fmtZ)
+    $script:Patches3.Clear()
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_UPDATESESSIONDISPLAY ('{"mode":"Warn5","baySessionId":"s-f1","playEndUtc":"' + $ext30 + '"}'))
+    $lastU = @($script:Patches3)[-1]
+    Assert-True ($script:Patches3.Count -eq 2 -and $script:Patches3[0].Body[$Col_Status] -eq $STATUS_INPROGRESS -and $lastU.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$lastU.Body[$Col_Result] -match '"updated":true' -and [string](Get-KioskProp $Global:RunningSession "endUtc" "") -eq $ext30) "F1 a display update (an extension) row for a running, not-canceled session: locked, run, Succeeded, the record's end moved (never turned away at the row)"
+    $script:Patches3.Clear()
+    Process-Command -token "t" -cmd (New-CmdRow $CMD_STARTSESSION ('{"mode":"Start","baySessionId":"s-f1","playEndUtc":"' + $ext30 + '","closeLauncher":false}'))
+    $lastS = @($script:Patches3)[-1]
+    Assert-True ($script:Patches3.Count -eq 2 -and $script:Patches3[0].Body[$Col_Status] -eq $STATUS_INPROGRESS -and $lastS.Body[$Col_Status] -eq $STATUS_SUCCEEDED -and [string]$lastS.Body[$Col_Result] -notmatch '"skipped"' -and (Get-RecSid) -eq "s-f1") "F1 a repeated Start row for a running, not-canceled session: locked, run, Succeeded, not skipped"
+    [void](Invoke-End "s-f1")
+
+    # ---- F4: a retry applies the guard its first run applied. Nobody recorded, the wall on the next booking's Prep, a late End
+    # of an older booking that never played here: the first run leaves the launcher alone, and so does the retry.
+    Clear-Bay
+    $slF4 = New-StandInLauncher
+    try {
+        [void](Invoke-Start "s-nx" "Prep")
+        Break-LauncherStep; $script:GlThrows = 0
+        try { [void](Execute-Command -CommandType $CMD_ENDSESSION -PayloadJson '{"mode":"End","baySessionId":"s-old"}' -BayLabel "Bay") } catch { }
+        Repair-LauncherStep
+        $pendBefore = Test-EndPendingFor "s-old" $Global:RunningSessionEndPending
+        [void](Invoke-CancelEndIfDue -NowUtc ((Get-Date).ToUniversalTime()))
+        Assert-True ($pendBefore -and (Test-StandInAlive $slF4) -and -not ((Get-IntentNow).Closed -and (Get-IntentNow).SessionId -eq "s-old") -and -not (Test-EndPendingFor "s-old" $Global:RunningSessionEndPending)) "F4 the retry of a late End of an older booking (nobody recorded, wall on the next Prep) leaves the launcher and the intent alone, as its first run would, and drops its mark (got: pending first=$pendBefore, launcher alive=$(Test-StandInAlive $slF4), intent closed=$((Get-IntentNow).Closed), pending after=$(Test-EndPendingFor 's-old' $Global:RunningSessionEndPending))"
+    } finally { Remove-StandInLauncher $slF4 }
+    Clear-Bay
 
     # ---- Item 5: the default sender's process handling, against real processes (a renamed copy of ping.exe stands in for msg.exe).
     $slS = New-StandInLauncher

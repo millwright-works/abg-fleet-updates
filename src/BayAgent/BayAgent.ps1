@@ -4986,6 +4986,20 @@ $CMD_EMERGENCY_STOP {
                 return @{ ok = $true; leftAlone = $true; scope = "other"; reason = $endScope.Why; runningSessionId = [string](Get-KioskProp $Global:RunningSession "baySessionId" ""); kiosk = $null; launcherStopped = @{ stopped = $false; reason = "late_old_session_skip" } }
             }
 
+            # F3: the End is marked pending, in the record file, BEFORE it touches anything. From here a stop, a crash or a
+            # restart ends with the launcher closed on the next pass (the main loop retries it) or by the next End of it.
+            # F4: whether this End owns the launcher is decided ONCE, here, from the state it found, and stored with the
+            # mark: the recorded session's own End owns it whatever session.json says (F1-R3); with nobody recorded, a late
+            # End of an older booking (session.json names another) does not. A retry reads the stored decision.
+            $endOwns = $true
+            if ($endScope.Scope -eq "retry") {
+                $endOwns = ([string](Get-KioskProp (Get-EndPendingEntry $endSid $Global:RunningSessionEndPending) "scope" "") -ne "leaves")
+            } else {
+                $wallSidEarly = [string](Get-PropValue (Read-SessionModelFromDisk) "baySessionId" "")
+                if ($endScope.Scope -ne "running" -and -not [string]::IsNullOrWhiteSpace($endSid) -and -not [string]::IsNullOrWhiteSpace($wallSidEarly) -and ($endSid -ne $wallSidEarly)) { $endOwns = $false }
+                Add-EndPending -SessionId $endSid -Payload $payloadObj -Scope $(if ($endOwns) { "owns" } else { "leaves" })
+            }
+
             # Facility: EndSession always moves the bay to the Cleanup scene (Step 5). Not on a retry (R2): the first run did it.
             $facility = $null
             if ($endScope.Scope -ne "retry") {
@@ -5120,10 +5134,6 @@ $CMD_EMERGENCY_STOP {
             $paths = @{ sessionJsonPath = $null; sessionJsPath = $null }
             if ($endScope.Scope -ne "retry") {
                 Add-FinishedSession -SessionId $endSid -Why "EndSession"
-                $endPayloadJson = $null
-                try { $endPayloadJson = ConvertTo-Json -Compress -Depth 6 -InputObject $payloadObj } catch { $endPayloadJson = $null }
-                if ([string]::IsNullOrWhiteSpace($endPayloadJson)) { $endPayloadJson = ConvertTo-Json -Compress -InputObject ([ordered]@{ mode = "End"; baySessionId = $endSid }) }
-                Add-EndPending -SessionId $endSid -PayloadJson $endPayloadJson
                 if ($endScope.Scope -eq "running") { $null = Set-RunningSessionForCommand -CommandType $CMD_ENDSESSION -Mode "End" -Payload $payloadObj }
                 # A wall that cannot be written must not leave the launcher open (A0.360; a canceled booking never becomes free
                 # play, A0.467): the End goes on to the intent and the launcher, and the result says the wall failed.
@@ -5140,10 +5150,9 @@ $CMD_EMERGENCY_STOP {
             # running-session record the scope above decided it; with none, judged from session.json as before.
             $payloadSessionId = $endSid
             $currentSessionId = [string](Get-PropValue $existing "baySessionId" "")
-            $sameSession = $true
-            if ($endScope.Scope -ne "running" -and $endScope.Scope -ne "retry" -and -not [string]::IsNullOrWhiteSpace($payloadSessionId) -and -not [string]::IsNullOrWhiteSpace($currentSessionId) -and ($payloadSessionId -ne $currentSessionId)) {
-                $sameSession = $false
-            }
+            # F4: decided once, up front ($endOwns, stored with the pending mark), so a retry applies the guard its first run
+            # applied even though the first run has since rewritten session.json.
+            $sameSession = $endOwns
 
             # A0.363: not wanted, written BEFORE the launcher is closed, so a kiosk shell cannot reopen it in between. A late
             # EndSession for an older session leaves the current session's intent alone.
@@ -5865,6 +5874,7 @@ function Write-RunningSessionFile {
         since        = $(if ($null -ne $r) { Get-KioskProp $r "since" $null } else { $null })
         cancelEndUtc = $(if ($null -ne $r) { Get-KioskProp $r "cancelEndUtc" $null } else { $null })
         finished     = @(@($Global:RunningSessionFinished) | ForEach-Object { [ordered]@{ id = [string](Get-KioskProp $_ "id" ""); utc = [string](Get-KioskProp $_ "utc" "") } })
+        endPending   = @(@($Global:RunningSessionEndPending) | Where-Object { $null -ne $_ } | ForEach-Object { [ordered]@{ id = [string](Get-KioskProp $_ "id" ""); payload = [string](Get-KioskProp $_ "payload" ""); tries = [int](Get-KioskProp $_ "tries" 0); scope = [string](Get-KioskProp $_ "scope" "") } })
         writtenUtc   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
     $text = ConvertTo-Json -InputObject $o -Depth 4
@@ -5958,6 +5968,22 @@ function Initialize-RunningSession([DateTime]$NowUtc) {
                 if ($fid -is [string] -and -not [string]::IsNullOrWhiteSpace($fid)) { $fin += [ordered]@{ id = $fid; utc = [string](Get-KioskProp $fe "utc" "") } }
             }
         }
+        # F3: an End that was received but did not finish closing the launcher (the pending list, written with the ended
+        # list). Its session counts as ended (so a snapshot that still says it plays is "nobody") and the main loop retries
+        # the End. A damaged file loses it, like the ended list itself (F9).
+        $pend = @()
+        if ($rd.Ok) {
+            $pl2 = Get-KioskProp $rd.Obj "endPending" $null
+            foreach ($pe in @($pl2)) {
+                $pid2 = Get-KioskProp $pe "id" $null
+                if ($pid2 -is [string] -and -not [string]::IsNullOrWhiteSpace($pid2)) {
+                    $pt = Get-KioskProp $pe "tries" 0
+                    $pend += [ordered]@{ id = $pid2; payload = [string](Get-KioskProp $pe "payload" ""); tries = $(if ($pt -is [int] -or $pt -is [long]) { [int]$pt } else { 0 }); scope = [string](Get-KioskProp $pe "scope" "") }
+                    $fin = @(Add-FinishedSessionToList -Finished $fin -SessionId $pid2 -NowUtc $NowUtc -Max $RunningSessionFinishedMax)
+                }
+            }
+        }
+        $Global:RunningSessionEndPending = @($pend)
         $Global:RunningSessionFinished = @($fin)
         $model = Read-SessionModelFromDisk
         $stamp = ConvertTo-RunningSnapshot (Get-KioskProp $model "agentRunning" $null)
@@ -6030,23 +6056,57 @@ function Get-CommandRefusal {
     return $null
 }
 
-function Add-EndPending([string]$SessionId, [string]$PayloadJson) {
-    # An End of that session began and has not yet done its protective act (R2, 2026-10-10: the "ended" list is written
-    # before the launcher is closed, so a failure in between used to make every retry a refused no-op). In memory; the
-    # main loop retries it (Invoke-PendingEndRetry). Never throws.
+function Get-EndRetryPayloadJson($Payload, [string]$SessionId) {
+    # Pure. The part of an End's payload a retry needs (never the customer block): mode, session, and what decides the
+    # launcher close (closeLauncher, a launcher override, the reason). Small enough to live in the record file.
+    $o = [ordered]@{ mode = "End"; baySessionId = $SessionId }
+    foreach ($k in @("closeLauncher", "launcher", "reason")) {
+        $v = Get-KioskProp $Payload $k $null
+        if ($null -ne $v) { $o[$k] = $v }
+    }
+    $t = $null
+    try { $t = ConvertTo-Json -Compress -Depth 4 -InputObject $o } catch { $t = $null }
+    if ([string]::IsNullOrWhiteSpace($t) -or $t.Length -gt 1500) { $t = ConvertTo-Json -Compress -InputObject ([ordered]@{ mode = "End"; baySessionId = $SessionId }) }
+    return $t
+}
+
+function Get-EndPendingEntry([string]$SessionId, $Pending) {
+    # Pure. The pending entry for that session, or $null.
+    if ([string]::IsNullOrWhiteSpace($SessionId)) { return $null }
+    foreach ($p in @($Pending)) { if ($null -ne $p -and (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $p "id" "")))) { return $p } }
+    return $null
+}
+
+function Save-EndPendingState {
+    # F3 (2026-10-10): the pending list lives in the record file, in the same atomic write as the ended list and the record,
+    # so an agent that stops, crashes or restarts at any point after an End was received still knows the launcher may be
+    # open (Initialize-RunningSession reads it back). Memory stays the authority; a failed write is retried every pass.
+    $Global:RunningSessionPending = $true
+    try { Write-RunningSessionFile; $Global:RunningSessionPending = $false }
+    catch { try { Write-Log ("[SESSION] the pending-End mark could not be written (kept in memory, retried every pass): {0}" -f $_.Exception.Message) "WARN" } catch { } }
+}
+
+function Add-EndPending([string]$SessionId, $Payload, [string]$Scope) {
+    # An End of that session was received and has not yet done its protective act (R2, F3, F4, 2026-10-10). Called FIRST,
+    # before the End touches anything, and written to the record file at once. The main loop retries it
+    # (Invoke-PendingEndRetry); an agent restart reads it back. Scope is how the first run judged the End ("running" or
+    # "none"), so the retry applies the same session guard. Never throws.
     try {
         if ([string]::IsNullOrWhiteSpace($SessionId)) { return }
         $keep = @(@($Global:RunningSessionEndPending) | Where-Object { $null -ne $_ -and -not (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $_ "id" ""))) })
-        $keep += [ordered]@{ id = $SessionId.Trim(); payload = $PayloadJson; tries = 0 }
+        $keep += [ordered]@{ id = $SessionId.Trim(); payload = (Get-EndRetryPayloadJson $Payload $SessionId.Trim()); tries = 0; scope = $Scope }
         $Global:RunningSessionEndPending = @($keep)
+        Save-EndPendingState
     } catch { }
 }
 
 function Clear-EndPending([string]$SessionId) {
-    # The protective act is done (or moot): drop the mark. An empty id drops every mark. Never throws.
+    # The protective act is done (or moot): drop the mark, in memory and in the file. An empty id drops every mark.
+    # Never throws.
     try {
-        if ([string]::IsNullOrWhiteSpace($SessionId)) { $Global:RunningSessionEndPending = @(); return }
-        $Global:RunningSessionEndPending = @(@($Global:RunningSessionEndPending) | Where-Object { $null -ne $_ -and -not (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $_ "id" ""))) })
+        if ([string]::IsNullOrWhiteSpace($SessionId)) { $Global:RunningSessionEndPending = @() }
+        else { $Global:RunningSessionEndPending = @(@($Global:RunningSessionEndPending) | Where-Object { $null -ne $_ -and -not (Test-BaySessionIdMatch $SessionId ([string](Get-KioskProp $_ "id" ""))) }) }
+        Save-EndPendingState
     } catch { }
 }
 
