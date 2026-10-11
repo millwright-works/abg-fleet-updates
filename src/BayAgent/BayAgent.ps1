@@ -24,6 +24,19 @@ Optional switches:
                yet the new certificate becomes active immediately; otherwise it is PENDING until a
                CredentialRotate action=activate proves it can mint a token.
                Optional: -EnrollValidityDays <int> (default 730), -EnrollStore CurrentUser|LocalMachine
+  -EnrollClientId <guid>
+               With -EnrollCert, on a bay that has NEVER held a credential: the bay's OWN Entra app (A0.458,
+               A0.524). The new certificate and the app it signs in as are recorded together, so the bay's
+               first token is minted as its own app and the shared secret is never needed on the machine.
+               Run the same command a second time after the certificate is registered on the app: it changes
+               nothing and reports whether the bay can sign in. Exit codes on this path:
+                 0  enrolled (first run), or already enrolled and the sign-in works (later runs)
+                 2  refused, nothing changed (the reason is printed)
+                 4  already enrolled, but the bay cannot sign in yet (the reason is printed)
+                 1  an unexpected failure; nothing is left enrolled
+               Add -EnrollForce to discard an enrollment that Entra refuses (a mistyped app id, a
+               certificate made under the wrong Windows account) and enroll again. An identity that works
+               is never replaced from the console.
 #>
 
 param(
@@ -35,7 +48,11 @@ param(
     # Minting a SECOND pending key pair is not what a repeated -EnrollCert usually means -- it is usually
     # someone re-running the command because they lost the console output. Default to reusing the pending
     # certificate and re-printing its public half; require an explicit -EnrollForce to mint a new one.
-    [switch]$EnrollForce
+    [switch]$EnrollForce,
+    # A0.524 / A0.528: the bay's OWN app, named at the console at its first enrollment. NO DEFAULT THAT MEANS
+    # ANYTHING: the value is read only when the parameter was typed ($PSBoundParameters), so nothing this file
+    # carries can become a bay's identity by being forwarded. See Invoke-OwnIdentityEnroll.
+    [string]$EnrollClientId = ""
 )
 
 Set-StrictMode -Version Latest
@@ -226,10 +243,17 @@ elseif ($hasPlaintext) {
 # once the certificate helpers are defined.
 $HasSecretCredential = ($null -ne $SecretPath) -or ($null -ne $Secret)
 
-if (-not $EnrollCert) {
-    if (-not $CertThumbprintCfg -and -not $HasSecretCredential) {
-        throw "Missing auth config: provide clientCertThumbprint (preferred), clientSecretDpapiPath, or clientSecret (deprecated) in $CfgPath"
-    }
+# "This bay has no credential at all" is decided in Write-CredentialStartupSummary, not here. It used to be decided on
+# this line from agent-config.json alone (no clientCertThumbprint and no secret named = refuse to start), which is
+# blind to a certificate enrolled into state\credential.json: a bay enrolled on its own identity from its first day
+# (-EnrollCert -EnrollClientId), whose configuration rightly names no secret file, was refused although it held a
+# working credential. The same refusal, with the same words, now also reads the enrolled certificate.
+
+# A0.524 / A0.528: -EnrollClientId counts only when it was typed, and only together with -EnrollCert. Typed alone it
+# would otherwise be ignored and the agent would start its normal loop, which is not what the person asked for.
+$EnrollClientIdGiven = $PSBoundParameters.ContainsKey("EnrollClientId")
+if ($EnrollClientIdGiven -and -not $EnrollCert) {
+    throw "-EnrollClientId is used only together with -EnrollCert. Nothing was started and nothing was changed."
 }
 
 function Get-ClientSecret {
@@ -691,10 +715,21 @@ function Get-ActiveClientId {
 }
 
 function Test-OwnIdentityActive {
-    # True when the active credential is a certificate on an app other than the configured shared one.
+    # True when the active credential is a certificate on the bay's OWN app. Two ways to know that:
+    #   - the app in force is not the one agent-config.json names (a bay moved off the shared app by the ladder), or
+    #   - the app in force is the one this bay was enrolled on as its own from its first day. A bay that has only ever
+    #     had its own app may name that same app in agent-config.json (there is no shared app to name), and
+    #     "different from the configured one" would then never be true: the wall pass would never be fetched.
     $tp = Get-ActiveCertThumbprint
     if (-not $tp) { return $false }
-    return ((Get-ActiveClientId) -ne (ConvertTo-AgentGuid $ClientId))
+    $active = Get-ActiveClientId
+    if ($active -ne (ConvertTo-AgentGuid $ClientId)) { return $true }
+    if (-not $active) { return $false }
+    # ownIdentityEnrolled is written only by Invoke-OwnIdentityEnroll, in the same write as the certificate it goes
+    # with. Read here, in this function, so every caller that already has Test-OwnIdentityActive has the whole rule.
+    $enrolledRec = Get-PropValue (Read-CredentialState) "ownIdentityEnrolled" $null
+    if ($null -eq $enrolledRec) { return $false }
+    return ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq $active)
 }
 
 function Get-IdentityProbation {
@@ -1083,9 +1118,19 @@ function Write-CredentialStartupSummary {
             Write-Log ("clientSecretDpapiPath is set but the file is missing ({0}); certificate-only, no secret fallback" -f $SecretPathCfg) "WARN"
             $script:SecretPath = $null
             $script:HasSecretCredential = ($null -ne $script:Secret)
+        } elseif ($activeTp) {
+            # An enrollment IS on record; it is the certificate that cannot be found. Saying only "the secret file is
+            # missing" here would point a person at the one thing a certificate bay must never be given.
+            throw "Certificate $activeTp is configured but no certificate with a private key was found in $((Get-CertStoreSearchOrder) -join ', ') for this Windows account (was it enrolled under another account?), and there is no secret to fall back to (clientSecretDpapiPath is set but file not found: $SecretPathCfg)"
         } else {
-            throw "clientSecretDpapiPath is set but file not found: $SecretPathCfg"
+            throw "clientSecretDpapiPath is set but file not found: $SecretPathCfg. This bay has no credential yet. A bay set up for a certificate is enrolled (BayAgent.ps1 -EnrollCert); it is never given the secret file."
         }
+    }
+
+    # No certificate on record (in state\credential.json or in agent-config.json) and no secret: nothing to sign in
+    # with. Decided here, where the enrolled certificate can be read, and never from agent-config.json alone.
+    if (-not $activeTp -and -not $script:HasSecretCredential) {
+        throw "Missing auth config: this bay has no credential. Enroll its certificate (BayAgent.ps1 -EnrollCert), or provide clientCertThumbprint (preferred), clientSecretDpapiPath, or clientSecret (deprecated) in agent-config.json"
     }
 
     $fallbackLabel = "none"
@@ -1094,6 +1139,10 @@ function Write-CredentialStartupSummary {
     if ($activeTp) {
         if ($cert) {
             Write-Log ("Auth mode: CERTIFICATE thumbprint={0} store={1} notAfter={2} fallbackSecret={3}" -f $activeTp, (Get-CertStoreName $cert), $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $fallbackLabel) "INFO"
+            # Which app the certificate signs in as, when it is the bay's own (A0.458). Never stops a start.
+            try {
+                if (Test-OwnIdentityActive) { Write-Log ("[IDENTITY] signing in as this bay's own app {0}" -f (Get-ActiveClientId)) "INFO" }
+            } catch { }
         } elseif ($script:HasSecretCredential) {
             Write-Log ("Auth mode: CERTIFICATE thumbprint={0} is configured but NOT FOUND in {1}; running on the client secret ({2}) until it is" -f $activeTp, ((Get-CertStoreSearchOrder) -join ", "), $fallbackLabel) "WARN"
         } else {
@@ -4582,6 +4631,332 @@ function New-EnrollCertPayload {
     return $p
 }
 
+# ---------------- A0.524 / A0.528: the bay's OWN identity from its first day (-EnrollCert -EnrollClientId) ----------------
+# A freshly installed bay that has never held a credential names its own Entra app at its first enrollment, at the
+# console. The certificate and the app it signs in as go into state\credential.json in ONE write, so the bay's first
+# token is minted as its own app and the shared secret is never needed on the machine (A0.529: there is no fallback to
+# it; a bay whose enrollment fails stays dark until the cause is fixed).
+#
+# CONSOLE ONLY. Nothing here is reachable from a BayCommand: Invoke-CredentialRotate does not call it, and its enroll
+# action reads no app id. A bay that already runs changes identity by CredentialRotate action=activate, which proves
+# the new identity first and can go back; this path has nothing to go back to, so it refuses a bay that has anything.
+#
+# WHAT A FAILURE LEAVES BEHIND: nothing. Every refusal is decided before a key is made or a byte is written. If
+# anything fails after the key is made, the key, its public .cer and the state file's change are undone before the
+# error is raised.
+
+function Get-OwnIdentitySignInProof {
+    # ONE live sign-in with the ACTIVE certificate as the app on record. Changes nothing, caches nothing, never throws.
+    #   none    - nothing is recorded as active
+    #   absent  - the recorded certificate, or its private key, is not usable by this Windows account
+    #   works   - Entra issued a token
+    #   refused - Entra answered and said no, or the certificate can never work (expired, no app id to sign in as)
+    #   unknown - no answer (the network, a 5xx): whether the identity works cannot be told
+    $r = [ordered]@{ outcome = "none"; thumbprint = $null; clientId = $null; code = ""; detail = "" }
+    try { $r.thumbprint = Get-ActiveCertThumbprint } catch { $r.thumbprint = $null }
+    try { $r.clientId = Get-ActiveClientId } catch { $r.clientId = $null }
+    if (-not $r.thumbprint) { return $r }
+    $certHere = $null
+    try { $certHere = Find-ClientCertificate $r.thumbprint } catch { $certHere = $null }
+    if (-not $certHere) {
+        $r.outcome = "absent"
+        $r.detail = "the certificate is not in a certificate store this Windows account can read"
+        return $r
+    }
+    if (-not $r.clientId) {
+        $r.outcome = "refused"
+        $r.detail = "no app id is recorded or configured to sign in as"
+        return $r
+    }
+    try {
+        $null = Acquire-TokenWithCertificate -Thumbprint $r.thumbprint -ForClientId $r.clientId
+        $r.outcome = "works"
+    } catch {
+        $proofMsg = [string]$_.Exception.Message
+        $r.detail = $proofMsg
+        $r.code = Get-AadstsCode $proofMsg
+        if ($proofMsg -match '^Token request failed with HTTP 4\d\d') { $r.outcome = "refused" }
+        elseif ($proofMsg -match '^Certificate [0-9A-F]{40} expired ') { $r.outcome = "refused" }
+        elseif ($proofMsg -match 'no usable RSA private key') { $r.outcome = "absent" }
+        else { $r.outcome = "unknown" }
+    }
+    return $r
+}
+
+function Get-OwnIdentitySignInAdvice($proof) {
+    # One plain sentence for the person at the bay. Never throws.
+    $code = [string](Get-PropValue $proof "code" "")
+    switch ([string](Get-PropValue $proof "outcome" "")) {
+        "works"   { return "Entra issued a token: this bay can sign in as its own app." }
+        "absent"  { return "The certificate on record is not usable by this Windows account. Run this as the account the agent runs as (the one that enrolled)." }
+        "unknown" { return "No answer from Entra, so it cannot be told yet. Check the network and run this again." }
+        "refused" {
+            if ($code -eq "AADSTS700027") { return "Entra does not hold this certificate for this app yet. Register the public certificate on the bay's app, wait a minute, and run this again." }
+            if ($code -eq "AADSTS700016") { return "Entra knows no app with this id in this tenant. Check the id typed after -EnrollClientId and tenantId in agent-config.json." }
+            if ($code -eq "AADSTS7000112") { return "This bay's app is disabled in Entra (a revoked bay is never enrolled again)." }
+            return "Entra refused the sign-in. The line above carries its reason."
+        }
+        default   { return "Nothing is enrolled." }
+    }
+}
+
+function Remove-OwnIdentityCertificate {
+    # Removes ONE certificate with its private key from the stores this account can reach, and its public .cer from
+    # state\. The caller passes only a thumbprint this agent itself made or recorded. Never throws; returns the stores
+    # it was removed from (callers wrap the result in @()).
+    param([Parameter(Mandatory=$true)][string]$Thumbprint)
+    $removedFrom = @()
+    $tp = $null
+    try { $tp = Normalize-Thumbprint $Thumbprint } catch { $tp = $null }
+    if (-not $tp) { return $removedFrom }
+    foreach ($store in (Get-CertStoreSearchOrder)) {
+        $certPath = "$store\$tp"
+        try {
+            if (Test-Path -LiteralPath $certPath) {
+                Remove-Item -LiteralPath $certPath -DeleteKey -Force -ErrorAction Stop
+                $removedFrom += $store
+            }
+        } catch {
+            Write-Log ("[IDENTITY] could not remove certificate {0} from {1}: {2}" -f $tp, $store, $_.Exception.Message) "WARN"
+        }
+    }
+    try {
+        $cerFile = Join-Path $BaseDir ("state\bay-cert-{0}.cer" -f $tp)
+        if (Test-Path -LiteralPath $cerFile) { Remove-Item -LiteralPath $cerFile -Force -ErrorAction Stop }
+    } catch { }
+    return $removedFrom
+}
+
+function New-OwnIdentityEnrollRefusal {
+    # A refusal of the console enrollment: nothing was changed. Exit code 2.
+    param([Parameter(Mandatory=$true)][string]$Reason, [Parameter(Mandatory=$true)][string]$Message)
+    Write-Log ("[IDENTITY] own-identity enrollment refused ({0}); nothing was changed" -f $Reason) "WARN"
+    return [ordered]@{ ok = $false; action = "enroll-own-identity"; outcome = "refused"; exitCode = 2; reason = $Reason; message = $Message }
+}
+
+function Invoke-OwnIdentityEnroll {
+    # See the section comment above. Returns one result object; the console block prints it (Format-OwnIdentityEnrollReport)
+    # and exits with its exitCode. Throws only for an unexpected failure, after undoing what it made.
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$OwnClientId,
+        $Payload = $null
+    )
+    if ($null -eq $Payload) { $Payload = @{} }
+    $force = [bool](Get-PropValue $Payload "force" $false)
+    $account = "?"
+    try { $account = ("{0}\{1}" -f [Environment]::UserDomainName, [Environment]::UserName) } catch { }
+
+    # ---- PHASE 1: every check, BEFORE a key is made or a byte is written. ----
+    # The value typed is never echoed: it is not a secret, but a person can paste the wrong thing after a parameter.
+    $own = ConvertTo-AgentGuid $OwnClientId
+    if (-not $own) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CLIENT_ID_NOT_A_GUID" ("-EnrollClientId must be this bay's own app id: a GUID, 36 characters, like 00000000-0000-0000-0000-000000000000. What was typed is {0} characters long and is not one." -f ([string]$OwnClientId).Length))
+    }
+
+    # The configuration must already describe THIS bay: the certificate's subject carries bayId, and the sign-in goes
+    # to tenantId. A template with a <placeholder> left in it is not a bay yet.
+    $unfilled = @()
+    if (-not (ConvertTo-AgentGuid ([string]$BayId))) { $unfilled += "bayId" }
+    if ([string]::IsNullOrWhiteSpace([string]$TenantId) -or ([string]$TenantId -match '[<>\s]')) { $unfilled += "tenantId" }
+    if ([string]$OrgUrl -notmatch '^https?://[A-Za-z0-9.-]+(:\d+)?$') { $unfilled += "environmentUrl" }
+    if ($unfilled.Count -gt 0) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CONFIG_NOT_FILLED_IN" ("agent-config.json does not hold this bay's values yet ({0}). Fill them in first; the certificate is made for the bay the configuration names." -f ($unfilled -join ", ")))
+    }
+
+    $st = $null; $stateTp = $null; $stateClient = $null; $enrolledOwn = $null; $pendingTp = $null; $probation = $null
+    try {
+        $st = Read-CredentialState
+        if ($Global:CredentialStateCorrupt) {
+            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT" "state\credential.json is present but cannot be read, so what this bay already holds cannot be told. Recover it from credential.json.bak (or delete it deliberately if this bay has never run), then run this again.")
+        }
+        $stateTp     = Normalize-Thumbprint ([string](Get-PropValue $st "activeThumbprint" ""))
+        $stateClient = ConvertTo-AgentGuid ([string](Get-PropValue $st "activeClientId" ""))
+        $enrolledOwn = ConvertTo-AgentGuid ([string](Get-PropValue (Get-PropValue $st "ownIdentityEnrolled" $null) "clientId" ""))
+        $pendingTp   = Get-PendingCertThumbprint
+        $probation   = Get-IdentityProbation
+    } catch {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_NOT_UNDERSTOOD" ("state\credential.json holds a value this agent cannot read ({0}), so what this bay already holds cannot be told." -f $_.Exception.Message))
+    }
+
+    # A0.529: a bay enrolled this way never holds a client secret. One on the machine means this is not that bay.
+    if (Test-HasUsableSecret) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_PRESENT" "This PC holds a client secret (a sealed secret file, or a clientSecret in agent-config.json). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all.")
+    }
+    if ($null -ne $probation) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SWITCH_IN_PROGRESS" "An identity switch is on probation on this bay. Confirm or revert it (CredentialRotate) first.")
+    }
+    if ($pendingTp) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_ROTATION_IN_PROGRESS" ("A certificate is waiting to be activated on this bay ({0}): a rotation is in progress, so this is not a new bay." -f $pendingTp))
+    }
+    if (-not $stateTp -and $CertThumbprintCfg) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CONFIGURED_CERTIFICATE" ("agent-config.json names a certificate (clientCertThumbprint {0}), so this bay already has a credential that this agent did not enroll." -f $CertThumbprintCfg))
+    }
+
+    $discard = $null
+    if ($stateTp) {
+        $recordedClient = Get-ActiveClientId
+        $certHere = Find-ClientCertificate $stateTp
+        $sameIdentity = ($enrolledOwn -eq $own) -and ($stateClient -eq $own)
+
+        if ($sameIdentity -and $certHere -and -not $force) {
+            # ALREADY ENROLLED as this app: change nothing, print the same certificate again, and say whether the bay
+            # can sign in. This is the second run of the same command, after the certificate was registered.
+            $cerAgain = Export-PublicCertificate $certHere
+            $proof = Get-OwnIdentitySignInProof
+            Write-Log ("[IDENTITY] already enrolled as own app {0} with certificate {1}; sign-in check: {2}{3}" -f $own, $stateTp, $proof.outcome, $(if ($proof.code) { " ($($proof.code))" } else { "" })) "INFO"
+            return [ordered]@{
+                ok = $true; action = "enroll-own-identity"; outcome = "already"
+                exitCode = $(if ($proof.outcome -eq "works") { 0 } else { 4 })
+                clientId = $own; account = $account; discarded = $null; signIn = $proof
+                enroll = (Build-CredentialEnrollResult -cert $certHere -cerPath $cerAgain -reused $true -activatedDirectly $true)
+            }
+        }
+
+        $onRecord = ("certificate {0}, signing in as {1}" -f $stateTp, $(if ($recordedClient) { "app $recordedClient" } else { "no app (agent-config.json clientId is not filled in)" }))
+        if (-not $certHere) { $onRecord += ("; that certificate is not in a store this Windows account ({0}) can read" -f $account) }
+        if (-not $force) {
+            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_ALREADY_ENROLLED" ("This bay already has an enrollment on record: {0}. If that enrollment is a mistake and the bay has never signed in with it, run the same command with -EnrollForce to discard it and enroll again." -f $onRecord))
+        }
+
+        # -EnrollForce: an enrollment is discarded only when it does not work. A working identity has a bay behind it.
+        $proof = Get-OwnIdentitySignInProof
+        if ($proof.outcome -eq "works") {
+            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_IDENTITY_WORKS" ("This bay just signed in with the enrollment on record ({0}). An identity that works is never replaced from the console; it changes only by the remote ladder (CredentialRotate), which proves the new one first." -f $onRecord))
+        }
+        if ($proof.outcome -eq "unknown") {
+            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CANNOT_TELL" ("Whether the enrollment on record works could not be told ({0}). It is discarded only when Entra itself refuses it. Check the network and run this again." -f $proof.detail))
+        }
+        $discard = [ordered]@{ thumbprint = $stateTp; clientId = $recordedClient; why = $proof.outcome; code = $proof.code; removedFrom = @() }
+    }
+
+    # ---- PHASE 2: make the key, record it, and undo both if anything fails. ----
+    $stateExisted = Test-Path -LiteralPath $CredentialStatePath
+    $stateBefore = $null
+    if ($stateExisted) { $stateBefore = [IO.File]::ReadAllBytes($CredentialStatePath) }
+
+    $cert = New-BayClientCertificate `
+        -Subject      ([string](Get-PropValue $Payload "subject" "")) `
+        -ValidityDays ([int](Get-PropValue $Payload "validityDays" 730)) `
+        -Store        ([string](Get-PropValue $Payload "store" "CurrentUser")) `
+        -KeyProvider  ([string](Get-PropValue $Payload "keyProvider" "")) `
+        -KeyLength    ([int](Get-PropValue $Payload "keyLength" 2048))
+    $cerPath = $null
+    try {
+        $cerPath = Export-PublicCertificate $cert
+        $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        # ONE write: the certificate and the app it signs in as never exist apart.
+        $changes = @{
+            activeThumbprint    = $cert.Thumbprint
+            activeClientId      = $own
+            ownIdentityEnrolled = [ordered]@{ clientId = $own; thumbprint = $cert.Thumbprint; utc = $nowStr; account = $account }
+            pendingThumbprint   = $null
+            activatedUtc        = $nowStr
+            enrolledUtc         = $nowStr
+        }
+        if ($discard) {
+            # The certificate being left keeps a record, so its private key can still be retired later.
+            $sup = @()
+            $priorSup = Get-PropValue $st "superseded" $null
+            if ($priorSup) { $sup = @($priorSup) }
+            if ($sup -notcontains $discard.thumbprint) { $sup += $discard.thumbprint }
+            $changes.superseded = $sup
+            $changes.ownIdentityDiscarded = [ordered]@{ thumbprint = $discard.thumbprint; clientId = $discard.clientId; utc = $nowStr; why = $discard.why; code = $discard.code }
+        }
+        Update-CredentialState $changes | Out-Null
+        # Believed only when the file says it.
+        if ((Get-ActiveCertThumbprint) -ne $cert.Thumbprint -or (Get-ActiveClientId) -ne $own -or -not (Test-OwnIdentityActive)) {
+            throw "state\credential.json did not read back the new enrollment"
+        }
+    } catch {
+        $whyFailed = [string]$_.Exception.Message
+        # NOTHING HALF-ENROLLED: put the state file back exactly as it was, and remove the key just made.
+        try {
+            if ($stateExisted) { [IO.File]::WriteAllBytes($CredentialStatePath, $stateBefore) }
+            elseif (Test-Path -LiteralPath $CredentialStatePath) { Remove-Item -LiteralPath $CredentialStatePath -Force }
+            if (Test-Path -LiteralPath "$CredentialStatePath.tmp" -PathType Leaf) { Remove-Item -LiteralPath "$CredentialStatePath.tmp" -Force }
+        } catch { Write-Log ("[IDENTITY] could not put state\credential.json back: {0}" -f $_.Exception.Message) "ERROR" }
+        [void](Remove-OwnIdentityCertificate -Thumbprint $cert.Thumbprint)
+        Write-Log ("[IDENTITY] own-identity enrollment failed and was undone: {0}" -f $whyFailed) "ERROR"
+        throw ("Own-identity enrollment failed and was undone: {0}. The certificate made for this attempt was removed and state\credential.json is as it was." -f $whyFailed)
+    }
+
+    if ($discard) {
+        # Only now, with the new enrollment on record, remove the discarded certificate and its key where this account
+        # can reach them. One it cannot reach stays on record as superseded.
+        $gone = @(Remove-OwnIdentityCertificate -Thumbprint $discard.thumbprint)
+        $discard.removedFrom = $gone
+        if ($gone.Count -gt 0) {
+            try {
+                $retired = @()
+                $priorRetired = Get-PropValue (Read-CredentialState) "retiredThumbprints" $null
+                if ($priorRetired) { $retired = @($priorRetired) }
+                if ($retired -notcontains $discard.thumbprint) { $retired += $discard.thumbprint }
+                Update-CredentialState @{ retiredThumbprints = $retired } | Out-Null
+            } catch { Write-Log ("[IDENTITY] could not record the discarded certificate as retired: {0}" -f $_.Exception.Message) "WARN" }
+        }
+        Write-Log ("[IDENTITY] discarded the earlier enrollment (certificate {0}, {1}): {2}" -f $discard.thumbprint, $discard.why, $(if ($gone.Count -gt 0) { "removed from " + ($gone -join ", ") } else { "not removed, it is not in this account's stores" })) "WARN"
+    }
+
+    Write-Log ("[IDENTITY] enrolled on this bay's own app {0}: certificate {1} notAfter={2}, active, as {3}; public cert at {4}" -f $own, $cert.Thumbprint, $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $account, $cerPath) "INFO"
+    return [ordered]@{
+        ok = $true; action = "enroll-own-identity"; outcome = $(if ($discard) { "replaced" } else { "enrolled" }); exitCode = 0
+        clientId = $own; account = $account; discarded = $discard; signIn = $null
+        enroll = (Build-CredentialEnrollResult -cert $cert -cerPath $cerPath -reused $false -activatedDirectly $true)
+    }
+}
+
+function Format-OwnIdentityEnrollReport($Result) {
+    # What the person at the bay reads. Every run ends with ONE "RESULT:" line; a run sheet can name it. Returns lines.
+    $lines = @("")
+    $outcome = [string](Get-PropValue $Result "outcome" "")
+    if ($outcome -eq "refused") {
+        $lines += ("REFUSED: {0}" -f [string](Get-PropValue $Result "message" ""))
+        $lines += ("  Reason code : {0}" -f [string](Get-PropValue $Result "reason" ""))
+        $lines += "  Nothing was changed on this PC."
+        $lines += ""
+        $lines += "RESULT: REFUSED"
+        return $lines
+    }
+    $e = Get-PropValue $Result "enroll" $null
+    switch ($outcome) {
+        "enrolled" { $lines += ("ENROLLED: bay {0} now has its own identity" -f $BayId) }
+        "replaced" { $lines += ("ENROLLED AGAIN: the earlier enrollment was discarded; bay {0} has a new certificate" -f $BayId) }
+        default    { $lines += ("ALREADY ENROLLED: nothing was changed (bay {0})" -f $BayId) }
+    }
+    $lines += ("  Signs in as : {0} (this bay's own app)" -f [string](Get-PropValue $Result "clientId" ""))
+    $lines += ("  Thumbprint  : {0}" -f [string](Get-PropValue $e "thumbprint" ""))
+    $lines += ("  Subject     : {0}" -f [string](Get-PropValue $e "subject" ""))
+    $lines += ("  Store       : {0}" -f [string](Get-PropValue $e "store" ""))
+    $lines += ("  Account     : {0} (the agent must run as this Windows account)" -f [string](Get-PropValue $Result "account" ""))
+    $lines += ("  NotAfter    : {0}" -f [string](Get-PropValue $e "notAfterUtc" ""))
+    $lines += ("  Public cert : {0}" -f [string](Get-PropValue $e "publicCertPath" ""))
+    $d = Get-PropValue $Result "discarded" $null
+    if ($null -ne $d) {
+        $goneFrom = @(Get-PropValue $d "removedFrom" @())
+        $lines += ("  Discarded   : certificate {0} ({1}); {2}" -f [string](Get-PropValue $d "thumbprint" ""), $(if (Get-PropValue $d "code" "") { [string](Get-PropValue $d "code" "") } else { [string](Get-PropValue $d "why" "") }),
+            $(if ($goneFrom.Count -gt 0) { "removed from this PC with its key. If it was ever registered on an app, remove it there too." } else { "NOT removed: it is not in this account's stores. Remove it signed in as the account that made it." }))
+    }
+    $lines += "  Public cert (base64 DER):"
+    $lines += [string](Get-PropValue $e "publicCertBase64" "")
+    $lines += ""
+    if ($outcome -eq "already") {
+        $proof = Get-PropValue $Result "signIn" $null
+        $proofOutcome = [string](Get-PropValue $proof "outcome" "")
+        $proofCode = [string](Get-PropValue $proof "code" "")
+        $lines += ("  Sign-in     : {0}{1}" -f $proofOutcome.ToUpperInvariant(), $(if ($proofCode) { " ($proofCode)" } else { "" }))
+        $lines += ("                {0}" -f (Get-OwnIdentitySignInAdvice $proof))
+        $lines += ""
+        if ($proofOutcome -eq "works") { $lines += "RESULT: READY (enrolled, and the bay can sign in as its own app)" }
+        else { $lines += "RESULT: NOT READY (enrolled, but the bay cannot sign in yet)" }
+        return $lines
+    }
+    $lines += "  Next: 1. Register this public certificate on the bay's own app (the operator's step, under a person's sign-in)."
+    $lines += "        2. Wait a minute, then run this same command again. It changes nothing and says whether the bay can sign in."
+    $lines += ""
+    $lines += "RESULT: ENROLLED (the sign-in is checked by running this again after the certificate is registered)"
+    return $lines
+}
+
 function Invoke-CredentialRotate($payloadObj) {
     if ($null -eq $payloadObj) { $payloadObj = @{} }
     $action = ([string](Get-PropValue $payloadObj "action" "status")).ToLowerInvariant()
@@ -7828,6 +8203,14 @@ if (-not $EnrollCert -and -not $TokenOnly) {
 # ---------------- -EnrollCert: hands-on / Day-0 enrollment (no credential needed) ----------------
 if ($EnrollCert) {
     $enrollPayload = New-EnrollCertPayload -ValidityDays $EnrollValidityDays -Store $EnrollStore -Force:$EnrollForce
+    # A0.524 / A0.528: -EnrollClientId was TYPED, so this is the bay's own identity from its first day. The value goes
+    # to Invoke-OwnIdentityEnroll exactly as typed (it decides, and refuses, before anything is made); the exit code is
+    # its answer. Without the parameter nothing below this block changes.
+    if ($EnrollClientIdGiven) {
+        $ownIdResult = Invoke-OwnIdentityEnroll -OwnClientId $EnrollClientId -Payload $enrollPayload
+        foreach ($ownIdLine in @(Format-OwnIdentityEnrollReport $ownIdResult)) { Write-Host $ownIdLine }
+        exit ([int]$ownIdResult.exitCode)
+    }
     $r = Invoke-CredentialEnroll $enrollPayload
     Write-Host ""
     Write-Host ("ENROLLED certificate credential for bay {0}" -f $BayId)
