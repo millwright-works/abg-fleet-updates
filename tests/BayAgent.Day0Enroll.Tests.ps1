@@ -74,6 +74,10 @@ $D0OtherApp = [guid]::NewGuid().ToString("D")   # a second bay's app, also known
 $D0Shared   = [guid]::NewGuid().ToString("D")   # stands for a shared bay-agent app named in agent-config.json
 $D0WrongApp = [guid]::NewGuid().ToString("D")   # a mistyped id: no such app in the mock directory
 $D0Subject  = "CN=ABG-BayAgent $D0BayId"
+$D0PlaceholderBayId = "<bay-guid-" + $D0BayId.Substring(0, 8) + ">"
+$D0PlaceholderSubject = "CN=ABG-BayAgent $D0PlaceholderBayId"
+# A syntactically valid thumbprint for a certificate that is in no store.
+$D0FakeThumb = "A1B2C3D4E5F60718293A4B5C6D7E8F9012345678"
 
 $SandboxRoot = Join-Path $env:TEMP ("bayagent-day0-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $SandboxRoot | Out-Null
@@ -101,7 +105,7 @@ function Get-D0InstallFingerprint([string]$Root) {
         try { $hash = Get-D0Sha256Hex ([IO.File]::ReadAllBytes($f.FullName)) } catch { $hash = "UNREADABLE-" + [guid]::NewGuid().ToString("N") }
         $rows += ("{0}|{1}" -f $rel, $hash)
     }
-    $rows += ("certs|" + ((Get-D0RunCerts) -join ","))
+    $rows += ("certs|" + ((@(Get-D0RunCerts) + @(Get-D0PlaceholderCerts)) -join ","))
     return ($rows -join "`n")
 }
 
@@ -262,7 +266,9 @@ function New-D0Bay {
         [Parameter(Mandatory = $true)][string]$Name,
         [ValidateSet("placeholder", "own", "shared")][string]$Shape = "placeholder",
         [switch]$LeaveBayIdPlaceholder,
-        [string]$PlaintextSecret = ""
+        [string]$PlaintextSecret = "",
+        [string]$CertThumbprintCfg = "",
+        [string]$SeedStateJson = ""
     )
     $root = Join-Path $SandboxRoot $Name
     foreach ($d in @("", "current", "logs", "secrets")) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null }
@@ -278,7 +284,10 @@ function New-D0Bay {
     # What the operator fills in (the values a run sheet names).
     $cfg.environmentUrl = $MockUrl
     $cfg.tenantId = $D0Tenant
-    if (-not $LeaveBayIdPlaceholder) { $cfg.bayId = $D0BayId }
+    # Left unfilled, bayId keeps the template's <placeholder> with this run's tag inside it: still not a GUID, and a
+    # certificate wrongly made for it carries a subject that only this run can have made.
+    if ($LeaveBayIdPlaceholder) { $cfg.bayId = $D0PlaceholderBayId } else { $cfg.bayId = $D0BayId }
+    if ($CertThumbprintCfg) { $cfg.clientCertThumbprint = $CertThumbprintCfg }
     if ($Shape -eq "own") { $cfg.clientId = $D0OwnApp } elseif ($Shape -eq "shared") { $cfg.clientId = $D0Shared }
     # The template's secret file path, pointed into the sandbox (the file is NOT made). The "own" shape names none.
     $cfg.clientSecretDpapiPath = (Join-Path $root "secrets\clientsecret.dpapi")
@@ -292,6 +301,11 @@ function New-D0Bay {
     $cfg.logLevel = "DEBUG"
     if ($PlaintextSecret) { $cfg | Add-Member -NotePropertyName clientSecret -NotePropertyValue $PlaintextSecret; $cfg.PSObject.Properties.Remove("clientSecretDpapiPath") }
     [IO.File]::WriteAllText((Join-Path $root "agent-config.json"), ($cfg | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    if ($SeedStateJson) {
+        # NOT a blank bay: a state file something earlier left. Used only by the refusal scenarios that say so.
+        New-Item -ItemType Directory -Force -Path (Join-Path $root "state") | Out-Null
+        [IO.File]::WriteAllText((Join-Path $root "state\credential.json"), $SeedStateJson, (New-Object Text.UTF8Encoding($false)))
+    }
 
     return [pscustomobject]@{ Root = $root; Agent = $agentCopy; Shape = $Shape
         State = (Join-Path $root "state\credential.json"); Config = (Join-Path $root "agent-config.json") }
@@ -357,6 +371,12 @@ function Get-D0ReportField([string]$StdOut, [string]$Label) {
     return $null
 }
 function Get-D0ResultLines([string]$StdOut) { return @($StdOut -split "`r?`n" | Where-Object { $_ -match "^RESULT:" }) }
+function Get-D0FirstResult([string]$StdOut) {
+    # The first RESULT line, or "" when the run printed none (never an index into nothing).
+    $all = @(Get-D0ResultLines $StdOut)
+    if ($all.Count -eq 0) { return "" }
+    return [string]$all[0]
+}
 function Get-D0Capabilities([object[]]$Requests) {
     # The credential block of the LAST capabilities report the bay wrote to its own row, as the operator ladder reads it.
     $caps = $null
@@ -378,6 +398,14 @@ Write-Host "Recorder         : $MockUrl (a MOCK of Entra's token endpoint and of
 Write-Host "This run's bay   : $D0BayId   own app: $D0OwnApp"
 
 $certsAtStart = @(Get-D0RunCerts)
+# A script that lacks the "configuration not filled in" refusal (an older release, a mutant) makes a certificate whose
+# subject carries the unfilled bayId instead of this run's bay id. That placeholder carries this run's tag, so these
+# too are this run's and no other's (two runs side by side cannot remove each other's).
+function Get-D0PlaceholderCerts {
+    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\My" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -eq $D0PlaceholderSubject } | ForEach-Object { $_.Thumbprint } | Sort-Object)
+}
+$placeholderCertsAtStart = @(Get-D0PlaceholderCerts)
 
 try {
     # ============================================================ S0 the copy is the shipped file
@@ -459,7 +487,7 @@ try {
     Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CONFIG_NOT_FILLED_IN") "[bayId not filled in] refused with ABG_OWNID_CONFIG_NOT_FILLED_IN (exit $($r.ExitCode))"
     Assert-True ($r.StdOut -match "bayId") "[bayId not filled in] ...naming the field"
     Assert-True ((Get-D0InstallFingerprint $b2c.Root) -eq $before) "[bayId not filled in] nothing was changed"
-    Assert-True (@(Get-ChildItem -LiteralPath "Cert:\CurrentUser\My" | Where-Object { $_.Subject -like "CN=ABG-BayAgent <*" }).Count -eq 0) "[bayId not filled in] no certificate was made for a placeholder"
+    Assert-True (((Get-D0PlaceholderCerts) -join ",") -eq ($placeholderCertsAtStart -join ",")) "[bayId not filled in] no certificate was made for a placeholder"
 
     # A0.529: a secret on the machine means this is not a new bay. Sealed file, then plaintext in the configuration.
     $b2s = New-D0Bay -Name "refusal-secret"
@@ -479,6 +507,29 @@ try {
     Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[plaintext secret present] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode))"
     Assert-True ((Get-D0InstallFingerprint $b2p.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[plaintext secret present] nothing was changed, nothing was sent"
     Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[plaintext secret present] the secret's text is not on the console or in the log"
+
+    # A PC that already holds something is not a new bay: each of these is refused, with or without -EnrollForce, and
+    # the state file is left byte for byte as it was.
+    $notBlank = @(
+        @{ label = "state file corrupt";            reason = "ABG_OWNID_STATE_CORRUPT";          state = '{ "activeThumbprint": "A1B2' ; thumbCfg = "" },
+        @{ label = "state value unreadable";        reason = "ABG_OWNID_STATE_NOT_UNDERSTOOD";   state = '{ "activeThumbprint": "not-a-thumbprint" }'; thumbCfg = "" },
+        @{ label = "a rotation is waiting";         reason = "ABG_OWNID_ROTATION_IN_PROGRESS";   state = ('{ "pendingThumbprint": "' + $D0FakeThumb + '" }'); thumbCfg = "" },
+        @{ label = "an identity switch on probation"; reason = "ABG_OWNID_SWITCH_IN_PROGRESS";   state = ('{ "activeThumbprint": "' + $D0FakeThumb + '", "activeClientId": "' + $D0OtherApp + '", "identityProbation": { "clientId": "' + $D0OtherApp + '", "sinceUtc": "2026-10-11T00:00:00Z", "previousThumbprint": null, "previousClientId": null } }'); thumbCfg = "" },
+        @{ label = "a certificate named in the configuration"; reason = "ABG_OWNID_CONFIGURED_CERTIFICATE"; state = ""; thumbCfg = $D0FakeThumb }
+    )
+    $nbIndex = 0
+    foreach ($case in $notBlank) {
+        $nbIndex++
+        $bn = New-D0Bay -Name ("not-blank-" + $nbIndex) -SeedStateJson $case.state -CertThumbprintCfg $case.thumbCfg
+        foreach ($extra in @("", " -EnrollForce")) {
+            $before = Get-D0InstallFingerprint $bn.Root; $mark = Get-D0Mark
+            $r = Invoke-D0Agent -Bay $bn -Arguments (($SheetEnroll -f $D0OwnApp) + $extra) -Sheet
+            if (-not $extra) { Show-D0Run $r ("S2 " + $case.label) }
+            $tag = $(if ($extra) { $case.label + ", with -EnrollForce" } else { $case.label })
+            Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq $case.reason) "[$tag] refused with $($case.reason) (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+            Assert-True ((Get-D0InstallFingerprint $bn.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[$tag] nothing was changed and nothing was sent"
+        }
+    }
 
     # ============================================================ S3..S8 the whole first day, in each configuration shape
     foreach ($shape in @("placeholder", "own", "shared")) {
@@ -557,7 +608,7 @@ try {
 
         Section "S6 [$shape] and a third time: the same answer, still nothing changed"
         $r = Invoke-D0Agent -Bay $bay -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
-        Assert-True ($r.ExitCode -eq 0 -and (@(Get-D0ResultLines $r.StdOut))[0] -like "RESULT: READY*") "[$shape] READY again, exit 0"
+        Assert-True ($r.ExitCode -eq 0 -and (Get-D0FirstResult $r.StdOut) -like "RESULT: READY*") "[$shape] READY again, exit 0"
         Assert-True ((Get-D0InstallFingerprint $bay.Root) -eq $before) "[$shape] nothing on the PC changed"
 
         Section "S7 [$shape] the bay starts as the agent host starts it, and runs on its own identity"
@@ -649,7 +700,7 @@ try {
     Assert-True (@(Get-D0Prop $st "retiredThumbprints") -contains $tp1) "the discarded certificate is on record as retired"
     Register-D0Certificate -AppId $D0OwnApp -CerPath (Join-Path $bw.Root ("state\bay-cert-{0}.cer" -f $tp2))
     $r = Invoke-D0Agent -Bay $bw -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
-    Assert-True ($r.ExitCode -eq 0 -and (@(Get-D0ResultLines $r.StdOut))[0] -like "RESULT: READY*") "after registering the new certificate: READY"
+    Assert-True ($r.ExitCode -eq 0 -and (Get-D0FirstResult $r.StdOut) -like "RESULT: READY*") "after registering the new certificate: READY"
 
     # ============================================================ S11 a failure after the key is made is undone
     Section "S11 a failure AFTER the key is made leaves nothing: no key, no .cer, no state; the next run enrolls cleanly"
@@ -667,7 +718,7 @@ try {
     Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $bf.Root "state") -Filter "bay-cert-*.cer" -ErrorAction SilentlyContinue).Count -eq 0) "there is no public .cer left to register by mistake"
     Remove-Item -LiteralPath (Join-Path $bf.Root "state\credential.json.tmp") -Force -Recurse
     $r = Invoke-D0Agent -Bay $bf -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
-    Assert-True ($r.ExitCode -eq 0 -and (@(Get-D0ResultLines $r.StdOut))[0] -like "RESULT: ENROLLED*" -and (@(Get-D0RunCerts).Count -eq ($certsBefore.Count + 1))) "with the cause fixed, the same command enrolls: one certificate, exit 0"
+    Assert-True ($r.ExitCode -eq 0 -and (Get-D0FirstResult $r.StdOut) -like "RESULT: ENROLLED*" -and (@(Get-D0RunCerts).Count -eq ($certsBefore.Count + 1))) "with the cause fixed, the same command enrolls: one certificate, exit 0"
 
     # ============================================================ S12 the key was made under another Windows account
     Section "S12 the certificate on record is not in this account's store (made under another account): dark, said plainly, correctable"
@@ -763,14 +814,15 @@ finally {
     try { $mock.PS.Stop() } catch {}
     try { $mock.RS.Close() } catch {}
     # Remove exactly the certificates this run made: the subject carries this run's own bay id.
-    foreach ($tpLeft in @(Get-D0RunCerts)) {
+    $mine = @(Get-D0RunCerts) + @(Get-D0PlaceholderCerts | Where-Object { $placeholderCertsAtStart -notcontains $_ })
+    foreach ($tpLeft in $mine) {
         try { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $tpLeft) -DeleteKey -Force } catch { Write-Host "could not remove test certificate $tpLeft" -ForegroundColor Yellow }
     }
     try { Remove-Item -LiteralPath $SandboxRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 Write-Host ""
-$left = @(Get-D0RunCerts)
+$left = @(Get-D0RunCerts) + @(Get-D0PlaceholderCerts | Where-Object { $placeholderCertsAtStart -notcontains $_ })
 Assert-True ($left.Count -eq 0) "cleanup: no certificate of this run is left in the store (left: $($left.Count))"
 if ($sync["Errors"].Count -gt 0) { Write-Host "recorder errors: $($sync['Errors'] -join ' | ')" -ForegroundColor Yellow }
 Assert-True ($sync["Errors"].Count -eq 0) "the recorder itself raised no error ($($sync['Errors'].Count))"
