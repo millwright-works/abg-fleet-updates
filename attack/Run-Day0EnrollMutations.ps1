@@ -77,6 +77,10 @@ $mutants = @(
         (New-D0Edit 'What was typed is {0} characters long and is not one." -f ([string]$OwnClientId).Length))' 'What was typed is {0} and is not one." -f ([string]$OwnClientId)))'))),
     (New-D0Mutant "G03" "an unfilled configuration is enrolled" @(
         (New-D0Edit '    if ($unfilled.Count -gt 0) {' '    if ($false) {'))),
+    (New-D0Mutant "G09" "a tenantId that is still a placeholder is enrolled (the attack's survivor)" @(
+        (New-D0Edit "if ([string]::IsNullOrWhiteSpace([string]`$TenantId) -or ([string]`$TenantId -match '[<>\s]')) { `$unfilled += `"tenantId`" }" "if (`$false) { `$unfilled += `"tenantId`" }"))),
+    (New-D0Mutant "G10" "an environmentUrl that is not an address is enrolled (the attack's survivor)" @(
+        (New-D0Edit "if ([string]`$OrgUrl -notmatch '^https?://[A-Za-z0-9.-]+(:\d+)?`$') { `$unfilled += `"environmentUrl`" }" "if (`$false) { `$unfilled += `"environmentUrl`" }"))),
     (New-D0Mutant "G04" "a PC that holds a client secret is enrolled (A0.529)" @(
         (New-D0Edit '    if (Test-HasUsableSecret) {' '    if ($false) {'))),
     (New-D0Mutant "G05" "a corrupt state file is not a refusal" @(
@@ -127,6 +131,9 @@ $mutants = @(
     # ---- a failure after the key is made ----
     (New-D0Mutant "U01" "a failed enrollment leaves its key and .cer behind" @(
         (New-D0Edit '        [void](Remove-OwnIdentityCertificate -Thumbprint $cert.Thumbprint)' '        $null = $cert'))),
+
+    (New-D0Mutant "U02" "an earlier enrollment is not put back after a failed replace (the attack's survivor)" @(
+        (New-D0Edit '            if ($stateExisted) { [IO.File]::WriteAllBytes($CredentialStatePath, $stateBefore) }' '            if ($false) { [IO.File]::WriteAllBytes($CredentialStatePath, $stateBefore) }'))),
 
     # ---- start-up on the enrolled bay ----
     (New-D0Mutant "S01" "a bay with no credential at all starts its loop" @(

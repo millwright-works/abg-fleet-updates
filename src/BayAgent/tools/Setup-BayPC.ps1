@@ -19,6 +19,10 @@ Notes:
     and for no other: a certificate bay is never given the shared secret or that tool.
   - -EnvironmentUrl, -TenantId, -ClientId and -BayId reach agent-config.json only when they are passed. Their
     defaults are never written into a bay's configuration.
+  - -BayAppId is this bay's OWN Entra app id (each bay has its own identity). It has no default. When it is passed,
+    the enroll line this script prints names it (BayAgent.ps1 -EnrollCert -EnrollClientId <id>), and it is also what
+    agent-config.json names as clientId unless -ClientId was typed as well. When it is not passed, nothing is
+    written for it and the printed line carries the words <this bay's own app id> for a person to replace.
   - The machine script policy is set to AllSigned on every run (the two scheduled tasks need it).
   - Remote Desktop is left OFF unless -EnableRemoteDesktop is given.
   - A blank PC has no BayAgent.ps1 after this script: the first run of tools\Update-BayAgent.ps1 installs it.
@@ -68,7 +72,12 @@ param(
   [string]$EnvironmentUrl = "https://builds-apps-dev.crm.dynamics.com",
   [string]$TenantId = "cc551e6a-be6a-42d2-add4-231f5891a179",
   [string]$ClientId = "0e77dbf6-499d-434c-acfc-b276bc439c38",
-  [string]$BayId = ""
+  [string]$BayId = "",
+
+  # THIS BAY'S OWN APP (A0.458: each bay its own identity; A0.524: from its first day). NO DEFAULT, and none may ever
+  # be given one: a default here would become a bay's identity. Read only when it was typed ($PSBoundParameters), in
+  # Get-BayAppIdPlan. It is public (an app id), never a secret.
+  [string]$BayAppId = ""
 )
 
 Set-StrictMode -Version Latest
@@ -281,13 +290,54 @@ function Get-CredentialFileCheck {
   if ($Mode -eq "Certificate") {
     return [ordered]@{
       Check  = "No DPAPI secret file (certificate bay)"
-      Result = $(if ($DpapiExists) { "FAIL (a secret file exists on a bay set up for a certificate: remove it before -EnrollCert, or the certificate enrolls as waiting and cannot activate)" } else { "PASS" })
+      Result = $(if ($DpapiExists) { "FAIL (a secret file exists on a bay set up for a certificate: the enrollment refuses a PC that holds one, and a certificate bay is never given the secret)" } else { "PASS" })
     }
   }
   return [ordered]@{
     Check  = "DPAPI secret exists"
     Result = $(if ($DpapiExists) { "PASS" } else { "PENDING (run SetClientSecretDpapi)" })
   }
+}
+
+function Get-BayAppIdPlan {
+  # What -BayAppId means for this run, decided in ONE place and before anything on the PC is changed.
+  #   not typed            nothing is written for it; the printed enroll line carries words to replace.
+  #   typed, not a GUID    the run stops (ok = $false) before any change. The value is not echoed: a person can paste
+  #                        the wrong thing after a parameter, and this screen may be photographed.
+  #   typed with -Credential Secret   the run stops: a bay's own app goes with a certificate, never with the secret.
+  #   typed, a GUID        the enroll line names it. It is also agent-config.json's clientId, unless -ClientId was
+  #                        typed too (then that typed value is kept, and a note says so when the two differ).
+  param(
+    [bool]$Given = $false,
+    [string]$Value = "",
+    [ValidateSet("Certificate", "Secret")][string]$Mode = "Certificate",
+    [bool]$ClientIdGiven = $false,
+    [string]$ClientId = ""
+  )
+  $plan = [ordered]@{ ok = $true; error = ""; appId = ""; enrollId = "<this bay's own app id>"; configClientId = ""; note = "" }
+  if (-not $Given) { return $plan }
+  $g = [guid]::Empty
+  if ([string]::IsNullOrWhiteSpace($Value) -or -not [guid]::TryParse($Value.Trim(), [ref]$g) -or $g -eq [guid]::Empty) {
+    $plan.ok = $false
+    $plan.error = ("-BayAppId must be this bay's own app id: a GUID, 36 characters, like 00000000-0000-0000-0000-000000000000. What was typed is {0} characters long and is not one. Nothing was changed on this PC." -f ([string]$Value).Length)
+    return $plan
+  }
+  if ($Mode -ne "Certificate") {
+    $plan.ok = $false
+    $plan.error = "-BayAppId is for a bay set up with a certificate (the default). A bay's own app is never used with the shared client secret (-Credential Secret). Nothing was changed on this PC."
+    return $plan
+  }
+  $plan.appId = $g.ToString("D")
+  $plan.enrollId = $plan.appId
+  if (-not $ClientIdGiven) {
+    $plan.configClientId = $plan.appId
+  } else {
+    $c = [guid]::Empty
+    if (-not ([guid]::TryParse(([string]$ClientId).Trim(), [ref]$c)) -or $c -ne $g) {
+      $plan.note = ("-ClientId was typed as well and is not this bay's own app: agent-config.json keeps the -ClientId value, and the bay signs in as the app named at enrollment ({0})." -f $plan.appId)
+    }
+  }
+  return $plan
 }
 
 function Get-Day0NextSteps {
@@ -303,11 +353,13 @@ function Get-Day0NextSteps {
     [string]$ExpectedName = "",
     [bool]$AgentInstalled = $false,
     [string]$Root = "C:\AllBirdies",
-    [string]$BayKioskUser = "BayKiosk"
+    [string]$BayKioskUser = "BayKiosk",
+    # What follows -EnrollClientId on the printed line: this bay's own app id, or the words to replace with it.
+    [string]$EnrollAppId = "<this bay's own app id>"
   )
   $steps = @()
   if (-not $NameOk) { $steps += "Reboot to apply the computer name change to '$ExpectedName'" }
-  $steps += "Check agent-config.json: environmentUrl, tenantId, clientId and bayId must hold this bay's values (no <placeholder> left)"
+  $steps += "Check agent-config.json: environmentUrl, tenantId, clientId and bayId must hold this bay's values (no <placeholder> left). clientId is this bay's own app id."
   if (-not $AgentInstalled) {
     $steps += @(
       "Install the agent package (BayAgent.ps1 is not on this PC until this runs). As Administrator:",
@@ -317,8 +369,10 @@ function Get-Day0NextSteps {
   }
   if ($Mode -eq "Certificate") {
     $steps += @(
-      "Enroll this bay's certificate, signed in as $BayKioskUser (see Phase 6 above). Do NOT create a DPAPI secret file. Run:",
-      "     powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\current\BayAgent.ps1`" -EnrollCert"
+      "Enroll this bay on its own identity, signed in as $BayKioskUser and NOT as administrator (see Phase 6 above). Do NOT create a DPAPI secret file. Run:",
+      "     powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\current\BayAgent.ps1`" -EnrollCert -EnrollClientId $EnrollAppId",
+      "     It must end 'RESULT: ENROLLED'. No RESULT line at all means the agent is older than 1.6.1: stop.",
+      "After the public certificate is registered on the bay's own app, run the same line again. It must end 'RESULT: READY'."
     )
   } elseif (-not $DpapiExists) {
     $steps += "Run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret (see Phase 6 output above)"
@@ -349,6 +403,14 @@ function Get-Day0NextSteps {
 # PHASE 1: PRE-FLIGHT CHECKS
 # ==================================================================
 Write-Step "Phase 1: Pre-flight Checks"
+
+# 1-0. -BayAppId, before anything on this PC is changed. Only a value that was TYPED counts.
+$bayAppPlan = Get-BayAppIdPlan -Given $PSBoundParameters.ContainsKey("BayAppId") -Value $BayAppId -Mode $Credential `
+  -ClientIdGiven $PSBoundParameters.ContainsKey("ClientId") -ClientId $ClientId
+if (-not $bayAppPlan.ok) {
+  Write-Error $bayAppPlan.error
+  exit 1
+}
 
 # 1a. Administrator
 if (-not (Test-IsAdmin)) {
@@ -479,6 +541,10 @@ if (-not $SkipDay0) {
   if ($PSBoundParameters.ContainsKey("TenantId") -and -not [string]::IsNullOrWhiteSpace($TenantId))             { $day0Args["ConfigTenantId"] = $TenantId }
   if ($PSBoundParameters.ContainsKey("ClientId") -and -not [string]::IsNullOrWhiteSpace($ClientId))             { $day0Args["ConfigClientId"] = $ClientId }
   if ($PSBoundParameters.ContainsKey("BayId") -and -not [string]::IsNullOrWhiteSpace($BayId))                   { $day0Args["ConfigBayId"] = $BayId }
+  # The bay's own app, typed as -BayAppId, is what its configuration names as clientId -- unless -ClientId was typed
+  # too (the line above). Get-BayAppIdPlan leaves configClientId empty in every other case, so nothing is written
+  # that was not typed.
+  if (-not [string]::IsNullOrWhiteSpace([string]$bayAppPlan.configClientId)) { $day0Args["ConfigClientId"] = [string]$bayAppPlan.configClientId }
 
   # The secret-credential tool is placed ONLY on a bay being set up for the legacy secret credential. A certificate
   # bay gets neither the shared secret nor the tool that seals one: if its enrollment fails, the setup stops there
@@ -767,35 +833,39 @@ function Get-Day0CredentialGuidance {
     [Parameter(Mandatory = $true)][ValidateSet("Certificate", "Secret")][string]$Mode,
     [Parameter(Mandatory = $true)][string]$DpapiPath,
     [Parameter(Mandatory = $true)][string]$Root,
-    [Parameter(Mandatory = $true)][string]$BayKioskUser
+    [Parameter(Mandatory = $true)][string]$BayKioskUser,
+    # What follows -EnrollClientId on the printed line: this bay's own app id, or the words to replace with it.
+    [string]$EnrollAppId = "<this bay's own app id>",
+    [string]$Note = ""
   )
   if ($Mode -eq "Certificate") {
     return [ordered]@{
       mode          = "Certificate"
       dpapiRequired = $false
       lines = @(
-        "This bay will authenticate with a CERTIFICATE it mints itself.",
+        "This bay will authenticate with a CERTIFICATE it mints itself, as ITS OWN app (each bay has its own identity).",
         "DO NOT create a DPAPI secret on this machine, and do not copy one here.",
-        "A DPAPI secret file makes the agent believe it already has a working credential, so",
-        "  BayAgent.ps1 -EnrollCert leaves the new certificate PENDING instead of ACTIVE -- and it",
-        "  cannot be activated, because activation has to mint a live token and the certificate is",
-        "  not registered on the Entra app yet.",
+        "  The enrollment below refuses a PC that holds a client secret (ABG_OWNID_SECRET_PRESENT) and makes nothing.",
         "",
         "FIRST install the agent package (tools\Update-BayAgent.ps1, see Next Steps): -EnrollCert is part of",
         "  BayAgent.ps1, and a blank PC does not have BayAgent.ps1 until the first install has run.",
+        "  The line below needs BayAgent 1.6.1 or later.",
         "",
-        "Next, signed in as the agent account ($BayKioskUser), because the key is made in that account's store:",
-        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\current\BayAgent.ps1`" -EnrollCert",
+        "Next, signed in as the agent account ($BayKioskUser) and NOT as administrator, because the key is made in",
+        "the store of whoever runs the line:",
+        "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\current\BayAgent.ps1`" -EnrollCert -EnrollClientId $EnrollAppId",
         "",
-        "That prints a public certificate in base64 and writes it to $Root\BayAgent\state\bay-cert-<thumbprint>.cer.",
-        "Send it to whoever holds the Entra app; they register it as a certificate credential. Until that",
-        "registration lands the agent will log AADSTS700027 on every poll -- that is expected, not a fault.",
-        "The certificate signs in as the app agent-config.json names (clientId). Giving a bay its OWN app is the",
-        "  bay identity runbook's ladder (docs/aoc-bay-identity-runbook.md in the product repository).",
+        "-EnrollClientId names this bay's OWN app; the agent records it with the certificate. The line must end",
+        "  'RESULT: ENROLLED', and its 'Account' line must name $BayKioskUser. NO 'RESULT:' LINE AT ALL means the agent",
+        "  is older than 1.6.1 and ignored the option: stop, install 1.6.1, and run the line again with -EnrollForce.",
+        "It prints a public certificate and writes it to $Root\BayAgent\state\bay-cert-<thumbprint>.cer. That file is",
+        "  public. Whoever holds the bay's own Entra app registers it there (wsdeploy bay-identity add-cert).",
+        "About a minute after it is registered, run the SAME line again: it changes nothing and must end 'RESULT: READY'.",
+        "  'RESULT: NOT READY' with AADSTS700027 means the registration has not landed yet: wait a minute and run it again.",
         "",
         "IF ENROLLMENT FAILS, STOP HERE and fix the cause. Do not switch this bay to the shared client secret.",
         "  A certificate bay is given neither that secret nor the tool that seals one."
-      )
+      ) + $(if ([string]::IsNullOrWhiteSpace($Note)) { @() } else { @("", ("NOTE: " + $Note)) })
     }
   }
   return [ordered]@{
@@ -820,7 +890,8 @@ function Get-Day0CredentialGuidance {
 Write-Step "Phase 6: Credential Setup ($Credential)"
 
 $dpapiPath = Join-Path $AllBirdiesRoot "BayAgent\secrets\clientsecret.dpapi"
-$guidance = Get-Day0CredentialGuidance -Mode $Credential -DpapiPath $dpapiPath -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser
+$guidance = Get-Day0CredentialGuidance -Mode $Credential -DpapiPath $dpapiPath -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser `
+  -EnrollAppId ([string]$bayAppPlan.enrollId) -Note ([string]$bayAppPlan.note)
 
 if ($guidance.dpapiRequired) {
   if (Test-Path $dpapiPath) {
@@ -834,8 +905,8 @@ if ($guidance.dpapiRequired) {
   # The one thing worth shouting about on a certificate bay: a secret that is already here.
   if (Test-Path $dpapiPath) {
     Write-Host "  WARNING: a DPAPI secret file EXISTS at $dpapiPath" -ForegroundColor Red
-    Write-Host "  This bay was provisioned for the certificate credential. Remove that file before" -ForegroundColor Red
-    Write-Host "  running -EnrollCert, or the certificate will enroll as PENDING and cannot activate." -ForegroundColor Red
+    Write-Host "  This bay was provisioned for the certificate credential. A certificate bay is never given" -ForegroundColor Red
+    Write-Host "  the secret, and the enrollment refuses a PC that holds one: find out how it got here." -ForegroundColor Red
     Write-Host ""
   }
   $guidance.lines | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor Cyan }
@@ -1094,7 +1165,7 @@ Write-Step "Next Steps"
 
 $nextSteps = Get-Day0NextSteps -Mode $Credential -DpapiExists (Test-Path $dpapiPath) `
   -NameOk ($env:COMPUTERNAME -eq $expectedName) -ExpectedName $expectedName `
-  -AgentInstalled $agentInstalled -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser
+  -AgentInstalled $agentInstalled -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser -EnrollAppId ([string]$bayAppPlan.enrollId)
 
 foreach ($step in $nextSteps) {
   Write-Host "  $step" -ForegroundColor White

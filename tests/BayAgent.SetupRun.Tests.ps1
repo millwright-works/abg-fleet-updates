@@ -116,6 +116,14 @@ function Get-LineIndex($Run, [string]$Pattern) {
     return -1
 }
 
+function Get-EnrollLines($Run) {
+    # Every printed line that runs the installed agent with -EnrollCert, trimmed.
+    return @(@($Run.console) | ForEach-Object { [string]$_ } | Where-Object { $_ -match 'current\\BayAgent\.ps1" -EnrollCert' } | ForEach-Object { $_.Trim() })
+}
+$EnrollWords = "<this bay's own app id>"
+$OwnApp = "0f1e2d3c-4b5a-4978-8a6b-5c4d3e2f1a0b"
+$VendorShared = "0e77dbf6"   # the first block of the vendor's own shared app id: it must never reach a bay by default
+
 $Bay1 = "44d35503-6d63-f011-bec2-0022480b527b"
 $OrgUrl = "https://example-club.crm.dynamics.com"
 $Tenant = "11111111-2222-3333-4444-555555555555"
@@ -187,6 +195,11 @@ try {
     Assert-True ($iNext -ge 0 -and $iInstall -gt $iNext) "Next Steps is printed, and the first install of the agent package is in it"
     Assert-True ($iEnroll -gt $iInstall -and $iInstall -ge 0) "...before the enroll step, which runs BayAgent\current\BayAgent.ps1"
     Assert-True ($t1 -notmatch '\\BayAgent\\BayAgent\.ps1') "no line on the screen names BayAgent\BayAgent.ps1 (nothing is installed there)"
+    # 1.6.1: the enroll line names the bay's own app. This run typed -ClientId and no -BayAppId, so the line carries the
+    # words to replace, never an id the operator did not type as the bay's own.
+    $enr1 = @(Get-EnrollLines $r1)
+    Assert-True ($enr1.Count -eq 2 -and @($enr1 | Where-Object { $_ -notmatch ('-EnrollCert -EnrollClientId ' + [regex]::Escape($EnrollWords) + '$') }).Count -eq 0) ("no -BayAppId typed: both enroll lines (Phase 6 and Next Steps) end '-EnrollCert -EnrollClientId " + $EnrollWords + "' (found " + $enr1.Count + ")")
+    Assert-True ($t1 -notmatch '-EnrollClientId [0-9a-fA-F]{8}-') "...and no app id follows -EnrollClientId anywhere on the screen (the typed -ClientId is not presented as the bay's own app)"
     $pw1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^PROMPT ' })
     Assert-True ($pw1.Count -eq 2 -and @($pw1 | Where-Object { $_ -match 'Reboot' }).Count -eq 0) "two password prompts and no reboot question (-SkipReboot)"
     Assert-True ($r1.markerInConsole -eq $false) "the password typed at the prompts appears nowhere in what the run printed"
@@ -255,6 +268,85 @@ try {
     Assert-True ((Get-RunReg $c1r $KeyRdp) -eq 1 -and $c1r.policy -eq "AllSigned") "Remote Desktop off and script policy AllSigned on a default run"
     $c2r = Get-PlanRun $cust 1
     Assert-True ($c2r.ended -eq "ran to its last line") ("the second run finishes too (" + $c2r.ended + " " + $c2r.stoppedAt + ")")
+    $enrC = @(Get-EnrollLines $c1r)
+    Assert-True ($enrC.Count -eq 2 -and @($enrC | Where-Object { $_ -notmatch ('-EnrollCert -EnrollClientId ' + [regex]::Escape($EnrollWords) + '$') }).Count -eq 0) "an installer that passes nothing is shown the enroll line with the words to replace, in both places"
+    Assert-True (-not $ct.Contains($VendorShared) -and $ct -notmatch '-EnrollClientId [0-9a-fA-F]{8}-') "...and no app id is on the screen at all: the vendor's shared app is not offered as this bay's identity"
+
+    # =========================================================================================== the bay's own app (1.6.1)
+    Section "PLAN own-identity: the sheet's first run with -BayAppId (twice), then the lockdown run (twice)"
+    $Step9Own = [ordered]@{ BayNumber = 1; BayId = $Bay1; EnvironmentUrl = $OrgUrl; TenantId = $Tenant; BayAppId = $OwnApp.ToUpperInvariant(); SkipLockdown = $true; SkipReboot = $true }
+    $own = Invoke-SetupPlan "own-identity" @(
+        [ordered]@{ title = "first run with -BayAppId, lockdown skipped"; computerName = "BAY1KIOSK"; args = $Step9Own },
+        [ordered]@{ title = "the same again"; computerName = "BAY1KIOSK"; args = $Step9Own },
+        [ordered]@{ title = "lockdown run"; computerName = "BAY1KIOSK"; args = $Step16Args; model = [ordered]@{ placeAgent = $true; rebootAnswer = "n" } },
+        [ordered]@{ title = "lockdown run again"; computerName = "BAY1KIOSK"; args = $Step16Args }
+    )
+    Assert-True ($own.census -eq "ok" -and [string]::IsNullOrEmpty([string]$own.harnessError) -and @($own.runs).Count -eq 4) ("census ok, harness clean, four runs (" + $own.census + " " + $own.harnessError + ")")
+    $o1r = Get-PlanRun $own 0; $ot1 = Get-RunText $o1r
+    Assert-True ($o1r.ended -eq "ran to its last line" -and (Test-NoFailedRow $o1r)) ("the first run reaches the last line with no failed row (" + $o1r.ended + " " + $o1r.stoppedAt + ")")
+    $ocfg = $null; try { $ocfg = ([string]$o1r.configText) | ConvertFrom-Json } catch { $ocfg = $null }
+    Assert-True ($null -ne $ocfg -and $ocfg.clientId -ceq $OwnApp -and $ocfg.environmentUrl -eq $OrgUrl -and $ocfg.tenantId -eq $Tenant -and $ocfg.bayId -eq $Bay1) "agent-config.json names the bay's OWN app as clientId (typed once, as -BayAppId, in upper case; written in canonical form)"
+    Assert-True ($null -ne $o1r.configText -and ([string]$o1r.configText) -notmatch '<[a-z-]+>' -and $ot1 -match 'environmentUrl, tenantId, clientId and bayId were filled from this command line') "...with no <placeholder> left, and Day0 says all four were filled"
+    Assert-True (-not ([string]$o1r.configText).Contains($VendorShared) -and -not $ot1.Contains($VendorShared)) "the vendor's shared app id is in neither the configuration nor anything printed"
+    $enrO = @(Get-EnrollLines $o1r)
+    $wantLine = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<root>\AllBirdies\BayAgent\current\BayAgent.ps1" -EnrollCert -EnrollClientId ' + $OwnApp)
+    Assert-True ($enrO.Count -eq 2 -and @($enrO | Where-Object { $_ -cne $wantLine }).Count -eq 0) ("both enroll lines are exactly the line a person runs, with the bay's own app id (found: " + ($enrO -join " || ") + ")")
+    Assert-True (-not $ot1.Contains($EnrollWords)) "...and the words-to-replace appear nowhere when the id was typed"
+    Assert-True ($ot1 -match "RESULT: ENROLLED" -and $ot1 -match "RESULT: READY" -and $ot1 -match "NO 'RESULT:' LINE AT ALL" -and $ot1 -match "NOT as administrator") "the screen says what the line must end with, twice, that no RESULT line means the wrong agent, and not to run it as administrator"
+    Assert-True ($ot1 -match "DO NOT create a DPAPI secret" -and $ot1 -match "IF ENROLLMENT FAILS, STOP HERE" -and $ot1 -notmatch "SetClientSecretDpapi") "...and still forbids the secret and the fallback (A0.529)"
+    Assert-True ($ot1 -notmatch "PENDING instead of ACTIVE" -and $ot1 -notmatch "signs in as the app agent-config.json names") "the 1.6.0 wording (a secret makes the certificate PENDING; the certificate signs in as the configured app) is gone"
+    Assert-True ($o1r.secretToolOnDisk -eq $false -and $o1r.markerInConsole -eq $false) "no secret tool on disk, no typed password on the screen"
+    $o2r = Get-PlanRun $own 1
+    Assert-True ($o2r.ended -eq "ran to its last line" -and [string]$o2r.configText -eq [string]$o1r.configText -and ((Get-EnrollLines $o2r) -join "|") -eq ($enrO -join "|")) "the same run a second time: same configuration bytes, same two enroll lines"
+    $o3r = Get-PlanRun $own 2; $o4r = Get-PlanRun $own 3
+    Assert-True ($o3r.ended -eq "ran to its last line" -and (Test-NoFailedRow $o3r) -and [string]$o3r.configText -eq [string]$o1r.configText) ("the lockdown run finishes with no failed row and leaves the configuration alone (" + $o3r.ended + ")")
+    Assert-True (@(Get-EnrollLines $o3r | Where-Object { $_ -notmatch ('-EnrollClientId ' + [regex]::Escape($EnrollWords) + '$') }).Count -eq 0 -and @(Get-EnrollLines $o3r).Count -eq 2) "the lockdown run was not given -BayAppId, so its enroll lines carry the words to replace (it does not guess an id from the configuration)"
+    Assert-True ($o4r.ended -eq "ran to its last line" -and (Test-NoFailedRow $o4r)) "the lockdown run a second time finishes too"
+
+    Section "PLAN own-identity, both ids typed: -ClientId is kept, and the screen says the two differ"
+    $both = Invoke-SetupPlan "both-ids" @(
+        [ordered]@{ title = "-ClientId and a different -BayAppId"; computerName = "BAY1KIOSK"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; EnvironmentUrl = $OrgUrl; TenantId = $Tenant; ClientId = $App; BayAppId = $OwnApp; SkipLockdown = $true; SkipReboot = $true } }
+    )
+    $bo1 = Get-PlanRun $both 0; $bot = Get-RunText $bo1; $bocfg = $null; try { $bocfg = ([string]$bo1.configText) | ConvertFrom-Json } catch { }
+    Assert-True ($bo1.ended -eq "ran to its last line" -and $null -ne $bocfg -and $bocfg.clientId -eq $App) ("the typed -ClientId is what the configuration holds (" + $bo1.ended + ")")
+    Assert-True (@(Get-EnrollLines $bo1 | Where-Object { $_ -notmatch ('-EnrollClientId ' + $OwnApp + '$') }).Count -eq 0 -and @(Get-EnrollLines $bo1).Count -eq 2) "...the enroll lines name the bay's own app, not the -ClientId value"
+    Assert-True ($bot -match "NOTE: -ClientId was typed as well and is not this bay's own app") "...and a NOTE says the two differ"
+    $same = Invoke-SetupPlan "same-ids" @(
+        [ordered]@{ title = "-ClientId equal to -BayAppId"; computerName = "BAY1KIOSK"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; EnvironmentUrl = $OrgUrl; TenantId = $Tenant; ClientId = $OwnApp; BayAppId = $OwnApp; SkipLockdown = $true; SkipReboot = $true } }
+    )
+    $sm1 = Get-PlanRun $same 0
+    Assert-True ($sm1.ended -eq "ran to its last line" -and (Get-RunText $sm1) -notmatch "NOTE: -ClientId was typed") "when both name the same app there is no NOTE"
+
+    Section "PLAN own-identity, a value that is not one: the run stops before ANYTHING on the PC is changed"
+    $typedWrong = "ZZ-pasted-by-mistake-" + [guid]::NewGuid().ToString("N")
+    foreach ($badCase in @(
+            @{ label = "not a GUID"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; EnvironmentUrl = $OrgUrl; TenantId = $Tenant; BayAppId = $typedWrong; SkipLockdown = $true; SkipReboot = $true }; pattern = "-BayAppId must be this bay's own app id" },
+            @{ label = "the all-zero GUID"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; BayAppId = "00000000-0000-0000-0000-000000000000"; SkipLockdown = $true; SkipReboot = $true }; pattern = "-BayAppId must be this bay's own app id" },
+            @{ label = "with -Credential Secret"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; BayAppId = $OwnApp; Credential = "Secret"; SkipLockdown = $true; SkipReboot = $true }; pattern = "-BayAppId is for a bay set up with a certificate" })) {
+        $bp = Invoke-SetupPlan ("bad-appid-" + ($badCase.label -replace '[^a-z]', '')) @(
+            [ordered]@{ title = $badCase.label; computerName = "DESKTOP-7Q2K9XA"; args = $badCase.args },
+            [ordered]@{ title = "then a good run on the same PC"; computerName = "DESKTOP-7Q2K9XA"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; EnvironmentUrl = $OrgUrl; TenantId = $Tenant; BayAppId = $OwnApp; SkipLockdown = $true; SkipReboot = $true } }
+        )
+        $bp1 = Get-PlanRun $bp 0; $bp2 = Get-PlanRun $bp 1
+        Assert-True ([string]$bp1.ended -match '^STOPPED: ' -and [string]$bp1.ended -match $badCase.pattern) ("[" + $badCase.label + "] the run stops and says why (" + $bp1.ended + ")")
+        Assert-True (@($bp1.log).Count -eq 0 -and $null -eq $bp1.configText -and @($bp1.users).Count -eq 0 -and @($bp1.tasks).Count -eq 0 -and $bp1.policy -eq "Undefined") ("[" + $badCase.label + "] nothing was changed: no rename, no account, no download, no registry write, no policy, no configuration (recorded actions: " + @($bp1.log).Count + ")")
+        Assert-True (-not (([string]$bp1.ended) + (Get-RunText $bp1)).Contains($typedWrong)) ("[" + $badCase.label + "] what was typed is not echoed")
+        $bp2cfg = $null; try { $bp2cfg = ([string]$bp2.configText) | ConvertFrom-Json } catch { }
+        Assert-True ($bp2.ended -eq "ran to its last line" -and $null -ne $bp2cfg -and $bp2cfg.clientId -eq $OwnApp) ("[" + $badCase.label + "] the next run with a good value sets the PC up as usual (" + $bp2.ended + ")")
+    }
+
+    Section "Census: -BayAppId has no default, is read only when typed, and reaches the configuration in one guarded place"
+    $tkS = $null; $erS = $null
+    $sAst = [System.Management.Automation.Language.Parser]::ParseFile($SetupScript, [ref]$tkS, [ref]$erS)
+    $bayAppParam = @($sAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "BayAppId" })
+    Assert-True ($bayAppParam.Count -eq 1 -and $null -ne $bayAppParam[0].DefaultValue -and $bayAppParam[0].DefaultValue.Extent.Text -eq '""') "-BayAppId exists and its default is the empty string"
+    $planCallsS = @($sAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Get-BayAppIdPlan" }, $true))
+    Assert-True ($planCallsS.Count -eq 1 -and $planCallsS[0].Extent.Text -match '-Given \$PSBoundParameters\.ContainsKey\("BayAppId"\) -Value \$BayAppId ') "Get-BayAppIdPlan is called once, with -Given bound to `$PSBoundParameters.ContainsKey(`"BayAppId`") (only a typed value counts)"
+    $cfgClient = @($sAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$day0Args["ConfigClientId"]' }, $true))
+    $rights = @($cfgClient | ForEach-Object { $_.Right.Extent.Text.Trim() } | Sort-Object)
+    Assert-True ($cfgClient.Count -eq 2 -and ($rights -join " | ") -eq '$ClientId | [string]$bayAppPlan.configClientId') ("the configuration's clientId is assigned in exactly two places: the typed -ClientId and the plan's configClientId (found: " + ($rights -join " | ") + ")")
+    $uses = @([regex]::Matches([IO.File]::ReadAllText($SetupScript), '\$BayAppId\b') | ForEach-Object { $_.Index })
+    Assert-True ($uses.Count -eq 2) ("`$BayAppId itself is read in one place besides its declaration, the call to Get-BayAppIdPlan (occurrences in code and comments: " + $uses.Count + ")")
 
     # =========================================================================================== the legacy secret credential
     Section "PLAN secret-bay: only a bay set up with -Credential Secret gets the tool that seals one"
@@ -318,6 +410,7 @@ try {
     Assert-True (Test-Row $w1 "Remote Desktop off" "FAIL") "Remote Desktop found ON with the lockdown skipped: the row reads FAIL (it is fed the real reading and printed as returned)"
     Assert-True (Test-Row $w1 "No DPAPI secret file (certificate bay)" "FAIL") "a secret file on a certificate bay: the row reads FAIL"
     Assert-True ($wt1 -match 'WARNING: a DPAPI secret file EXISTS') "...and Phase 6 warns about it"
+    Assert-True ($wt1 -match 'the enrollment refuses a PC that holds one' -and $wt1 -notmatch 'enroll as PENDING') "...in 1.6.1's terms: the enrollment refuses such a PC (not 'the certificate will enroll as PENDING')"
     Assert-True ($wt1 -match '(?m)^\d+ PASSED, 2 FAILED, \d+ PENDING\s*$') "the summary counts exactly those two failures"
     Assert-True ($w2.ended -eq "ran to its last line" -and (Get-LogCount $w2 'fDenyTSConnections = 1$') -eq 1 -and (Get-RunReg $w2 $KeyRdp) -eq 1 -and (Test-Row $w2 "Remote Desktop off" "PASS")) "the lockdown run turns Remote Desktop OFF and the row then reads PASS"
 

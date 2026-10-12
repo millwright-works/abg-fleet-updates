@@ -268,6 +268,8 @@ function New-D0Bay {
         [Parameter(Mandatory = $true)][string]$Name,
         [ValidateSet("placeholder", "own", "shared")][string]$Shape = "placeholder",
         [switch]$LeaveBayIdPlaceholder,
+        [switch]$LeaveTenantPlaceholder,
+        [string]$EnvironmentUrlAs = "",
         [string]$PlaintextSecret = "",
         [string]$CertThumbprintCfg = "",
         [string]$SeedStateJson = ""
@@ -284,8 +286,9 @@ function New-D0Bay {
 
     $cfg = $Day0TemplateJson | ConvertFrom-Json
     # What the operator fills in (the values a run sheet names).
-    $cfg.environmentUrl = $MockUrl
-    $cfg.tenantId = $D0Tenant
+    # -EnvironmentUrlAs "template" keeps the template's own unfilled address; any other text is written as typed.
+    if ($EnvironmentUrlAs -eq "template") { } elseif ($EnvironmentUrlAs) { $cfg.environmentUrl = $EnvironmentUrlAs } else { $cfg.environmentUrl = $MockUrl }
+    if (-not $LeaveTenantPlaceholder) { $cfg.tenantId = $D0Tenant }
     # Left unfilled, bayId keeps the template's <placeholder> with this run's tag inside it: still not a GUID, and a
     # certificate wrongly made for it carries a subject that only this run can have made.
     if ($LeaveBayIdPlaceholder) { $cfg.bayId = $D0PlaceholderBayId } else { $cfg.bayId = $D0BayId }
@@ -399,7 +402,12 @@ function Get-D0Capabilities([object[]]$Requests) {
     return $caps
 }
 
+# THE ARGUMENTS UNDER TEST ARE THE ONES Setup-BayPC.ps1 PRINTS. They are read out of that script's text (Phase 6 and
+# Next Steps), so the line a person is shown at the bay is the line every scenario below runs.
+$SetupScriptText = [IO.File]::ReadAllText((Resolve-Path (Join-Path $PSScriptRoot "..\src\BayAgent\tools\Setup-BayPC.ps1")).Path)
+$PrintedEnroll = @([regex]::Matches($SetupScriptText, '(powershell\.exe -NoProfile -ExecutionPolicy Bypass) -File `"\$Root\\BayAgent\\current\\BayAgent\.ps1`" (-EnrollCert[^"\r\n]*)"') | ForEach-Object { $_.Groups[1].Value + "|" + $_.Groups[2].Value } | Sort-Object -Unique)
 $SheetEnroll = "-EnrollCert -EnrollClientId {0}"
+if ($PrintedEnroll.Count -eq 1) { $SheetEnroll = ($PrintedEnroll[0] -split "\|", 2)[1].Replace('$EnrollAppId', '{0}') }
 
 Write-Host "Agent under test : $AgentScript"
 Write-Host "Sandbox          : $SandboxRoot"
@@ -427,6 +435,8 @@ try {
     for ($i = 0; $i -lt [Math]::Min($shippedLines.Count, $copyLines.Count); $i++) { if ($shippedLines[$i] -ne $copyLines[$i]) { $diffIdx += $i } }
     Assert-True ($diffIdx.Count -eq 1 -and $shippedLines[$diffIdx[0]].Trim().StartsWith('$BaseDir =')) "exactly one line differs, and it is the `$BaseDir assignment (differing lines: $($diffIdx.Count))"
     Assert-True ($certsAtStart.Count -eq 0) "precondition: no certificate with this run's subject exists"
+    Assert-True ($PrintedEnroll.Count -eq 1 -and $PrintedEnroll[0] -eq 'powershell.exe -NoProfile -ExecutionPolicy Bypass|-EnrollCert -EnrollClientId $EnrollAppId') ("Setup-BayPC.ps1 prints ONE enroll line, in both places it prints it, and it is the line these scenarios run (found: " + ($PrintedEnroll -join " || ") + ")")
+    Assert-True ($SheetEnroll -eq "-EnrollCert -EnrollClientId {0}") "...so the arguments under test are: -EnrollCert -EnrollClientId <the bay's own app id>"
     $cfgProbe = [IO.File]::ReadAllText($probe.Config) | ConvertFrom-Json
     Assert-True ([string]$cfgProbe.clientId -eq "<app-client-id>") "the modeled configuration is Day0's own template: clientId still holds its placeholder when the operator passed none"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $probe.Root "state"))) "precondition: a blank bay has no state folder, no credential.json"
@@ -501,6 +511,19 @@ try {
     Assert-True ($r.StdOut -match "bayId") "[bayId not filled in] ...naming the field"
     Assert-True ((Get-D0InstallFingerprint $b2c.Root) -eq $before) "[bayId not filled in] nothing was changed"
     Assert-True (((Get-D0PlaceholderCerts) -join ",") -eq ($placeholderCertsAtStart -join ",")) "[bayId not filled in] no certificate was made for a placeholder"
+
+    # The same refusal for the other two fields the enrollment needs (the attack's surviving changes: only bayId was pinned).
+    foreach ($unfilledCase in @(
+            @{ label = "tenantId not filled in"; field = "tenantId"; bay = (New-D0Bay -Name "refusal-tenant" -LeaveTenantPlaceholder) },
+            @{ label = "environmentUrl still the template's"; field = "environmentUrl"; bay = (New-D0Bay -Name "refusal-org-template" -EnvironmentUrlAs "template") },
+            @{ label = "environmentUrl not an address"; field = "environmentUrl"; bay = (New-D0Bay -Name "refusal-org-text" -EnvironmentUrlAs "example-club.crm.dynamics.com") })) {
+        $before = Get-D0InstallFingerprint $unfilledCase.bay.Root; $mark = Get-D0Mark; $certsBeforeCase = @(Get-D0RunCerts).Count
+        $r = Invoke-D0Agent -Bay $unfilledCase.bay -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+        Show-D0Run $r ("S2 " + $unfilledCase.label)
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CONFIG_NOT_FILLED_IN") "[$($unfilledCase.label)] refused with ABG_OWNID_CONFIG_NOT_FILLED_IN (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+        Assert-True ($r.StdOut -match ("does not hold this bay's values yet \(" + $unfilledCase.field + "\)")) "[$($unfilledCase.label)] ...naming exactly that field"
+        Assert-True ((Get-D0InstallFingerprint $unfilledCase.bay.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0 -and @(Get-D0RunCerts).Count -eq $certsBeforeCase) "[$($unfilledCase.label)] nothing was changed, no key was made, nothing was sent"
+    }
 
     # A0.529: a secret on the machine means this is not a new bay. Sealed file, then plaintext in the configuration.
     $b2s = New-D0Bay -Name "refusal-secret"
@@ -743,6 +766,53 @@ try {
     Remove-Item -LiteralPath (Join-Path $bf.Root "state\credential.json.tmp") -Force -Recurse
     $r = Invoke-D0Agent -Bay $bf -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Assert-True ($r.ExitCode -eq 0 -and (Get-D0FirstResult $r.StdOut) -like "RESULT: ENROLLED*" -and (@(Get-D0RunCerts).Count -eq ($certsBefore.Count + 1))) "with the cause fixed, the same command enrolls: one certificate, exit 0"
+
+    # ============================================================ S11b the one check that is NOT a run of the script
+    Section "S11b (lifted, and said so) a replace that fails AFTER the state file changed puts the earlier enrollment back"
+    # Every other section runs the script's real text. This branch cannot be reached that way: the state write is the
+    # last thing that can fail, and when it fails the file has not changed. So here, and only here, the enrollment
+    # function and what it calls are lifted out of the script and run in this process, with ONE stand-in:
+    # Update-CredentialState writes a changed state file and THEN fails. An independent attack planted "the earlier
+    # enrollment is not put back" and the suite passed; this is the assertion that was missing.
+    $liftNames = @("Get-PropValue", "Normalize-Thumbprint", "ConvertTo-AgentGuid", "Read-CredentialState", "Get-ActiveCertThumbprint", "Get-PendingCertThumbprint",
+        "Get-ActiveClientId", "Test-OwnIdentityActive", "Get-IdentityProbation", "Test-HasUsableSecret", "Get-CertStoreSearchOrder", "Get-CertStoreName",
+        "Find-ClientCertificate", "New-BayClientCertificate", "Export-PublicCertificate", "Build-CredentialEnrollResult", "Get-AadstsCode",
+        "Get-OwnIdentitySignInProof", "Remove-OwnIdentityCertificate", "New-OwnIdentityEnrollRefusal", "Invoke-OwnIdentityEnroll")
+    $ltk = $null; $ler = $null
+    $liftAst = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$ltk, [ref]$ler)
+    $liftDefs = @{}
+    foreach ($d in @($liftAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) { $liftDefs[$d.Name] = $d.Extent.Text }
+    $liftMissing = @($liftNames | Where-Object { -not $liftDefs.ContainsKey($_) })
+    Assert-True ($liftMissing.Count -eq 0) ("the functions this check needs exist in the script (missing: " + $(if ($liftMissing.Count) { $liftMissing -join ", " } else { "none" }) + ")")
+    if ($liftMissing.Count -eq 0) {
+        foreach ($ln in $liftNames) { . ([scriptblock]::Create($liftDefs[$ln])) }
+        function Write-Log { param([string]$Message, [string]$Level = "INFO") }
+        $liftRoot = Join-Path $SandboxRoot "lifted-restore"
+        New-Item -ItemType Directory -Force -Path (Join-Path $liftRoot "state") | Out-Null
+        # The script-level names those functions read, as the script sets them on a bay with no secret configured.
+        $BaseDir = $liftRoot; $CredentialStatePath = Join-Path $liftRoot "state\credential.json"
+        $BayId = $D0BayId; $TenantId = $D0Tenant; $OrgUrl = $MockUrl; $ClientId = "<app-client-id>"
+        $CertThumbprintCfg = $null; $CertStoreCfg = $null
+        Set-Variable -Name Secret -Value $null; Set-Variable -Name SecretPath -Value $null
+        $Global:CredentialStateCorrupt = $false
+        # An earlier enrollment on record whose certificate is not in this account's store, on a bay that never ran:
+        # the case -EnrollForce is allowed to replace.
+        $earlier = '{ "activeThumbprint": "' + $D0FakeThumb + '", "activeClientId": "' + $D0OtherApp + '", "ownIdentityEnrolled": { "clientId": "' + $D0OtherApp + '", "thumbprint": "' + $D0FakeThumb + '", "utc": "2026-10-11T00:00:00Z", "account": "X\\Y" }, "fallbackCountTotal": 0 }'
+        [IO.File]::WriteAllText($CredentialStatePath, $earlier, (New-Object Text.UTF8Encoding($false)))
+        $earlierHash = Get-D0Sha256Hex ([IO.File]::ReadAllBytes($CredentialStatePath))
+        $certsBeforeLift = @(Get-D0RunCerts)
+        # THE STAND-IN: the state file is changed, then the write fails.
+        function Update-CredentialState([hashtable]$changes) {
+            [IO.File]::WriteAllText($CredentialStatePath, '{ "activeThumbprint": "HALF-WRITTEN" }', (New-Object Text.UTF8Encoding($false)))
+            throw "stand-in: the state write failed after the file had changed"
+        }
+        $liftThrew = ""; $liftResult = $null
+        try { $liftResult = Invoke-OwnIdentityEnroll -OwnClientId $D0OwnApp -Payload @{ force = $true; validityDays = 730 } } catch { $liftThrew = [string]$_.Exception.Message }
+        Assert-True ($liftThrew -match "Own-identity enrollment failed and was undone" -and $null -eq $liftResult) ("the enrollment fails and says it was undone (" + $liftThrew + ")")
+        Assert-True ((Test-Path -LiteralPath $CredentialStatePath) -and (Get-D0Sha256Hex ([IO.File]::ReadAllBytes($CredentialStatePath))) -eq $earlierHash) "the state file is byte for byte the earlier enrollment again (not the half-written one)"
+        Assert-True (((Get-D0RunCerts) -join ",") -eq ($certsBeforeLift -join ",")) "the key made for the failed attempt is gone from the store"
+        Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $liftRoot "state") -Filter "bay-cert-*.cer" -ErrorAction SilentlyContinue).Count -eq 0) "...and so is its public .cer"
+    }
 
     # ============================================================ S12 the key was made under another Windows account
     Section "S12 the certificate on record is not in this account's store (made under another account): dark, said plainly, correctable"
