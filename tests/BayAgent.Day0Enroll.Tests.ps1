@@ -272,6 +272,7 @@ function New-D0Bay {
         [string]$EnvironmentUrlAs = "",
         [string]$PlaintextSecret = "",
         [switch]$KeepSecretPathBesidePlaintext,
+        [switch]$SecretPathElsewhere,
         [string]$CertThumbprintCfg = "",
         [string]$SeedStateJson = ""
     )
@@ -297,6 +298,8 @@ function New-D0Bay {
     if ($Shape -eq "own") { $cfg.clientId = $D0OwnApp } elseif ($Shape -eq "shared") { $cfg.clientId = $D0Shared }
     # The template's secret file path, pointed into the sandbox (the file is NOT made). The "own" shape names none.
     $cfg.clientSecretDpapiPath = (Join-Path $root "secrets\clientsecret.dpapi")
+    # -SecretPathElsewhere: the configuration names a sealed-secret path that is NOT the standard place.
+    if ($SecretPathElsewhere) { New-Item -ItemType Directory -Force -Path (Join-Path $root "elsewhere") | Out-Null; $cfg.clientSecretDpapiPath = (Join-Path $root "elsewhere\bay-secret.dpapi") }
     if ($Shape -eq "own") { $cfg.PSObject.Properties.Remove("clientSecretDpapiPath") }
     # Machine-touching values made inert, as BayAgent.Launch.Tests.ps1 L7 does: no real launcher, no real wall.
     $cfg.sessionJsonPath = (Join-Path $root "session.json")
@@ -565,6 +568,16 @@ try {
     Show-D0Run $r "S2 sealed secret file the configuration does not name"
     Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[a sealed secret file at the standard place, named by no configuration key] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ((Get-D0InstallFingerprint $b2y.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[...named by no configuration key] nothing was changed, nothing was sent"
+
+    # ...and the third place: a sealed file the configuration DOES name, somewhere other than the standard place.
+    # (Planted change G13 survived until this was added: in every other scenario the named path is the standard one.)
+    $b2z = New-D0Bay -Name "refusal-sealed-elsewhere" -SecretPathElsewhere
+    [IO.File]::WriteAllBytes((Join-Path $b2z.Root "elsewhere\bay-secret.dpapi"), $sealed)
+    $before = Get-D0InstallFingerprint $b2z.Root; $mark = Get-D0Mark
+    $r = Invoke-D0Agent -Bay $b2z -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+    Show-D0Run $r "S2 sealed secret file at a path of the configuration's own choosing"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT" -and $r.StdOut -match "the sealed secret file the configuration names") "[a sealed secret file at a path only the configuration names] refused with ABG_OWNID_SECRET_PRESENT, naming it (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ((Get-D0InstallFingerprint $b2z.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[...at a path only the configuration names] nothing was changed, nothing was sent"
 
     # A PC that already holds something is not a new bay: each of these is refused, with or without -EnrollForce, and
     # the state file is left byte for byte as it was.
