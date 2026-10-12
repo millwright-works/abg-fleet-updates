@@ -4740,8 +4740,10 @@ function Remove-OwnIdentityCertificate {
 }
 
 function Get-OwnIdentitySecretOnPc {
-    # WHERE a client secret sits on this PC, as a short description, or "" when none is found. Never the secret, and
-    # nothing is decrypted. Never throws.
+    # WHERE a client secret sits on this PC, and WHICH PLACES THIS ACCOUNT COULD NOT LOOK AT. Returns an object with
+    # two strings: Found (the places that hold a secret, "" when none was seen) and Unreadable (the places that could
+    # not be looked at, each with the error, "" when every place could be looked at). Never the secret, and nothing is
+    # decrypted. Never throws.
     #
     # It reads the PLACES a secret can be, not only the two variables the sign-in code resolved from the
     # configuration at start-up ($Secret, $SecretPath). Those are what a sign-in would use right now; a guard that
@@ -4751,20 +4753,33 @@ function Get-OwnIdentitySecretOnPc {
     #      loads only the path, so (1) cannot see the plaintext, but it is a secret in a file on this PC;
     #   3. a sealed file at the standard place, secrets\clientsecret.dpapi under the agent's folder, even when the
     #      configuration names no path, or another one.
+    #
+    # FAILS CLOSED (BayAgent 1.6.1 re-check, RF-1). An error while LOOKING is not "nothing there". Under
+    # $ErrorActionPreference = "Stop", Test-Path THROWS "Access is denied" for a file this account may not look at
+    # (the rights ABG.SetClientSecretDpapi.ps1 leaves by default: SYSTEM and Administrators only) and ArgumentException
+    # for a path with illegal characters. Every read below that throws is recorded in Unreadable, naming the place,
+    # and the caller refuses before any key is made. No catch in this function may leave $found and $unreadable alone.
     $found = @()
-    try { if (Test-HasUsableSecret) { $found += $(if ($script:Secret) { "a clientSecret in agent-config.json" } else { "the sealed secret file the configuration names" }) } } catch { }
+    $unreadable = @()
+    $namedPath = [string]$script:SecretPath
+    if (-not $namedPath) { $namedPath = "the path clientSecretDpapiPath names" }
+    $standardPlace = "secrets\clientsecret.dpapi under the agent's folder"
+    try { if (Test-HasUsableSecret) { $found += $(if ($script:Secret) { "a clientSecret in agent-config.json" } else { "the sealed secret file the configuration names" }) } }
+    catch { $unreadable += ("the secret the configuration names ({0}): {1}" -f $namedPath, $_.Exception.Message) }
     try {
         if (($cfg.PSObject.Properties.Name -contains "clientSecret") -and (-not [string]::IsNullOrWhiteSpace([string]$cfg.clientSecret))) {
             if ($found -notcontains "a clientSecret in agent-config.json") { $found += "a clientSecret in agent-config.json" }
         }
-    } catch { }
+    }
+    catch { $unreadable += ("agent-config.json, the clientSecret key: {0}" -f $_.Exception.Message) }
     try {
         $standardPlace = Join-Path $BaseDir "secrets\clientsecret.dpapi"
         if (Test-Path -LiteralPath $standardPlace -PathType Leaf) {
             if ($found -notcontains "the sealed secret file the configuration names") { $found += ("a sealed secret file at " + $standardPlace) }
         }
-    } catch { }
-    return ($found -join "; ")
+    }
+    catch { $unreadable += ("the standard place for the sealed secret ({0}): {1}" -f $standardPlace, $_.Exception.Message) }
+    return [pscustomobject]@{ Found = ($found -join "; "); Unreadable = ($unreadable -join "; ") }
 }
 
 function New-OwnIdentityEnrollRefusal {
@@ -4820,9 +4835,13 @@ function Invoke-OwnIdentityEnroll {
 
     # A0.529: a bay enrolled this way never holds a client secret. One on the machine means this is not that bay.
     # The guard reads every place a secret can sit (Get-OwnIdentitySecretOnPc), not only what a sign-in would use now.
-    $secretOnPc = Get-OwnIdentitySecretOnPc
-    if ($secretOnPc) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_PRESENT" ("This PC holds a client secret ({0}). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all." -f $secretOnPc))
+    # A place this account could not look at is a refusal too (it fails closed): "could not look" is not "nothing there".
+    $secretCheck = Get-OwnIdentitySecretOnPc
+    if ($secretCheck.Found) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_PRESENT" ("This PC holds a client secret ({0}). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all." -f $secretCheck.Found))
+    }
+    if ($secretCheck.Unreadable) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_UNREADABLE" ("Whether this PC holds a client secret could not be told: this Windows account ({0}) could not look at: {1}. A secret that cannot be looked at may still be there, so this bay is not known to be new, and nothing was made. If this bay is new, an administrator checks that place and removes the secret file from it, then this is run again. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate)." -f $account, $secretCheck.Unreadable))
     }
     if ($null -ne $probation) {
         return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SWITCH_IN_PROGRESS" "An identity switch is on probation on this bay. Confirm or revert it (CredentialRotate) first.")

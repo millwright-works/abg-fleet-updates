@@ -82,13 +82,30 @@ $mutants = @(
     (New-D0Mutant "G10" "an environmentUrl that is not an address is enrolled (the attack's survivor)" @(
         (New-D0Edit "if ([string]`$OrgUrl -notmatch '^https?://[A-Za-z0-9.-]+(:\d+)?`$') { `$unfilled += `"environmentUrl`" }" "if (`$false) { `$unfilled += `"environmentUrl`" }"))),
     (New-D0Mutant "G04" "a PC that holds a client secret is enrolled (A0.529)" @(
-        (New-D0Edit '    if ($secretOnPc) {' '    if ($false) {'))),
+        (New-D0Edit '    if ($secretCheck.Found) {' '    if ($false) {'))),
     (New-D0Mutant "G11" "the secret guard reads only what a sign-in would use now: a plaintext secret beside a secret-file path is not seen" @(
         (New-D0Edit 'if (($cfg.PSObject.Properties.Name -contains "clientSecret") -and (-not [string]::IsNullOrWhiteSpace([string]$cfg.clientSecret))) {' 'if ($false) {'))),
     (New-D0Mutant "G12" "the secret guard reads only the configured path: a sealed file at the standard place is not seen" @(
         (New-D0Edit '        if (Test-Path -LiteralPath $standardPlace -PathType Leaf) {' '        if ($false) {'))),
     (New-D0Mutant "G13" "the secret guard no longer reads what a sign-in would use now" @(
         (New-D0Edit 'try { if (Test-HasUsableSecret) { $found +=' 'try { if ($false) { $found +='))),
+    # ---- RF-1 (re-check of 2026-10-12): a place that cannot be looked at is a refusal, not "nothing there" ----
+    (New-D0Mutant "H01" "an error looking at the secret the configuration names is swallowed again (read as nothing there)" @(
+        (New-D0Edit 'catch { $unreadable += ("the secret the configuration names ({0}): {1}" -f $namedPath, $_.Exception.Message) }' 'catch { }'))),
+    (New-D0Mutant "H02" "an error reading the clientSecret key of the configuration is swallowed again" @(
+        (New-D0Edit 'catch { $unreadable += ("agent-config.json, the clientSecret key: {0}" -f $_.Exception.Message) }' 'catch { }'))),
+    (New-D0Mutant "H03" "an error looking at the standard place is swallowed again" @(
+        (New-D0Edit 'catch { $unreadable += ("the standard place for the sealed secret ({0}): {1}" -f $standardPlace, $_.Exception.Message) }' 'catch { }'))),
+    (New-D0Mutant "H04" "the caller no longer refuses when a place could not be looked at" @(
+        (New-D0Edit '    if ($secretCheck.Unreadable) {' '    if ($false) {'))),
+    (New-D0Mutant "W3" "-EnrollForce passes the secret guard (the re-check's survivor)" @(
+        (New-D0Edit '    if ($secretCheck.Found) {' '    if ($secretCheck.Found -and -not $force) {'))),
+    (New-D0Mutant "W3b" "-EnrollForce passes the unreadable-place refusal" @(
+        (New-D0Edit '    if ($secretCheck.Unreadable) {' '    if ($secretCheck.Unreadable -and -not $force) {'))),
+    (New-D0Mutant "W4" "the standard place is read only when the configuration names no other path (the re-check's survivor)" @(
+        (New-D0Edit '        if (Test-Path -LiteralPath $standardPlace -PathType Leaf) {' '        if (-not $script:SecretPath -and (Test-Path -LiteralPath $standardPlace -PathType Leaf)) {'))),
+    (New-D0Mutant "W5" "the secret guard is not asked of a bay that already has something on record (the re-check's survivor)" @(
+        (New-D0Edit '    $secretCheck = Get-OwnIdentitySecretOnPc' '    $secretCheck = $(if ($stateTp) { [pscustomobject]@{ Found = ""; Unreadable = "" } } else { Get-OwnIdentitySecretOnPc })'))),
     (New-D0Mutant "G05" "a corrupt state file is not a refusal" @(
         (New-D0Edit ('        if ($Global:CredentialStateCorrupt) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT"') ('        if ($false) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT"')))),
     (New-D0Mutant "G06" "an identity switch on probation is not a refusal" @(
@@ -183,7 +200,11 @@ function Start-D0SuiteRun([string]$Id, [string]$AgentCopy) {
     $log = Join-Path $OutDir ($Id + ".txt")
     $err = Join-Path $OutDir ($Id + ".stderr.txt")
     $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $SuitePath), "-AgentScript", ('"{0}"' -f $AgentCopy))
-    $p = Start-Process -FilePath $HostExe -ArgumentList $argList -RedirectStandardOutput $log -RedirectStandardError $err -PassThru -WindowStyle Hidden
+    # A Windows PowerShell child started from pwsh 7 must not inherit pwsh's module path: it then has no Cert: drive, and the
+    # suite (which now stops when it cannot read the certificate store) would stop at its first certificate check.
+    $savedModulePath = $env:PSModulePath
+    try { $env:PSModulePath = $null; $p = Start-Process -FilePath $HostExe -ArgumentList $argList -RedirectStandardOutput $log -RedirectStandardError $err -PassThru -WindowStyle Hidden }
+    finally { $env:PSModulePath = $savedModulePath }
     return [pscustomobject]@{ Id = $Id; Process = $p; Log = $log }
 }
 
