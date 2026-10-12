@@ -437,8 +437,22 @@ function Invoke-D0Icacls([string[]]$IcaclsArgs) {
     if ($LASTEXITCODE -ne 0) { throw ("icacls {0} failed with exit code {1}" -f ($IcaclsArgs -join " "), $LASTEXITCODE) }
 }
 function Test-D0CannotLook([string]$Path) {
-    # True when the existence test the agent uses THROWS for this path from this account (the shape RF-1 is about).
-    try { [void](Test-Path -LiteralPath $Path -PathType Leaf); return $false } catch { return $true }
+    # True when the existence test the agent uses THROWS for this path from this account (the shape RF-1 is about). It is
+    # asked of the HOST THE BAY RUNS (a child Windows PowerShell 5.1 with $ErrorActionPreference = "Stop", as the agent
+    # sets it), not of this suite's own host: pwsh 7 does not throw for a path with an illegal character, 5.1 does.
+    $psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $probeText = '$ErrorActionPreference = "Stop"; try { [void](Test-Path -LiteralPath ''' + $Path.Replace("'", "''") + ''' -PathType Leaf); "no-throw" } catch { "throws" }'
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $psExe
+    $psi.Arguments = "-NoProfile -NonInteractive -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeText))
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    if ($psi.EnvironmentVariables.ContainsKey("PSModulePath")) { $psi.EnvironmentVariables.Remove("PSModulePath") }
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $soTask = $proc.StandardOutput.ReadToEndAsync(); $seTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit(30000)) { try { $proc.Kill() } catch {}; throw "the existence probe for $Path did not finish" }
+    $answer = ([string]$soTask.Result).Trim()
+    if ($answer -ne "throws" -and $answer -ne "no-throw") { throw ("the existence probe for {0} answered neither 'throws' nor 'no-throw': '{1}' {2}" -f $Path, $answer, [string]$seTask.Result) }
+    return ($answer -eq "throws")
 }
 function Lock-D0LikeTheSecretTool([string]$Dir, [string]$File) {
     # Returns a sentence saying which rights this account ended up with. Registers both for unlocking.
