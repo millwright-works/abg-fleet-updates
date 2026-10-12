@@ -306,7 +306,7 @@ if ($cfg.PSObject.Properties.Name -contains "heartbeatSeconds" -and $cfg.heartbe
 # A label read from a side file is only as true as the copy that placed it. So the version is a constant in the
 # file that runs, the build refuses a package whose manifest disagrees with it, and the manifest's own value is
 # reported next to it (manifestVersion) so a stale copy is visible instead of believed.
-$AgentCodeVersion = "1.6.0"
+$AgentCodeVersion = "1.6.1"
 $AgentVersion = $AgentCodeVersion
 $AgentManifestVersion = $null
 

@@ -1168,7 +1168,7 @@ try {
     }
     $shippedText = [IO.File]::ReadAllText($AgentScript)
     Assert-True ([regex]::Matches($shippedText, 'ownIdentityEnrolled\s*=').Count -eq 1) "...and the whole script writes that key in exactly one place"
-    Assert-True ($shippedText -match '(?m)^\$AgentCodeVersion = "1\.6\.0"') "the version constant is untouched by this change (1.6.0; the bump is the release's act)"
+    Assert-True ($shippedText -match '(?m)^\$AgentCodeVersion = "1\.6\.1"') "the version constant reads 1.6.1 (the release bump; the day-0 change itself did not touch it)"
 }
 catch {
     # A suite that stops on an error must still end with a RESULT line that is red, never with silence.
