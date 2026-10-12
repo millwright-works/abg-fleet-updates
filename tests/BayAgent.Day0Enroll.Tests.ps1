@@ -29,7 +29,7 @@ HOW, AND WHY IT IS BUILT THIS WAY
 
 THE SECRET GUARD (A0.529) AND "COULD NOT LOOK" (the re-check of 2026-10-12, RF-1)
   S2/S2b/S2e pin the guard that refuses a PC holding a client secret: each of its three places (a sealed file the
-  configuration names, a clientSecret key, the sealed file at the standard place even when another path is named); that
+  configuration names, a plaintext key in the configuration, the sealed file at the standard place even when another path is named); that
   -EnrollForce does not pass it; that it is asked of a bay that already has an enrollment; and that a place this account
   cannot LOOK AT (a sealed file with the rights the product's own secret tool leaves: SYSTEM and Administrators only; a
   path with an illegal character) is a refusal that names the place (ABG_OWNID_SECRET_UNREADABLE), never "nothing there".
