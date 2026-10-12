@@ -475,7 +475,117 @@ try {
         Assert-True ($throws.Count -eq 1 -and $gate.Count -eq 1 -and $readers.Count -eq 1 -and $gate[0].Extent.StartOffset -lt $throws[0].Extent.StartOffset -and $throws[0].Extent.EndOffset -lt $readers[0].Extent.StartOffset) "inside it: the enrollment gate, then the refusal, and only then the read of the secret"
     } else { Assert-True $false "Acquire-TokenWithSecret was not found exactly once" }
     $gateFn = @($cFns | Where-Object { $_.Name -eq "Test-OwnIdentityActive" })
-    Assert-True ($gateFn.Count -eq 1 -and $gateFn[0].Extent.Text -match '(?m)^\s*if \(\$EnrolledOnly\) \{ return \(\$null -ne \$enrolledRec\) \}\s*$') "the gate's answer is the existence of the enrollment record and nothing else (it does not compare it with the app in force, the certificate or the configuration)"
+    $gateOk = $false
+    if ($gateFn.Count -eq 1) {
+        # Everything the function does BEFORE it answers -EnrolledOnly: it may read the state file and nothing else.
+        $gateText = $gateFn[0].Extent.Text
+        $cut = $gateText.IndexOf('if ($EnrolledOnly) {')
+        $closing = $(if ($cut -ge 0) { $gateText.IndexOf('$active = Get-ActiveClientId', $cut) } else { -1 })
+        if ($cut -gt 0 -and $closing -gt $cut) {
+            $beforeAnswer = (($gateText.Substring(0, $closing) -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+            $gateOk = ($beforeAnswer -notmatch 'Get-ActiveClientId|Get-ActiveCertThumbprint|\$ClientId|\$cfg\b|ConvertTo-AgentGuid') -and ($beforeAnswer -match 'Read-CredentialState') -and ($beforeAnswer -match '\$recordPresent = \(\$null -ne \$stateProp\.Value\)') -and ($beforeAnswer -match 'return \(\$recordPresent -or ')
+        }
+    }
+    Assert-True $gateOk "the gate's answer is the existence of the enrollment record and nothing else: before it answers, the function reads the state file only (not the app in force, the certificate or the configuration)"
+    $swallowed = @($cFns | Where-Object { $_.Name -in @("Acquire-TokenWithSecret", "Acquire-Token", "Write-CredentialStartupSummary") -and $_.Extent.Text -match 'try \{[^\r\n}]*Test-OwnIdentityActive -EnrolledOnly' } | ForEach-Object { $_.Name })
+    Assert-True ($swallowed.Count -eq 0) ("none of the three places that DECIDE on the gate catches its error (a gate that cannot answer must not read as 'not enrolled'): " + $(if ($swallowed.Count) { $swallowed -join ", " } else { "none do" }))
+
+    # ============================================================ D: when the gate's one piece of state is not what it should be
+    # An automated review raised a second class: a gate that reads one piece of stored state, where losing or damaging
+    # that state makes it answer "not enrolled" and opens what it was closing. Every bay below WAS enrolled at the
+    # console (certificate not registered), then its state file was changed as the label says and a working secret was
+    # put on it. Each case is on one side, on purpose, and the side is what is asserted:
+    #   REFUSE  the agent sends no secret and reaches nothing;
+    #   OPEN    the agent behaves as a bay that was never enrolled and signs in with the secret. These are the cases
+    #           the rule does NOT cover. They are stated here so that nobody has to find them.
+    Section "D the enrollment record after the fact: which damage keeps the rule, and which lets a secret through (a stated choice per case)"
+    function Set-NsRecord($Bay, [string]$JsonValue) {
+        # Rewrites ONLY the ownIdentityEnrolled value in the state file, as raw JSON text.
+        $t = [IO.File]::ReadAllText($Bay.State)
+        $m = [regex]::Match($t, '(?s)"ownIdentityEnrolled"\s*:\s*\{.*?\}')
+        if (-not $m.Success) { throw "could not find the record in the state file" }
+        [IO.File]::WriteAllText($Bay.State, $t.Replace($m.Value, ('"ownIdentityEnrolled": ' + $JsonValue)), (New-Object Text.UTF8Encoding($false)))
+    }
+    $driftCases = @(
+        @{ side = "REFUSE"; label = "the record is an empty object";                  change = { param($b) Set-NsRecord $b '{}' } },
+        @{ side = "REFUSE"; label = "the record is a piece of text";                  change = { param($b) Set-NsRecord $b '"yes"' } },
+        @{ side = "REFUSE"; label = "the record is false";                            change = { param($b) Set-NsRecord $b 'false' } },
+        @{ side = "REFUSE"; label = "the record is 0";                                change = { param($b) Set-NsRecord $b '0' } },
+        @{ side = "REFUSE"; label = "the record is an empty list";                    change = { param($b) Set-NsRecord $b '[]' } },
+        @{ side = "REFUSE"; label = "the record's name is in another letter case";    change = { param($b) [IO.File]::WriteAllText($b.State, ([IO.File]::ReadAllText($b.State)).Replace('"ownIdentityEnrolled"', '"OWNIDENTITYENROLLED"'), (New-Object Text.UTF8Encoding($false))) } },
+        @{ side = "REFUSE"; label = "the record is all that is left of the state file"; change = { param($b) $o = [IO.File]::ReadAllText($b.State) | ConvertFrom-Json; [IO.File]::WriteAllText($b.State, ('{ "ownIdentityEnrolled": ' + ($o.ownIdentityEnrolled | ConvertTo-Json -Compress) + ' }'), (New-Object Text.UTF8Encoding($false))) } },
+        @{ side = "OPEN";   label = "the state file is deleted";                      change = { param($b) Remove-Item -LiteralPath $b.State -Force } },
+        @{ side = "OPEN";   label = "the state file is emptied (zero bytes)";         change = { param($b) [IO.File]::WriteAllBytes($b.State, (New-Object byte[] 0)) } },
+        @{ side = "OPEN";   label = "the record alone is removed from the state file"; change = { param($b) $o = [IO.File]::ReadAllText($b.State) | ConvertFrom-Json; $o.PSObject.Properties.Remove("ownIdentityEnrolled"); [IO.File]::WriteAllText($b.State, ($o | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false))) } },
+        @{ side = "OPEN";   label = "the record's value is JSON null";                change = { param($b) Set-NsRecord $b 'null' } },
+        @{ side = "OPEN";   label = "the state file is truncated (does not parse)";   change = { param($b) $t = [IO.File]::ReadAllText($b.State); [IO.File]::WriteAllText($b.State, $t.Substring(0, [int]($t.Length / 2)), (New-Object Text.UTF8Encoding($false))) }; says = "credential\.json is CORRUPT" },
+        @{ side = "OPEN";   label = "the state file cannot be read (held open by another program)"; change = { param($b) }; lock = $true; says = "credential\.json is present but UNREADABLE" },
+        @{ side = "REFUSE"; label = "the state file is a one-item list around the same object (PowerShell hands the item back)"; change = { param($b) [IO.File]::WriteAllText($b.State, ('[ ' + [IO.File]::ReadAllText($b.State) + ' ]'), (New-Object Text.UTF8Encoding($false))) } }
+    )
+    $driftIndex = 0
+    foreach ($dc in $driftCases) {
+        $driftIndex++
+        $db = New-NsEnrolledBay -Name ("d-" + $driftIndex) -ConfigClient "shared"
+        & $dc.change $db
+        Add-NsSealedSecret $db
+        $held = $null
+        if ($dc.ContainsKey("lock")) { $held = [IO.File]::Open($db.State, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None) }
+        $mark = Get-NsMark
+        try { $r = Invoke-NsAgent -Bay $db -Arguments "-Once" } finally { if ($null -ne $held) { $held.Dispose() } }
+        $q = @(Get-NsRequestsSince $mark)
+        $secretSent = @($q | Where-Object { $_.hasSecret }).Count
+        Write-Host ("        [{0}] {1}: exit={2} requests: {3}" -f $dc.side, $dc.label, $r.ExitCode, (Get-NsSummary $q)) -ForegroundColor DarkGray
+        if ($dc.side -eq "REFUSE") {
+            Assert-True (-not $r.TimedOut -and $secretSent -eq 0 -and @($q | Where-Object { $_.kind -eq "dataverse" }).Count -eq 0) ("REFUSE  " + $dc.label + ": no secret is sent and nothing reaches Dataverse")
+            Assert-True ($r.Log -match "IGNORED|Client secret refused") ("REFUSE  " + $dc.label + ": the log says the secret is ignored or refused")
+        } else {
+            Assert-True (-not $r.TimedOut -and $r.ExitCode -eq 0 -and @($q | Where-Object { $_.hasSecret -and $_.outcome -eq "issued-by-secret" -and $_.clientId -eq $NsShared }).Count -ge 1) ("OPEN    " + $dc.label + ": the agent signs in with the secret as the configured app, as a bay that was never enrolled would (the rule does not cover this case)")
+            if ($dc.ContainsKey("says")) {
+                $credD = Get-NsCredentialReport $q
+                Assert-True ($r.Log -match $dc.says -and (Get-NsProp $credD "stateFileCorrupt") -eq $true) ("OPEN    " + $dc.label + ": ...and it says so: an ERROR line in the log and stateFileCorrupt = true in its report")
+            }
+        }
+    }
+
+    Section "D2 (lifted, and said so) two cases no run of the script can reach: the record vanishes during a run, and the gate itself fails"
+    # A run with -Once signs in once, so "there at the start, gone later in the same run" needs the functions in this
+    # process. The gate, the one sender of a secret and what they call are lifted out of the script; the token endpoint
+    # and the reader of the secret are stand-ins that count their calls.
+    $liftD = @("Get-PropValue", "ConvertTo-AgentGuid", "Normalize-Thumbprint", "Read-CredentialState", "Get-ActiveClientId", "Get-ActiveCertThumbprint", "Test-OwnIdentityActive", "Get-TokenUrl", "Acquire-TokenWithSecret")
+    $dDefs = @{}
+    foreach ($d in $cFns) { $dDefs[$d.Name] = $d.Extent.Text }
+    $dMissing = @($liftD | Where-Object { -not $dDefs.ContainsKey($_) })
+    Assert-True ($dMissing.Count -eq 0) ("the functions this check needs exist in the script (missing: " + $(if ($dMissing.Count) { $dMissing -join ", " } else { "none" }) + ")")
+    if ($dMissing.Count -eq 0) {
+        foreach ($ln in $liftD) { . ([scriptblock]::Create($dDefs[$ln])) }
+        function Write-Log { param([string]$Message, [string]$Level = "INFO") }
+        $script:NsSecretReads = 0; $script:NsTokenPosts = 0
+        function Get-ClientSecret { $script:NsSecretReads++; return "stand-in" }
+        function Invoke-TokenEndpoint { param([string]$TokenUrl, [string]$FormBody) $script:NsTokenPosts++; return [pscustomobject]@{ access_token = "stand-in"; expires_in = 3599 } }
+        $liftRootD = Join-Path $SandboxRoot "lifted-latch"
+        New-Item -ItemType Directory -Force -Path (Join-Path $liftRootD "state") | Out-Null
+        $CredentialStatePath = Join-Path $liftRootD "state\credential.json"
+        $TenantId = $NsTenant; $ClientId = $NsShared; $OrgUrl = $MockUrl; $TokenAuthorityHost = $MockUrl; $CertThumbprintCfg = $null
+        $Global:CredentialStateCorrupt = $false
+        Remove-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ErrorAction SilentlyContinue
+        # control first: with no record the lifted sender does send (so a refusal below is the gate's doing)
+        $null = Acquire-TokenWithSecret
+        Assert-True ($script:NsSecretReads -eq 1 -and $script:NsTokenPosts -eq 1) "control: with no enrollment record the lifted sender reads the secret and posts it (once)"
+        [IO.File]::WriteAllText($CredentialStatePath, ('{ "activeClientId": "' + $NsOwnApp + '", "ownIdentityEnrolled": { "clientId": "' + $NsOwnApp + '" } }'), (New-Object Text.UTF8Encoding($false)))
+        Assert-True ((Test-OwnIdentityActive -EnrolledOnly) -eq $true) "the record is there: the gate answers enrolled"
+        Remove-Item -LiteralPath $CredentialStatePath -Force
+        Assert-True ((Test-OwnIdentityActive -EnrolledOnly) -eq $true) "the record is GONE later in the same run: the gate still answers enrolled (it was seen once by this process)"
+        $threwD = ""
+        try { $null = Acquire-TokenWithSecret } catch { $threwD = [string]$_.Exception.Message }
+        Assert-True ($threwD -match "Client secret refused" -and $script:NsSecretReads -eq 1 -and $script:NsTokenPosts -eq 1) "...and the sender refuses: the secret is not read again and nothing is posted"
+        # the gate itself fails: the read of the state throws something the reader does not catch
+        Remove-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ErrorAction SilentlyContinue
+        function Read-CredentialState { throw "stand-in: the state could not be read at all" }
+        $threwG = ""
+        try { $null = Acquire-TokenWithSecret } catch { $threwG = [string]$_.Exception.Message }
+        Assert-True ($threwG -match "the state could not be read at all" -and $script:NsSecretReads -eq 1 -and $script:NsTokenPosts -eq 1) "when the gate itself fails, the sender fails with it: no secret is read, nothing is posted (it is not read as 'not enrolled')"
+        Remove-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ErrorAction SilentlyContinue
+    }
 
     # ============================================================ controls: bays that are NOT enrolled keep 1.6.0's behavior
     Section "C2 control: a certificate on the SHARED app (plain -EnrollCert), not registered, with the secret: it falls back to the secret (unchanged)"

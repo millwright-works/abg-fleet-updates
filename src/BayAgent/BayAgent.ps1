@@ -731,14 +731,39 @@ function Test-OwnIdentityActive {
     # as the CONFIGURED app with whatever secret it finds. So the gate is the record's existence, and the action it
     # gates (Acquire-TokenWithSecret) is every use of a client secret there is. A bay moved to its own app by the
     # remote ladder has no such record and answers false: it keeps its secret to go back to, exactly as before.
+    #
+    # WHAT THE GATE DOES WHEN ITS ONE PIECE OF STATE IS NOT WHAT IT SHOULD BE (each case is pinned by a test):
+    #   - the record is there with ANY value but JSON null (an object, an empty object, text, false, 0, an empty
+    #     list; any letter case of its name): ENROLLED. The gate tests that the record exists, never what it says.
+    #   - the record was seen once by this process and is gone later in the same run: still ENROLLED (the latch
+    #     below). A running agent does not forget that its bay is enrolled because a file changed under it.
+    #   - reading it throws: the error is NOT caught where a secret would be used, so no secret is read or sent.
+    #   - the state file is absent or empty, the record is not in it, or its value is JSON null: NOT enrolled. This
+    #     cannot be told apart from a bay that never was enrolled, and such a bay must keep working.
+    #   - the state file is present but cannot be read or does not parse (truncated, locked, another account's
+    #     rights): NOT enrolled, and the agent says so (credential.json is CORRUPT / UNREADABLE at ERROR;
+    #     stateFileCorrupt in the heartbeat). That is a CHOICE, not an oversight: the other choice (refuse a secret
+    #     whenever the state file cannot be read) would stop a bay that runs on the shared secret today the moment
+    #     its state file is damaged. Which of the two is wanted is not decided in this file.
     param([switch]$EnrolledOnly)
-    $active = Get-ActiveClientId
     # ownIdentityEnrolled is written only by Invoke-OwnIdentityEnroll, in the same write as the certificate it goes
     # with. Read here, in this function, so every caller that already has Test-OwnIdentityActive has the whole rule.
-    $enrolledRec = Get-PropValue (Read-CredentialState) "ownIdentityEnrolled" $null
-    if ($EnrolledOnly) { return ($null -ne $enrolledRec) }
+    $enrolledRec = $null
+    $recordPresent = $false
+    $stateNow = Read-CredentialState
+    if (($null -ne $stateNow) -and ($stateNow -isnot [array])) {
+        foreach ($stateProp in $stateNow.PSObject.Properties) {
+            if ($stateProp.Name -ieq "ownIdentityEnrolled") { $enrolledRec = $stateProp.Value; $recordPresent = ($null -ne $stateProp.Value) }
+        }
+    }
+    if ($recordPresent) { $Global:OwnIdentityEnrolledSeen = $true }
+    if ($EnrolledOnly) {
+        # Read with Get-Variable: the latch may not exist yet, and an unset variable is an error under strict mode.
+        return ($recordPresent -or ((Get-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ValueOnly -ErrorAction SilentlyContinue) -eq $true))
+    }
+    $active = Get-ActiveClientId
     $enrolledHere = $false
-    if ($active -and ($null -ne $enrolledRec)) {
+    if ($active -and $recordPresent) {
         $enrolledHere = ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq $active)
     }
     $tp = Get-ActiveCertThumbprint
@@ -948,8 +973,8 @@ function Acquire-TokenWithSecret {
     # identity at the console never signs in with a client secret: not when its certificate fails, not when a secret
     # file appears on it later, not when a command asks for a secret test. The refusal comes before the secret is
     # read, so nothing of it is in memory. Any other bay is unchanged.
-    $enrolledOwn = $false
-    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+    # The gate is NOT wrapped in try/catch: if it cannot answer, this function fails here and no secret is read or sent.
+    $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly)
     if ($enrolledOwn) {
         throw "Client secret refused: this bay is enrolled on its own certificate identity and never signs in with a client secret. Fix the certificate; do not add a secret."
     }
@@ -982,8 +1007,7 @@ function Acquire-Token {
             # A0.458: on probation, a certificate that cannot sign in as the bay's own app counts toward going back.
             Register-IdentityProbationFailure ("mint: " + $_.Exception.Message)
             # A bay enrolled on its own identity has no fallback: the certificate's failure is the failure.
-            $enrolledOwn = $false
-            try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+            $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly)
             if ($HasSecretCredential -and -not $enrolledOwn) {
                 $Global:CredentialTelemetry.fallbackCount++
                 $Global:CredentialTelemetry.lastFallbackUtc = $nowStr
@@ -1176,8 +1200,7 @@ function Write-CredentialStartupSummary {
 
     # A0.529: a bay enrolled on its own identity never uses a client secret. One found on it is said out loud, once per
     # start, and is not a fallback. (Acquire-TokenWithSecret is what refuses it; this is what tells a person.)
-    $enrolledOwn = $false
-    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+    $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly)
     $secretIgnored = $false
     if ($enrolledOwn -and $fallbackLabel -ne "none") {
         $secretIgnored = $true

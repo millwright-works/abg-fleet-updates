@@ -39,15 +39,25 @@ $mutants = @(
     (New-SeMutant "P03" "an enrolled bay whose certificate is missing 'runs on the client secret until it is found'" @(
         (New-SeEdit '        } elseif ($script:HasSecretCredential -and -not $enrolledOwn) {' '        } elseif ($script:HasSecretCredential) {'))),
     (New-SeMutant "P04" "no bay is ever seen as enrolled (the rule is off)" @(
-        (New-SeEdit '    if ($EnrolledOnly) { return ($null -ne $enrolledRec) }' '    if ($EnrolledOnly) { return $false }'))),
+        (New-SeEdit '        return ($recordPresent -or ((Get-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ValueOnly -ErrorAction SilentlyContinue) -eq $true))' '        return $false'))),
     (New-SeMutant "P05" "every bay is seen as enrolled (a bay on the shared secret goes dark)" @(
-        (New-SeEdit '    if ($EnrolledOnly) { return ($null -ne $enrolledRec) }' '    if ($EnrolledOnly) { return $true }'))),
+        (New-SeEdit '        return ($recordPresent -or ((Get-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ValueOnly -ErrorAction SilentlyContinue) -eq $true))' '        return $true'))),
     (New-SeMutant "P06" "a bay moved to its own app by the remote ladder loses its secret to go back to" @(
-        (New-SeEdit '    if ($EnrolledOnly) { return ($null -ne $enrolledRec) }' '    if ($EnrolledOnly) { return (($null -ne $enrolledRec) -or ($active -and ($active -ne (ConvertTo-AgentGuid $ClientId)))) }'))),
+        (New-SeEdit '        return ($recordPresent -or ((Get-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ValueOnly -ErrorAction SilentlyContinue) -eq $true))' '        return ($recordPresent -or ((Get-ActiveClientId) -and ((Get-ActiveClientId) -ne (ConvertTo-AgentGuid $ClientId))))'))),
     (New-SeMutant "P12" "the gate compares the record with the app in force again (it lapses when they disagree)" @(
-        (New-SeEdit '    if ($EnrolledOnly) { return ($null -ne $enrolledRec) }' '    if ($EnrolledOnly) { return (($null -ne $enrolledRec) -and ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq $active)) }'))),
+        (New-SeEdit '        return ($recordPresent -or ((Get-Variable -Name OwnIdentityEnrolledSeen -Scope Global -ValueOnly -ErrorAction SilentlyContinue) -eq $true))' '        return ($recordPresent -and ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq (Get-ActiveClientId)))'))),
+    (New-SeMutant "P14" "the gate tests what the record says, not that it exists (false, 0, an empty list read as 'not enrolled')" @(
+        (New-SeEdit '$recordPresent = ($null -ne $stateProp.Value) }' '$recordPresent = [bool]$stateProp.Value }'))),
+    (New-SeMutant "P15" "the record's name must match letter for letter" @(
+        (New-SeEdit 'if ($stateProp.Name -ieq "ownIdentityEnrolled") {' 'if ($stateProp.Name -ceq "ownIdentityEnrolled") {'))),
+    (New-SeMutant "P16" "a running agent forgets it is enrolled when the record vanishes" @(
+        (New-SeEdit '    if ($recordPresent) { $Global:OwnIdentityEnrolledSeen = $true }' '    if ($false) { $Global:OwnIdentityEnrolledSeen = $true }'))),
+    (New-SeMutant "P17" "a gate that cannot answer reads as 'not enrolled' where the secret is sent" @(
+        (New-SeEdit ('    $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly)' + $nl + '    if ($enrolledOwn) {' + $nl + '        throw "Client secret refused') ('    $enrolledOwn = $false; try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }' + $nl + '    if ($enrolledOwn) {' + $nl + '        throw "Client secret refused')))),
+    (New-SeMutant "P18" "a state file that cannot be read is treated as enrolled (a bay on the shared secret with a damaged state file goes dark): the OTHER choice, planted to show the suite pins the one made" @(
+        (New-SeEdit '    if ($recordPresent) { $Global:OwnIdentityEnrolledSeen = $true }' '    if ($Global:CredentialStateCorrupt) { $recordPresent = $true }; if ($recordPresent) { $Global:OwnIdentityEnrolledSeen = $true }'))),
     (New-SeMutant "P13" "the secret is read before the refusal" @(
-        (New-SeEdit ('    $enrolledOwn = $false' + $nl + '    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }' + $nl + '    if ($enrolledOwn) {' + $nl + '        throw "Client secret refused') ('    $clientSecretEarly = Get-ClientSecret' + $nl + '    $enrolledOwn = $false' + $nl + '    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }' + $nl + '    if ($enrolledOwn) {' + $nl + '        throw "Client secret refused')))),
+        (New-SeEdit ('    $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly)' + $nl + '    if ($enrolledOwn) {' + $nl + '        throw "Client secret refused') ('    $clientSecretEarly = Get-ClientSecret' + $nl + '    $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly)' + $nl + '    if ($enrolledOwn) {' + $nl + '        throw "Client secret refused')))),
     (New-SeMutant "P07" "the report does not say the bay is enrolled" @(
         (New-SeEdit '        $identity["enrolledOwn"] = $true' '        $null = $true'))),
     (New-SeMutant "P08" "the report says no secret is being ignored when one is" @(
