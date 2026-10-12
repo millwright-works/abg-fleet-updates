@@ -344,7 +344,8 @@ try {
     Assert-True ($planCallsS.Count -eq 1 -and $planCallsS[0].Extent.Text -match '-Given \$PSBoundParameters\.ContainsKey\("BayAppId"\) -Value \$BayAppId ') "Get-BayAppIdPlan is called once, with -Given bound to `$PSBoundParameters.ContainsKey(`"BayAppId`") (only a typed value counts)"
     $cfgClient = @($sAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$day0Args["ConfigClientId"]' }, $true))
     $rights = @($cfgClient | ForEach-Object { $_.Right.Extent.Text.Trim() } | Sort-Object)
-    Assert-True ($cfgClient.Count -eq 2 -and ($rights -join " | ") -eq '$ClientId | [string]$bayAppPlan.configClientId') ("the configuration's clientId is assigned in exactly two places: the typed -ClientId and the plan's configClientId (found: " + ($rights -join " | ") + ")")
+    # Compared as a set: the two hosts sort text that starts with '$' and '[' in different orders.
+    Assert-True ($cfgClient.Count -eq 2 -and ($rights -contains '$ClientId') -and ($rights -contains '[string]$bayAppPlan.configClientId')) ("the configuration's clientId is assigned in exactly two places: the typed -ClientId and the plan's configClientId (found: " + ($rights -join " | ") + ")")
     $uses = @([regex]::Matches([IO.File]::ReadAllText($SetupScript), '\$BayAppId\b') | ForEach-Object { $_.Index })
     Assert-True ($uses.Count -eq 2) ("`$BayAppId itself is read in one place besides its declaration, the call to Get-BayAppIdPlan (occurrences in code and comments: " + $uses.Count + ")")
 
