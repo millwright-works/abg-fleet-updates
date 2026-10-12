@@ -429,6 +429,54 @@ try {
     Assert-True ($r.Log -match "Client secret refused: this bay is enrolled on its own certificate identity") "the one place a secret is sent refuses it, and says why"
     Assert-True ($r.Log -match "Auth mode: NONE" -and $r.Log -notmatch "Auth mode: SECRET") "start-up does not announce the secret as this bay's credential"
 
+    # ============================================================ N6, N7: the record and what is in force disagree
+    # An automated review of this change raised the class "the gate reads one field, the action reads another". The
+    # gate here is the enrollment record; the action is a sign-in with the secret as the CONFIGURED app. These two
+    # scenarios make everything else disagree with the record and show the gate still holds.
+    Section "N6 enrolled, then a later identity switch puts ANOTHER app in force (the record stays), and a secret is on the bay"
+    $n6 = New-NsEnrolledBay -Name "n6-switched" -ConfigClient "shared"
+    $s6 = [IO.File]::ReadAllText($n6.State) | ConvertFrom-Json
+    $s6.activeClientId = $NsOtherApp      # what a later CredentialRotate action=activate with another app records
+    [IO.File]::WriteAllText($n6.State, ($s6 | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    Add-NsSealedSecret $n6
+    $mark = Get-NsMark
+    $r = Invoke-NsAgent -Bay $n6 -Arguments "-Once"
+    $q = @(Get-NsRequestsSince $mark); Show-NsRun $r "N6"; Write-Host ("            requests: " + (Get-NsSummary $q)) -ForegroundColor DarkGray
+    Assert-True (-not $r.TimedOut -and @($q | Where-Object { $_.hasSecret }).Count -eq 0 -and @($q | Where-Object { $_.kind -eq "dataverse" }).Count -eq 0) "no secret is sent although the app in force is no longer the enrolled one; nothing reaches Dataverse"
+    Assert-True (@($q | Where-Object { $_.kind -eq "token" -and $_.clientId -eq $NsOtherApp -and -not $_.hasSecret }).Count -ge 1) "the only sign-in tried is the certificate, as the app in force"
+    Assert-True ($r.Log -match "IGNORED" -and $r.Log -notmatch "falling back to the client secret") "the secret is named as ignored; no fallback"
+
+    Section "N7 enrolled, then the state file loses its activeClientId (the configuration names the shared app), and a secret is on the bay"
+    $n7 = New-NsEnrolledBay -Name "n7-lost-field" -ConfigClient "shared"
+    $s7 = [IO.File]::ReadAllText($n7.State) | ConvertFrom-Json
+    $s7.PSObject.Properties.Remove("activeClientId")
+    [IO.File]::WriteAllText($n7.State, ($s7 | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    Add-NsSealedSecret $n7
+    $mark = Get-NsMark
+    $r = Invoke-NsAgent -Bay $n7 -Arguments "-Once"
+    $q = @(Get-NsRequestsSince $mark); Show-NsRun $r "N7"; Write-Host ("            requests: " + (Get-NsSummary $q)) -ForegroundColor DarkGray
+    Assert-True (-not $r.TimedOut -and @($q | Where-Object { $_.hasSecret }).Count -eq 0 -and @($q | Where-Object { $_.kind -eq "dataverse" }).Count -eq 0) "no secret is sent although the app in force now reads as the shared one; nothing reaches Dataverse"
+    $cred7 = Get-NsCredentialReport $q
+    Assert-True ($null -eq $cred7) "and it writes no report at all (it cannot sign in), so it cannot report its own identity while being another app"
+
+    Section "N8 census on the real text: one sender of a client secret, and the refusal stands in front of it"
+    $ctk = $null; $cer = $null
+    $cAst = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$ctk, [ref]$cer)
+    $cFns = @($cAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+    $senders = @($cFns | Where-Object { $_.Extent.Text -match 'client_secret=' } | ForEach-Object { $_.Name })
+    Assert-True (($senders -join ",") -eq "Acquire-TokenWithSecret" -and [regex]::Matches([IO.File]::ReadAllText($AgentScript), 'client_secret=').Count -eq 1) ("exactly one place in the script builds a request with client_secret, in Acquire-TokenWithSecret (found: " + ($senders -join ", ") + ")")
+    $readers = @($cAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Get-ClientSecret" }, $true))
+    $senderFn = @($cFns | Where-Object { $_.Name -eq "Acquire-TokenWithSecret" })
+    $readerInside = ($readers.Count -eq 1 -and $senderFn.Count -eq 1 -and $readers[0].Extent.StartOffset -gt $senderFn[0].Extent.StartOffset -and $readers[0].Extent.EndOffset -lt $senderFn[0].Extent.EndOffset)
+    Assert-True $readerInside ("the secret is read in exactly one place, inside that function (calls of Get-ClientSecret: " + $readers.Count + ")")
+    if ($senderFn.Count -eq 1) {
+        $throws = @($senderFn[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] -and $n.Extent.Text -match 'Client secret refused' }, $true))
+        $gate = @($senderFn[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Test-OwnIdentityActive" -and $n.Extent.Text -match '-EnrolledOnly' }, $true))
+        Assert-True ($throws.Count -eq 1 -and $gate.Count -eq 1 -and $readers.Count -eq 1 -and $gate[0].Extent.StartOffset -lt $throws[0].Extent.StartOffset -and $throws[0].Extent.EndOffset -lt $readers[0].Extent.StartOffset) "inside it: the enrollment gate, then the refusal, and only then the read of the secret"
+    } else { Assert-True $false "Acquire-TokenWithSecret was not found exactly once" }
+    $gateFn = @($cFns | Where-Object { $_.Name -eq "Test-OwnIdentityActive" })
+    Assert-True ($gateFn.Count -eq 1 -and $gateFn[0].Extent.Text -match '(?m)^\s*if \(\$EnrolledOnly\) \{ return \(\$null -ne \$enrolledRec\) \}\s*$') "the gate's answer is the existence of the enrollment record and nothing else (it does not compare it with the app in force, the certificate or the configuration)"
+
     # ============================================================ controls: bays that are NOT enrolled keep 1.6.0's behavior
     Section "C2 control: a certificate on the SHARED app (plain -EnrollCert), not registered, with the secret: it falls back to the secret (unchanged)"
     $c2 = New-NsPlainCertBay -Name "c2-plain-cert"

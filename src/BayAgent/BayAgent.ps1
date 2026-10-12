@@ -723,21 +723,24 @@ function Test-OwnIdentityActive {
     #     had its own app may name that same app in agent-config.json (there is no shared app to name), and
     #     "different from the configured one" would then never be true: the wall pass would never be fetched.
     #
-    # -EnrolledOnly asks the narrower question the secret rule needs (A0.529): was this bay ENROLLED on its own app at
-    # the console (ownIdentityEnrolled on record), and is that app the one in force? It does not ask whether a
-    # certificate is active: a bay enrolled this way must not reach for a client secret even when its certificate is
-    # missing. A bay moved to its own app by the remote ladder has no such record and answers false: it keeps its
-    # secret to go back to, exactly as before, until it is retired.
+    # -EnrolledOnly asks the one question the secret rule needs (A0.529): was this bay ENROLLED on its own identity at
+    # the console? It reads ONE thing, the ownIdentityEnrolled record, and nothing else: not which app is in force,
+    # not which certificate is active, not what agent-config.json names. Those can each change or be damaged after
+    # the enrollment (a later identity switch, a state file that lost a field, an edited configuration), and a rule
+    # that compared the record with any of them would lapse exactly then, while the code that sends a secret signs in
+    # as the CONFIGURED app with whatever secret it finds. So the gate is the record's existence, and the action it
+    # gates (Acquire-TokenWithSecret) is every use of a client secret there is. A bay moved to its own app by the
+    # remote ladder has no such record and answers false: it keeps its secret to go back to, exactly as before.
     param([switch]$EnrolledOnly)
     $active = Get-ActiveClientId
     # ownIdentityEnrolled is written only by Invoke-OwnIdentityEnroll, in the same write as the certificate it goes
     # with. Read here, in this function, so every caller that already has Test-OwnIdentityActive has the whole rule.
     $enrolledRec = Get-PropValue (Read-CredentialState) "ownIdentityEnrolled" $null
+    if ($EnrolledOnly) { return ($null -ne $enrolledRec) }
     $enrolledHere = $false
     if ($active -and ($null -ne $enrolledRec)) {
         $enrolledHere = ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq $active)
     }
-    if ($EnrolledOnly) { return $enrolledHere }
     $tp = Get-ActiveCertThumbprint
     if (-not $tp) { return $false }
     if ($active -ne (ConvertTo-AgentGuid $ClientId)) { return $true }
