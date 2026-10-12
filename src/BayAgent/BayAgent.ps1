@@ -722,16 +722,26 @@ function Test-OwnIdentityActive {
     #   - the app in force is the one this bay was enrolled on as its own from its first day. A bay that has only ever
     #     had its own app may name that same app in agent-config.json (there is no shared app to name), and
     #     "different from the configured one" would then never be true: the wall pass would never be fetched.
-    $tp = Get-ActiveCertThumbprint
-    if (-not $tp) { return $false }
+    #
+    # -EnrolledOnly asks the narrower question the secret rule needs (A0.529): was this bay ENROLLED on its own app at
+    # the console (ownIdentityEnrolled on record), and is that app the one in force? It does not ask whether a
+    # certificate is active: a bay enrolled this way must not reach for a client secret even when its certificate is
+    # missing. A bay moved to its own app by the remote ladder has no such record and answers false: it keeps its
+    # secret to go back to, exactly as before, until it is retired.
+    param([switch]$EnrolledOnly)
     $active = Get-ActiveClientId
-    if ($active -ne (ConvertTo-AgentGuid $ClientId)) { return $true }
-    if (-not $active) { return $false }
     # ownIdentityEnrolled is written only by Invoke-OwnIdentityEnroll, in the same write as the certificate it goes
     # with. Read here, in this function, so every caller that already has Test-OwnIdentityActive has the whole rule.
     $enrolledRec = Get-PropValue (Read-CredentialState) "ownIdentityEnrolled" $null
-    if ($null -eq $enrolledRec) { return $false }
-    return ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq $active)
+    $enrolledHere = $false
+    if ($active -and ($null -ne $enrolledRec)) {
+        $enrolledHere = ((ConvertTo-AgentGuid ([string](Get-PropValue $enrolledRec "clientId" ""))) -eq $active)
+    }
+    if ($EnrolledOnly) { return $enrolledHere }
+    $tp = Get-ActiveCertThumbprint
+    if (-not $tp) { return $false }
+    if ($active -ne (ConvertTo-AgentGuid $ClientId)) { return $true }
+    return $enrolledHere
 }
 
 function Get-IdentityProbation {
@@ -931,6 +941,15 @@ function Acquire-TokenWithCertificate {
 }
 
 function Acquire-TokenWithSecret {
+    # THE ONE PLACE A CLIENT SECRET IS SENT, AND SO THE ONE PLACE IT IS REFUSED (A0.529). A bay enrolled on its own
+    # identity at the console never signs in with a client secret: not when its certificate fails, not when a secret
+    # file appears on it later, not when a command asks for a secret test. The refusal comes before the secret is
+    # read, so nothing of it is in memory. Any other bay is unchanged.
+    $enrolledOwn = $false
+    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+    if ($enrolledOwn) {
+        throw "Client secret refused: this bay is enrolled on its own certificate identity and never signs in with a client secret. Fix the certificate; do not add a secret."
+    }
     $clientSecret = Get-ClientSecret
     $body = @(
         "client_id=$([uri]::EscapeDataString($ClientId))"
@@ -959,7 +978,10 @@ function Acquire-Token {
             $Global:CredentialTelemetry.lastCertError = $_.Exception.Message
             # A0.458: on probation, a certificate that cannot sign in as the bay's own app counts toward going back.
             Register-IdentityProbationFailure ("mint: " + $_.Exception.Message)
-            if ($HasSecretCredential) {
+            # A bay enrolled on its own identity has no fallback: the certificate's failure is the failure.
+            $enrolledOwn = $false
+            try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+            if ($HasSecretCredential -and -not $enrolledOwn) {
                 $Global:CredentialTelemetry.fallbackCount++
                 $Global:CredentialTelemetry.lastFallbackUtc = $nowStr
                 Write-Log ("Certificate credential {0} failed ({1}); falling back to the client secret" -f $activeTp, $_.Exception.Message) "WARN"
@@ -1078,6 +1100,16 @@ function Get-CredentialTelemetry {
         reverted             = (Get-PropValue $idState "identityReverted" $null)
     }
 
+    # A0.529: on a bay enrolled on its own identity, say whether a client secret sits on it (it is never used). The
+    # field exists only on such a bay, so every other bay's report is what it was.
+    $enrolledOwn = $false
+    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+    if ($enrolledOwn) {
+        $identity["enrolledOwn"] = $true
+        # A secret file that appeared after this process started is seen here too (the path the configuration names).
+        $identity["secretIgnored"] = [bool](($secretMode -ne "none") -or ($SecretPathCfg -and (Test-Path -LiteralPath $SecretPathCfg)))
+    }
+
     $t = $Global:CredentialTelemetry
     return [ordered]@{
         schema                 = 2
@@ -1139,6 +1171,17 @@ function Write-CredentialStartupSummary {
     $fallbackLabel = "none"
     if ($script:SecretPath) { $fallbackLabel = "dpapi" } elseif ($script:Secret) { $fallbackLabel = "plaintext" }
 
+    # A0.529: a bay enrolled on its own identity never uses a client secret. One found on it is said out loud, once per
+    # start, and is not a fallback. (Acquire-TokenWithSecret is what refuses it; this is what tells a person.)
+    $enrolledOwn = $false
+    try { $enrolledOwn = [bool](Test-OwnIdentityActive -EnrolledOnly) } catch { $enrolledOwn = $false }
+    $secretIgnored = $false
+    if ($enrolledOwn -and $fallbackLabel -ne "none") {
+        $secretIgnored = $true
+        Write-Log ("[IDENTITY] a client secret is present on this bay ({0}) and is IGNORED: the bay is enrolled on its own identity and never signs in with a secret. Find out how it got here and remove it." -f $(if ($fallbackLabel -eq "dpapi") { "sealed file " + $script:SecretPath } else { "plaintext clientSecret in agent-config.json" })) "WARN"
+        $fallbackLabel = "ignored"
+    }
+
     if ($activeTp) {
         if ($cert) {
             Write-Log ("Auth mode: CERTIFICATE thumbprint={0} store={1} notAfter={2} fallbackSecret={3}" -f $activeTp, (Get-CertStoreName $cert), $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $fallbackLabel) "INFO"
@@ -1146,11 +1189,17 @@ function Write-CredentialStartupSummary {
             try {
                 if (Test-OwnIdentityActive) { Write-Log ("[IDENTITY] signing in as this bay's own app {0}" -f (Get-ActiveClientId)) "INFO" }
             } catch { }
-        } elseif ($script:HasSecretCredential) {
+        } elseif ($script:HasSecretCredential -and -not $enrolledOwn) {
             Write-Log ("Auth mode: CERTIFICATE thumbprint={0} is configured but NOT FOUND in {1}; running on the client secret ({2}) until it is" -f $activeTp, ((Get-CertStoreSearchOrder) -join ", "), $fallbackLabel) "WARN"
+        } elseif ($enrolledOwn) {
+            throw "Certificate $activeTp is on record for this bay's own identity but no certificate with a private key was found in $((Get-CertStoreSearchOrder) -join ', ') for this Windows account. This bay never signs in with a client secret$(if ($secretIgnored) { ' (the one found on it is ignored)' } else { '' }): enroll it again at the console (BayAgent.ps1 -EnrollCert -EnrollClientId <its app id> -EnrollForce)."
         } else {
             throw "Certificate $activeTp is configured but no certificate with a private key was found in $((Get-CertStoreSearchOrder) -join ', '), and no secret fallback is configured"
         }
+    } elseif ($enrolledOwn) {
+        # The record of the bay's own identity is there, the certificate it names is not (a damaged state file). The
+        # secret found beside it is not a credential for this bay: say what will happen instead of "Auth mode: SECRET".
+        Write-Log "Auth mode: NONE. This bay's own identity is on record without a certificate, and it never signs in with a client secret: it stays dark until it is enrolled again at the console (BayAgent.ps1 -EnrollCert -EnrollClientId <its app id> -EnrollForce)." "ERROR"
     } else {
         if ($script:SecretPath) { Write-Log ("Auth mode: SECRET (DPAPI path={0}); no certificate enrolled yet - send CredentialRotate action=enroll" -f $script:SecretPath) "INFO" }
         elseif ($script:Secret) { Write-Log "Auth mode: SECRET (PLAINTEXT clientSecret in agent-config.json - DEPRECATED)" "WARN" }
