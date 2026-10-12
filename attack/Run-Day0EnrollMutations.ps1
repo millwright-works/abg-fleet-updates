@@ -82,7 +82,13 @@ $mutants = @(
     (New-D0Mutant "G10" "an environmentUrl that is not an address is enrolled (the attack's survivor)" @(
         (New-D0Edit "if ([string]`$OrgUrl -notmatch '^https?://[A-Za-z0-9.-]+(:\d+)?`$') { `$unfilled += `"environmentUrl`" }" "if (`$false) { `$unfilled += `"environmentUrl`" }"))),
     (New-D0Mutant "G04" "a PC that holds a client secret is enrolled (A0.529)" @(
-        (New-D0Edit '    if (Test-HasUsableSecret) {' '    if ($false) {'))),
+        (New-D0Edit '    if ($secretOnPc) {' '    if ($false) {'))),
+    (New-D0Mutant "G11" "the secret guard reads only what a sign-in would use now: a plaintext secret beside a secret-file path is not seen" @(
+        (New-D0Edit 'if (($cfg.PSObject.Properties.Name -contains "clientSecret") -and (-not [string]::IsNullOrWhiteSpace([string]$cfg.clientSecret))) {' 'if ($false) {'))),
+    (New-D0Mutant "G12" "the secret guard reads only the configured path: a sealed file at the standard place is not seen" @(
+        (New-D0Edit '        if (Test-Path -LiteralPath $standardPlace -PathType Leaf) {' '        if ($false) {'))),
+    (New-D0Mutant "G13" "the secret guard no longer reads what a sign-in would use now" @(
+        (New-D0Edit 'try { if (Test-HasUsableSecret) { $found +=' 'try { if ($false) { $found +='))),
     (New-D0Mutant "G05" "a corrupt state file is not a refusal" @(
         (New-D0Edit ('        if ($Global:CredentialStateCorrupt) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT"') ('        if ($false) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT"')))),
     (New-D0Mutant "G06" "an identity switch on probation is not a refusal" @(

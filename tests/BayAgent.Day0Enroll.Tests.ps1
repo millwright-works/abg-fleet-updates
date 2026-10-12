@@ -271,6 +271,7 @@ function New-D0Bay {
         [switch]$LeaveTenantPlaceholder,
         [string]$EnvironmentUrlAs = "",
         [string]$PlaintextSecret = "",
+        [switch]$KeepSecretPathBesidePlaintext,
         [string]$CertThumbprintCfg = "",
         [string]$SeedStateJson = ""
     )
@@ -304,7 +305,12 @@ function New-D0Bay {
     # The test seam the agent documents: where the token endpoint is.
     $cfg | Add-Member -NotePropertyName tokenAuthorityHost -NotePropertyValue $MockUrl
     $cfg.logLevel = "DEBUG"
-    if ($PlaintextSecret) { $cfg | Add-Member -NotePropertyName clientSecret -NotePropertyValue $PlaintextSecret; $cfg.PSObject.Properties.Remove("clientSecretDpapiPath") }
+    if ($PlaintextSecret) {
+        $cfg | Add-Member -NotePropertyName clientSecret -NotePropertyValue $PlaintextSecret
+        # With -KeepSecretPathBesidePlaintext the configuration carries BOTH keys: the agent's start-up then loads only
+        # the path, so the plaintext secret is in the file but is not what a sign-in would use.
+        if (-not $KeepSecretPathBesidePlaintext -and $cfg.PSObject.Properties["clientSecretDpapiPath"]) { $cfg.PSObject.Properties.Remove("clientSecretDpapiPath") }
+    }
     # With a byte-order mark, as Day0 writes it (Set-Content -Encoding UTF8 under Windows PowerShell 5.1).
     [IO.File]::WriteAllText((Join-Path $root "agent-config.json"), ($cfg | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($true)))
     if ($SeedStateJson) {
@@ -544,6 +550,22 @@ try {
     Assert-True ((Get-D0InstallFingerprint $b2p.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[plaintext secret present] nothing was changed, nothing was sent"
     Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[plaintext secret present] the secret's text is not on the console or in the log"
 
+    # An automated review raised the class "the gate reads one field, the action another". Here the gate must read
+    # the PLACES a secret can be, not only what a sign-in would use now. Two secrets a sign-in would NOT use now:
+    $b2x = New-D0Bay -Name "refusal-plaintext-shadowed" -PlaintextSecret $secretMarker -KeepSecretPathBesidePlaintext
+    $before = Get-D0InstallFingerprint $b2x.Root; $mark = Get-D0Mark
+    $r = Invoke-D0Agent -Bay $b2x -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+    Show-D0Run $r "S2 plaintext secret beside a secret-file path"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[a clientSecret in the configuration beside a secret-file path, no file] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ((Get-D0InstallFingerprint $b2x.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0 -and -not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[...beside a secret-file path] nothing was changed, nothing was sent, the secret's text is nowhere"
+    $b2y = New-D0Bay -Name "refusal-sealed-unnamed" -Shape "own"
+    [IO.File]::WriteAllBytes((Join-Path $b2y.Root "secrets\clientsecret.dpapi"), $sealed)
+    $before = Get-D0InstallFingerprint $b2y.Root; $mark = Get-D0Mark
+    $r = Invoke-D0Agent -Bay $b2y -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+    Show-D0Run $r "S2 sealed secret file the configuration does not name"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[a sealed secret file at the standard place, named by no configuration key] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ((Get-D0InstallFingerprint $b2y.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[...named by no configuration key] nothing was changed, nothing was sent"
+
     # A PC that already holds something is not a new bay: each of these is refused, with or without -EnrollForce, and
     # the state file is left byte for byte as it was.
     $notBlank = @(
@@ -774,7 +796,7 @@ try {
     # function and what it calls are lifted out of the script and run in this process, with ONE stand-in:
     # Update-CredentialState writes a changed state file and THEN fails. An independent attack planted "the earlier
     # enrollment is not put back" and the suite passed; this is the assertion that was missing.
-    $liftNames = @("Get-PropValue", "Normalize-Thumbprint", "ConvertTo-AgentGuid", "Read-CredentialState", "Get-ActiveCertThumbprint", "Get-PendingCertThumbprint",
+    $liftNames = @("Get-OwnIdentitySecretOnPc", "Get-PropValue", "Normalize-Thumbprint", "ConvertTo-AgentGuid", "Read-CredentialState", "Get-ActiveCertThumbprint", "Get-PendingCertThumbprint",
         "Get-ActiveClientId", "Test-OwnIdentityActive", "Get-IdentityProbation", "Test-HasUsableSecret", "Get-CertStoreSearchOrder", "Get-CertStoreName",
         "Find-ClientCertificate", "New-BayClientCertificate", "Export-PublicCertificate", "Build-CredentialEnrollResult", "Get-AadstsCode",
         "Get-OwnIdentitySignInProof", "Remove-OwnIdentityCertificate", "New-OwnIdentityEnrollRefusal", "Invoke-OwnIdentityEnroll")
