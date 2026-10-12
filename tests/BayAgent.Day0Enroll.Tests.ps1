@@ -27,6 +27,16 @@ HOW, AND WHY IT IS BUILT THIS WAY
   The certificate store is REAL (CurrentUser\My): keys are made and removed there. Every certificate this suite makes
   carries a subject unique to this run, and exactly those are removed at the end.
 
+THE SECRET GUARD (A0.529) AND "COULD NOT LOOK" (the re-check of 2026-10-12, RF-1)
+  S2/S2b/S2e pin the guard that refuses a PC holding a client secret: each of its three places (a sealed file the
+  configuration names, a clientSecret key, the sealed file at the standard place even when another path is named); that
+  -EnrollForce does not pass it; that it is asked of a bay that already has an enrollment; and that a place this account
+  cannot LOOK AT (a sealed file with the rights the product's own secret tool leaves: SYSTEM and Administrators only; a
+  path with an illegal character) is a refusal that names the place (ABG_OWNID_SECRET_UNREADABLE), never "nothing there".
+  The unreadable file is built with icacls, not a mocked throw. This suite must be started so the child has a Cert: drive
+  (call powershell.exe directly; a Start-Process child of pwsh 7 inherits pwsh's module path and has none): the
+  certificate helpers fail loudly instead of reading an unreadable store as "no certificates".
+
 WHAT IT DOES NOT PROVE (a real blank PC and a person's sign-in)
   Entra itself, the directory write that registers the certificate, the command guard, Dataverse's own answers, the
   AllSigned script policy (a rewritten copy cannot carry the bay's signature), Smart App Control, the BayKiosk
@@ -89,7 +99,10 @@ function Get-D0Sha256Hex([byte[]]$Bytes) {
 
 function Get-D0RunCerts {
     # Every certificate in CurrentUser\My whose subject is this run's. Thumbprints, sorted.
-    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\My" -ErrorAction SilentlyContinue |
+    # It FAILS when the store cannot be read (-ErrorAction Stop): "could not look" must never read as "none made". A
+    # process started with Start-Process -WindowStyle Hidden has no Cert: drive here (measured 2026-10-12), and with
+    # SilentlyContinue here every certificate check passed or failed on an empty list without saying why.
+    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\My" -ErrorAction Stop |
         Where-Object { $_.Subject -eq $D0Subject } | ForEach-Object { $_.Thumbprint } | Sort-Object)
 }
 
@@ -411,6 +424,51 @@ function Get-D0Capabilities([object[]]$Requests) {
     return $caps
 }
 
+# ---------------------------------------------------------------- a secret file this account cannot look at (RF-1)
+# The rights are the ones the product's OWN tool writes (src\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1, lines 57 to
+# 70, run with no -AgentAccount, which is its default): inheritance removed from the folder and the file, SYSTEM and
+# Administrators granted, nobody else. The enrolling account (BayKiosk on a bay; this suite's account here) is in neither
+# list, so a plain existence test of the file THROWS "Access is denied" under $ErrorActionPreference = "Stop". Nothing
+# here mocks a throw. The tool runs elevated and does the folder first; this suite is not elevated, so it does the FILE
+# first (a locked folder would stop it reaching the file). The rights each ends with are the same.
+$script:D0Locked = New-Object System.Collections.ArrayList
+function Invoke-D0Icacls([string[]]$IcaclsArgs) {
+    & icacls.exe @IcaclsArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw ("icacls {0} failed with exit code {1}" -f ($IcaclsArgs -join " "), $LASTEXITCODE) }
+}
+function Test-D0CannotLook([string]$Path) {
+    # True when the existence test the agent uses THROWS for this path from this account (the shape RF-1 is about).
+    try { [void](Test-Path -LiteralPath $Path -PathType Leaf); return $false } catch { return $true }
+}
+function Lock-D0LikeTheSecretTool([string]$Dir, [string]$File) {
+    # Returns a sentence saying which rights this account ended up with. Registers both for unlocking.
+    [void]$script:D0Locked.Add($File); [void]$script:D0Locked.Add($Dir)
+    Invoke-D0Icacls @($File, "/inheritance:r")
+    Invoke-D0Icacls @($File, "/grant", "SYSTEM:F", "Administrators:F")
+    Invoke-D0Icacls @($Dir, "/inheritance:r")
+    Invoke-D0Icacls @($Dir, "/grant", "SYSTEM:(OI)(CI)F", "Administrators:(OI)(CI)F")
+    $how = "the tool's rights only (SYSTEM and Administrators)"
+    if (-not (Test-D0CannotLook $File)) {
+        # An elevated run is in Administrators, so the tool's rights let it look. Deny this account the two rights an
+        # existence check needs (read attributes on the file, list on the folder) so the same situation is modeled.
+        $me = ("{0}\{1}" -f [Environment]::UserDomainName, [Environment]::UserName)
+        Invoke-D0Icacls @($File, "/deny", ("{0}:(RA)" -f $me))
+        Invoke-D0Icacls @($Dir, "/deny", ("{0}:(RD)" -f $me))
+        $how = "the tool's rights plus an explicit deny for this account (this run is elevated)"
+    }
+    return $how
+}
+function Unlock-D0All {
+    # The owner may always rewrite the rights: put inheritance back so the sandbox can be read and removed. FOLDERS FIRST:
+    # icacls lists a path's parent before it acts, so once a folder is locked the file inside it cannot be reached until
+    # the folder is reset (they are registered file then folder, so walk the list backward).
+    $lockedNow = @($script:D0Locked.ToArray()); [array]::Reverse($lockedNow)
+    foreach ($p in $lockedNow) {
+        try { if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) { & icacls.exe $p /reset | Out-Null } } catch { Write-Host ("could not put the rights back on " + $p) -ForegroundColor Yellow }
+    }
+    $script:D0Locked.Clear()
+}
+
 # THE ARGUMENTS UNDER TEST ARE THE ONES Setup-BayPC.ps1 PRINTS. They are read out of that script's text (Phase 6 and
 # Next Steps), so the line a person is shown at the bay is the line every scenario below runs.
 $SetupScriptText = [IO.File]::ReadAllText((Resolve-Path (Join-Path $PSScriptRoot "..\src\BayAgent\tools\Setup-BayPC.ps1")).Path)
@@ -428,7 +486,7 @@ $certsAtStart = @(Get-D0RunCerts)
 # subject carries the unfilled bayId instead of this run's bay id. That placeholder carries this run's tag, so these
 # too are this run's and no other's (two runs side by side cannot remove each other's).
 function Get-D0PlaceholderCerts {
-    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\My" -ErrorAction SilentlyContinue |
+    return @(Get-ChildItem -LiteralPath "Cert:\CurrentUser\My" -ErrorAction Stop |
         Where-Object { $_.Subject -eq $D0PlaceholderSubject } | ForEach-Object { $_.Thumbprint } | Sort-Object)
 }
 $placeholderCertsAtStart = @(Get-D0PlaceholderCerts)
@@ -578,6 +636,116 @@ try {
     Show-D0Run $r "S2 sealed secret file at a path of the configuration's own choosing"
     Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT" -and $r.StdOut -match "the sealed secret file the configuration names") "[a sealed secret file at a path only the configuration names] refused with ABG_OWNID_SECRET_PRESENT, naming it (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ((Get-D0InstallFingerprint $b2z.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[...at a path only the configuration names] nothing was changed, nothing was sent"
+
+    # ...and the standard place when the configuration names ANOTHER path (a planted "read the standard place only when no
+    # path is named" survived the re-check: the "unnamed" scenario above names no path at all, so it cannot tell).
+    $b2w = New-D0Bay -Name "refusal-sealed-standard-other-path" -SecretPathElsewhere
+    [IO.File]::WriteAllBytes((Join-Path $b2w.Root "secrets\clientsecret.dpapi"), $sealed)
+    Assert-True ($b2w.Root -and -not (Test-Path -LiteralPath (Join-Path $b2w.Root "elsewhere\bay-secret.dpapi"))) "precondition: the path the configuration names holds no file; the sealed secret is only at the standard place"
+    $before = Get-D0InstallFingerprint $b2w.Root; $mark = Get-D0Mark
+    $r = Invoke-D0Agent -Bay $b2w -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+    Show-D0Run $r "S2 sealed secret at the standard place, the configuration names another path"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT" -and $r.StdOut.Contains("a sealed secret file at " + (Join-Path $b2w.Root "secrets\clientsecret.dpapi"))) "[the standard place, another path named] refused with ABG_OWNID_SECRET_PRESENT, naming the standard place (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ((Get-D0InstallFingerprint $b2w.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[the standard place, another path named] nothing was changed, nothing was sent"
+
+    # -EnrollForce does not pass the secret guard (a planted "force passes it" survived the re-check: the scenarios above
+    # never typed -EnrollForce). A secret on the PC means this is not a new bay, whatever the person typed.
+    foreach ($fc in @(
+            @{ label = "sealed file the configuration names"; bay = $b2s },
+            @{ label = "plaintext clientSecret in the configuration"; bay = $b2p },
+            @{ label = "plaintext clientSecret beside a secret-file path"; bay = $b2x },
+            @{ label = "sealed file at the standard place, named by no key"; bay = $b2y },
+            @{ label = "sealed file at a path only the configuration names"; bay = $b2z },
+            @{ label = "sealed file at the standard place, another path named"; bay = $b2w })) {
+        $before = Get-D0InstallFingerprint $fc.bay.Root; $mark = Get-D0Mark; $certsBeforeF = @(Get-D0RunCerts).Count
+        $r = Invoke-D0Agent -Bay $fc.bay -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
+        Show-D0Run $r ("S2 -EnrollForce, " + $fc.label)
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[$($fc.label), with -EnrollForce] refused with ABG_OWNID_SECRET_PRESENT: -EnrollForce does not pass the secret guard (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+        Assert-True ((Get-D0InstallFingerprint $fc.bay.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0 -and @(Get-D0RunCerts).Count -eq $certsBeforeF) "[$($fc.label), with -EnrollForce] nothing was changed, no key was made, nothing was sent"
+    }
+
+    # RF-1 (BayAgent 1.6.1 re-check): "could not look" is not "nothing there". A secret file this account has no rights to
+    # look at is still a secret on the PC. The rights are the ones the product's own secret tool leaves by default.
+    # (On bc2e6c67 each of these enrolled, printed ENROLLED, and the agent then could not start: a dark bay.)
+    Section "S2b a secret file this account cannot LOOK AT is a refusal that names the place, not 'nothing there' (RF-1)"
+    foreach ($uc in @(
+            @{ kind = "standard-named";   label = "sealed file at the standard place, which the configuration names";   place = "the secret the configuration names" },
+            @{ kind = "standard-unnamed"; label = "sealed file at the standard place, the configuration names no path";  place = "the standard place for the sealed secret" },
+            @{ kind = "named-elsewhere";  label = "sealed file at another path the configuration names";                place = "the secret the configuration names" },
+            @{ kind = "illegal-path";     label = "the configuration names a path with an illegal character";           place = "the secret the configuration names" })) {
+        $ub = $null; $lockedFile = $null; $how = "none"
+        if ($uc.kind -eq "standard-named")   { $ub = New-D0Bay -Name "unreadable-named" }
+        if ($uc.kind -eq "standard-unnamed") { $ub = New-D0Bay -Name "unreadable-unnamed" -Shape "own" }
+        if ($uc.kind -eq "named-elsewhere")  { $ub = New-D0Bay -Name "unreadable-elsewhere" -SecretPathElsewhere }
+        if ($uc.kind -eq "illegal-path") {
+            $ub = New-D0Bay -Name "unreadable-illegal"
+            $illegalPath = (Join-Path $ub.Root "secrets") + "\a|b.dpapi"
+            $cfgIll = [IO.File]::ReadAllText($ub.Config) | ConvertFrom-Json
+            $cfgIll.clientSecretDpapiPath = $illegalPath
+            [IO.File]::WriteAllText($ub.Config, ($cfgIll | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($true)))
+            Assert-True (Test-D0CannotLook $illegalPath) "[$($uc.label)] precondition: the existence test throws for that path"
+        } else {
+            $lockedFile = $(if ($uc.kind -eq "named-elsewhere") { Join-Path $ub.Root "elsewhere\bay-secret.dpapi" } else { Join-Path $ub.Root "secrets\clientsecret.dpapi" })
+        }
+        try {
+            if ($lockedFile) {
+                [IO.File]::WriteAllBytes($lockedFile, $sealed)
+                $how = Lock-D0LikeTheSecretTool -Dir (Split-Path -Parent $lockedFile) -File $lockedFile
+                Assert-True (Test-D0CannotLook $lockedFile) "[$($uc.label)] precondition: this account cannot look at the secret file; the existence test throws (rights: $how)"
+            }
+            foreach ($extra in @("", " -EnrollForce")) {
+                $tag = $(if ($extra) { $uc.label + ", with -EnrollForce" } else { $uc.label })
+                $before = Get-D0InstallFingerprint $ub.Root; $mark = Get-D0Mark; $certsBeforeU = @(Get-D0RunCerts).Count
+                $r = Invoke-D0Agent -Bay $ub -Arguments (($SheetEnroll -f $D0OwnApp) + $extra) -Sheet
+                Show-D0Run $r ("S2b " + $tag)
+                Assert-True (-not $r.TimedOut -and $r.ExitCode -eq 2) "[$tag] exit code 2 (got $($r.ExitCode))"
+                $resU = @(Get-D0ResultLines $r.StdOut)
+                Assert-True ($resU.Count -eq 1 -and $resU[0] -eq "RESULT: REFUSED") "[$tag] exactly one RESULT line, and it is REFUSED (got: $($resU -join ' | '))"
+                Assert-True ((Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_UNREADABLE") "[$tag] reason code ABG_OWNID_SECRET_UNREADABLE (got $(Get-D0ReportField $r.StdOut 'Reason code'))"
+                Assert-True ($r.StdOut.Contains($uc.place)) "[$tag] the refusal names the place that could not be looked at ('$($uc.place)')"
+                Assert-True ($r.StdOut -match "nothing was made" -and $r.StdOut -match "Nothing was changed on this PC") "[$tag] it says nothing was made"
+                Assert-True (@(Get-D0RunCerts).Count -eq $certsBeforeU) "[$tag] no key was made"
+                Assert-True (-not (Test-Path -LiteralPath $ub.State)) "[$tag] no state\credential.json was written"
+                Assert-True ((Get-D0InstallFingerprint $ub.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[$tag] nothing was changed and nothing was sent"
+                Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[$tag] the secret's text is not on the console or in the log"
+            }
+        } finally { Unlock-D0All }
+    }
+
+    # The guard is asked once something is on record too (a planted "not asked of a bay that already holds an enrollment"
+    # survived the re-check, because every scenario above runs on a blank bay). A bay enrolled and working, and then a
+    # secret arrives in each of the three places: the same line must be refused, with and without -EnrollForce, and
+    # change nothing. The control first: the same line on the same bay, before the secret, answers READY.
+    Section "S2e a secret that ARRIVES after the enrollment is refused by the same line (the guard is asked of a bay with something on record)"
+    foreach ($lc in @(
+            @{ kind = "named";          label = "sealed file at the path the configuration names (the standard place)" },
+            @{ kind = "standard-other"; label = "sealed file at the standard place, the configuration names another path" },
+            @{ kind = "plaintext";      label = "a clientSecret key added beside the secret-file path" })) {
+        $lb = New-D0Bay -Name ("late-" + $lc.kind) -Shape "placeholder" -SecretPathElsewhere:($lc.kind -eq "standard-other")
+        $r = Invoke-D0Agent -Bay $lb -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+        $tpLate = Get-D0ReportField $r.StdOut "Thumbprint"
+        Assert-True ($r.ExitCode -eq 0 -and (Get-D0FirstResult $r.StdOut) -like "RESULT: ENROLLED*") "[$($lc.label)] the bay is enrolled first (exit $($r.ExitCode), $(Get-D0FirstResult $r.StdOut))"
+        if ($tpLate -notmatch '^[0-9A-F]{40}$') { Assert-True $false "[$($lc.label)] no enrollment happened, so the late secret could not be tested"; continue }
+        Register-D0Certificate -AppId $D0OwnApp -CerPath (Join-Path $lb.Root ("state\bay-cert-{0}.cer" -f $tpLate))
+        $r = Invoke-D0Agent -Bay $lb -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
+        Assert-True ($r.ExitCode -eq 0 -and (Get-D0FirstResult $r.StdOut) -like "RESULT: READY*") "[$($lc.label)] control: before the secret arrives, the same line answers READY (exit $($r.ExitCode), $(Get-D0FirstResult $r.StdOut))"
+        if ($lc.kind -eq "plaintext") {
+            $cfgLate = [IO.File]::ReadAllText($lb.Config) | ConvertFrom-Json
+            $cfgLate | Add-Member -NotePropertyName clientSecret -NotePropertyValue $secretMarker
+            [IO.File]::WriteAllText($lb.Config, ($cfgLate | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($true)))
+        } else {
+            [IO.File]::WriteAllBytes((Join-Path $lb.Root "secrets\clientsecret.dpapi"), $sealed)
+        }
+        foreach ($extra in @("", " -EnrollForce")) {
+            $tag = $(if ($extra) { $lc.label + ", with -EnrollForce" } else { $lc.label })
+            $before = Get-D0InstallFingerprint $lb.Root; $mark = Get-D0Mark
+            $r = Invoke-D0Agent -Bay $lb -Arguments (($SheetEnroll -f $D0OwnApp) + $extra) -Sheet
+            Show-D0Run $r ("S2e " + $tag)
+            Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[$tag] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+            Assert-True ((Get-D0InstallFingerprint $lb.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[$tag] nothing was changed and nothing was sent (not even a sign-in check)"
+            Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[$tag] the secret's text is not on the console or in the log"
+        }
+    }
 
     # A PC that already holds something is not a new bay: each of these is refused, with or without -EnrollForce, and
     # the state file is left byte for byte as it was.
@@ -828,6 +996,9 @@ try {
         $BaseDir = $liftRoot; $CredentialStatePath = Join-Path $liftRoot "state\credential.json"
         $BayId = $D0BayId; $TenantId = $D0Tenant; $OrgUrl = $MockUrl; $ClientId = "<app-client-id>"
         $CertThumbprintCfg = $null; $CertStoreCfg = $null
+        # ...and the configuration object the secret guard reads (the real script always has it; before the guard failed
+        # closed, reading it here threw, the guard's catch swallowed that, and this check passed without it).
+        $cfg = [pscustomobject]@{ bayId = $D0BayId }
         Set-Variable -Name Secret -Value $null; Set-Variable -Name SecretPath -Value $null
         $Global:CredentialStateCorrupt = $false
         # An earlier enrollment on record whose certificate is not in this account's store, on a bay that never ran:
@@ -847,6 +1018,18 @@ try {
         Assert-True ((Test-Path -LiteralPath $CredentialStatePath) -and (Get-D0Sha256Hex ([IO.File]::ReadAllBytes($CredentialStatePath))) -eq $earlierHash) "the state file is byte for byte the earlier enrollment again (not the half-written one)"
         Assert-True (((Get-D0RunCerts) -join ",") -eq ($certsBeforeLift -join ",")) "the key made for the failed attempt is gone from the store"
         Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $liftRoot "state") -Filter "bay-cert-*.cer" -ErrorAction SilentlyContinue).Count -eq 0) "...and so is its public .cer"
+
+        # The guard's second read (the clientSecret key of the configuration) fails closed too. It cannot fail in a real run
+        # (the script stops at start-up without its configuration), so this is the one place it is pinned: lifted, with a
+        # configuration object that is NOT THERE (under strict mode, reading a variable that was never set throws; a
+        # ScriptProperty stand-in does not work, PowerShell swallows an error raised inside a script property's getter).
+        Remove-Variable -Name cfg
+        $liftGuard = Get-OwnIdentitySecretOnPc
+        $liftU = [string](Get-D0Prop $liftGuard "Unreadable"); $liftF = [string](Get-D0Prop $liftGuard "Found")
+        Assert-True (($liftU -match "agent-config\.json, the clientSecret key") -and -not $liftF) ("a configuration key that cannot be read is reported as unreadable, not as nothing there (Unreadable: '" + $liftU + "', Found: '" + $liftF + "')")
+        $cfg = [pscustomobject]@{ bayId = $D0BayId }
+        $liftClean = Get-OwnIdentitySecretOnPc
+        Assert-True ($null -ne (Get-D0Prop $liftClean "Found") -and -not [string](Get-D0Prop $liftClean "Found") -and -not [string](Get-D0Prop $liftClean "Unreadable")) "control: with nothing on the lifted PC, the guard finds nothing and reports nothing unreadable"
     }
 
     # ============================================================ S12 the key was made under another Windows account
@@ -981,16 +1164,21 @@ finally {
     $sync["Stop"] = $true
     try { $mock.PS.Stop() } catch {}
     try { $mock.RS.Close() } catch {}
-    # Remove exactly the certificates this run made: the subject carries this run's own bay id.
-    $mine = @(Get-D0RunCerts) + @(Get-D0PlaceholderCerts | Where-Object { $placeholderCertsAtStart -notcontains $_ })
-    foreach ($tpLeft in $mine) {
-        try { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $tpLeft) -DeleteKey -Force } catch { Write-Host "could not remove test certificate $tpLeft" -ForegroundColor Yellow }
-    }
+    Unlock-D0All
     try { Remove-Item -LiteralPath $SandboxRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    # Remove exactly the certificates this run made: the subject carries this run's own bay id.
+    try {
+        $mine = @(Get-D0RunCerts) + @(Get-D0PlaceholderCerts | Where-Object { $placeholderCertsAtStart -notcontains $_ })
+        foreach ($tpLeft in $mine) {
+            try { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $tpLeft) -DeleteKey -Force } catch { Write-Host "could not remove test certificate $tpLeft" -ForegroundColor Yellow }
+        }
+    } catch { Assert-True $false ("cleanup could not read the certificate store, so certificates this run made may be left in it: " + $_.Exception.Message) }
 }
 
 Write-Host ""
-$left = @(Get-D0RunCerts) + @(Get-D0PlaceholderCerts | Where-Object { $placeholderCertsAtStart -notcontains $_ })
+$left = @()
+try { $left = @(Get-D0RunCerts) + @(Get-D0PlaceholderCerts | Where-Object { $placeholderCertsAtStart -notcontains $_ }) }
+catch { Assert-True $false ("cleanup check could not read the certificate store: " + $_.Exception.Message) }
 Assert-True ($left.Count -eq 0) "cleanup: no certificate of this run is left in the store (left: $($left.Count))"
 if ($sync["Errors"].Count -gt 0) { Write-Host "recorder errors: $($sync['Errors'] -join ' | ')" -ForegroundColor Yellow }
 Assert-True ($sync["Errors"].Count -eq 0) "the recorder itself raised no error ($($sync['Errors'].Count))"
