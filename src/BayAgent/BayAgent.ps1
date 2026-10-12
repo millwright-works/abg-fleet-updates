@@ -4739,6 +4739,34 @@ function Remove-OwnIdentityCertificate {
     return $removedFrom
 }
 
+function Get-OwnIdentitySecretOnPc {
+    # WHERE a client secret sits on this PC, as a short description, or "" when none is found. Never the secret, and
+    # nothing is decrypted. Never throws.
+    #
+    # It reads the PLACES a secret can be, not only the two variables the sign-in code resolved from the
+    # configuration at start-up ($Secret, $SecretPath). Those are what a sign-in would use right now; a guard that
+    # read only them would miss a secret the sign-in code is one edit away from using:
+    #   1. what the sign-in code would use now (Test-HasUsableSecret);
+    #   2. a clientSecret key in agent-config.json EVEN WHEN a clientSecretDpapiPath key is there too. Start-up then
+    #      loads only the path, so (1) cannot see the plaintext, but it is a secret in a file on this PC;
+    #   3. a sealed file at the standard place, secrets\clientsecret.dpapi under the agent's folder, even when the
+    #      configuration names no path, or another one.
+    $found = @()
+    try { if (Test-HasUsableSecret) { $found += $(if ($script:Secret) { "a clientSecret in agent-config.json" } else { "the sealed secret file the configuration names" }) } } catch { }
+    try {
+        if (($cfg.PSObject.Properties.Name -contains "clientSecret") -and (-not [string]::IsNullOrWhiteSpace([string]$cfg.clientSecret))) {
+            if ($found -notcontains "a clientSecret in agent-config.json") { $found += "a clientSecret in agent-config.json" }
+        }
+    } catch { }
+    try {
+        $standardPlace = Join-Path $BaseDir "secrets\clientsecret.dpapi"
+        if (Test-Path -LiteralPath $standardPlace -PathType Leaf) {
+            if ($found -notcontains "the sealed secret file the configuration names") { $found += ("a sealed secret file at " + $standardPlace) }
+        }
+    } catch { }
+    return ($found -join "; ")
+}
+
 function New-OwnIdentityEnrollRefusal {
     # A refusal of the console enrollment: nothing was changed. Exit code 2.
     param([Parameter(Mandatory=$true)][string]$Reason, [Parameter(Mandatory=$true)][string]$Message)
@@ -4791,8 +4819,10 @@ function Invoke-OwnIdentityEnroll {
     }
 
     # A0.529: a bay enrolled this way never holds a client secret. One on the machine means this is not that bay.
-    if (Test-HasUsableSecret) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_PRESENT" "This PC holds a client secret (a sealed secret file, or a clientSecret in agent-config.json). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all.")
+    # The guard reads every place a secret can sit (Get-OwnIdentitySecretOnPc), not only what a sign-in would use now.
+    $secretOnPc = Get-OwnIdentitySecretOnPc
+    if ($secretOnPc) {
+        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_PRESENT" ("This PC holds a client secret ({0}). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all." -f $secretOnPc))
     }
     if ($null -ne $probation) {
         return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SWITCH_IN_PROGRESS" "An identity switch is on probation on this bay. Confirm or revert it (CredentialRotate) first.")
