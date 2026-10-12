@@ -229,7 +229,7 @@ try {
         Write-RcHead "R5  a sealed secret file is on the PC but THIS account cannot even look at it (access denied): base 6227e4d against head"
         $rcMe = ("{0}\{1}" -f [Environment]::UserDomainName, [Environment]::UserName)
         $rcHeadScript = $AgentScript
-        foreach ($side in @(@{ n = "BASE 6227e4d (the attacked head)"; s = "C:\aoc-wt\verdicts\bayagent-161-recheck-evidence\BayAgent-6227e4d.ps1" }, @{ n = "HEAD bc2e6c6"; s = $rcHeadScript })) {
+        foreach ($side in @(@{ n = "BASE 6227e4d (the first attacked head)"; s = "C:\aoc-wt\verdicts\bayagent-161-recheck-evidence\BayAgent-6227e4d.ps1" }, @{ n = "PREV bc2e6c6 (the re-checked head)"; s = "C:\aoc-wt\verdicts\bayagent-161-recheck-evidence\BayAgent-bc2e6c6.ps1" }, @{ n = "HEAD (this worktree's script)"; s = $rcHeadScript })) {
             Write-RcNote ("--- " + $side.n)
             $AgentScript = $side.s
             $b = New-RcSheetBay ("r5-" + $side.n.Substring(0, 4).Trim().ToLowerInvariant())
@@ -275,6 +275,116 @@ try {
             & icacls.exe $secDir /remove:d $rcMe | Out-Null
             & icacls.exe $secFile /remove:d $rcMe | Out-Null
         }
+    }
+
+    # ================================================================== R8
+    if (Test-RcWanted "R8") {
+        Write-RcHead "R8  can the new refusal stop a LEGITIMATE blank PC? No secret file anywhere; the secrets folder in five states"
+        $rcMe = ("{0}\{1}" -f [Environment]::UserDomainName, [Environment]::UserName)
+        $rcElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        Write-RcNote ("this session is elevated: {0}" -f $rcElevated)
+        $states = @(
+            @{ n = "A the folder as Day0 leaves it (inherited rights), empty"; k = "plain" },
+            @{ n = "B no secrets folder at all"; k = "absent" },
+            @{ n = "C the folder with list DENIED to this account, empty"; k = "deny" },
+            @{ n = "D the folder with the secret tool's rights (inheritance removed; SYSTEM and Administrators only), empty"; k = "tool" },
+            @{ n = "E the configuration names a path on a drive that does not exist"; k = "nodrive" }
+        )
+        $xi = 0
+        foreach ($stt in $states) {
+            $xi++
+            Write-RcNote ("--- " + $stt.n)
+            $b = New-RcSheetBay ("r8-" + $xi)
+            $secDir = Join-Path $b.Root "secrets"; $secFile = Join-Path $secDir "clientsecret.dpapi"
+            if ($stt.k -eq "absent") { Remove-Item -LiteralPath $secDir -Recurse -Force }
+            if ($stt.k -eq "deny") { & icacls.exe $secDir /deny ("{0}:(RD)" -f $rcMe) | Out-Null }
+            if ($stt.k -eq "tool") { & icacls.exe $secDir /inheritance:r | Out-Null; & icacls.exe $secDir /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null }
+            if ($stt.k -eq "nodrive") {
+                $c = [IO.File]::ReadAllText($b.Config) | ConvertFrom-Json
+                $c.clientSecretDpapiPath = "Q:\NoSuchFolder\clientsecret.dpapi"
+                [IO.File]::WriteAllText($b.Config, ($c | ConvertTo-Json -Depth 6), $RcUtf8Bom)
+            }
+            try {
+                $seen = "?"
+                try { $seen = [string](Test-Path -LiteralPath $secFile) } catch { $seen = "THROWS: " + $_.Exception.Message }
+                Write-RcNote ("Test-Path on where the secret file would be, from this account: " + $seen)
+                $r = Invoke-D0Agent -Bay $b -Arguments ($RcEnroll -f $D0OwnApp) -Sheet
+                $tp = Get-D0ReportField $r.StdOut "Thumbprint"
+                Write-RcNote ("step 11: exit={0} '{1}' reason '{2}'" -f $r.ExitCode, (Get-D0FirstResult $r.StdOut), (Get-D0ReportField $r.StdOut "Reason code"))
+                if ($tp -match '^[0-9A-F]{40}$') {
+                    Register-D0Certificate -AppId $D0OwnApp -CerPath (Join-Path $b.Root ("state\bay-cert-{0}.cer" -f $tp))
+                    $r = Invoke-D0Agent -Bay $b -Arguments ($RcEnroll -f $D0OwnApp) -Sheet
+                    Write-RcNote ("step 13: exit={0} '{1}' reason '{2}'" -f $r.ExitCode, (Get-D0FirstResult $r.StdOut), (Get-D0ReportField $r.StdOut "Reason code"))
+                    $mark = Get-D0Mark
+                    $r = Invoke-D0Agent -Bay $b -Arguments "-Once"; Show-RcRun $r "step 14, the agent, one pass"
+                    Write-RcNote ("requests the agent sent: {0}" -f @(Get-D0RequestsSince $mark).Count)
+                }
+            } finally {
+                if ($stt.k -eq "deny") { & icacls.exe $secDir /remove:d $rcMe | Out-Null }
+                if ($stt.k -eq "tool") { & icacls.exe $secDir /reset | Out-Null }
+            }
+        }
+    }
+
+    # ================================================================== R9
+    if (Test-RcWanted "R9") {
+        Write-RcHead "R9  can 'could not look' at one place hide 'found' at another? And an unreadable file that arrives AFTER enrollment"
+        $rcMe = ("{0}\{1}" -f [Environment]::UserDomainName, [Environment]::UserName)
+        Write-RcNote "--- a: the configuration names another path whose file cannot be looked at; a READABLE sealed file sits at the standard place"
+        $b = New-RcSheetBay "r9-a"
+        $c = [IO.File]::ReadAllText($b.Config) | ConvertFrom-Json
+        $elseDir = Join-Path $b.Root "elsewhere"; $elseFile = Join-Path $elseDir "other.dpapi"
+        $c.clientSecretDpapiPath = $elseFile
+        [IO.File]::WriteAllText($b.Config, ($c | ConvertTo-Json -Depth 6), $RcUtf8Bom)
+        Protect-RcSecretAt $elseFile
+        Protect-RcSecretAt (Join-Path $b.Root "secrets\clientsecret.dpapi")
+        & icacls.exe $elseFile /deny ("{0}:(RA)" -f $rcMe) | Out-Null
+        & icacls.exe $elseDir /deny ("{0}:(RD)" -f $rcMe) | Out-Null
+        try {
+            $certsBefore = @(Get-D0RunCerts).Count
+            foreach ($extra in @("", " -EnrollForce")) {
+                $r = Invoke-D0Agent -Bay $b -Arguments (($RcEnroll -f $D0OwnApp) + $extra) -Sheet
+                Write-RcNote ("console line{0}: exit={1} '{2}' reason '{3}' | key made: {4} | state written: {5}" -f $extra, $r.ExitCode, (Get-D0FirstResult $r.StdOut), (Get-D0ReportField $r.StdOut "Reason code"), (@(Get-D0RunCerts).Count -gt $certsBefore), (Test-Path -LiteralPath $b.State))
+            }
+        } finally { & icacls.exe $elseDir /remove:d $rcMe | Out-Null; & icacls.exe $elseFile /remove:d $rcMe | Out-Null }
+
+        Write-RcNote "--- b: a clientSecret key in agent-config.json; the sealed file at the named standard place cannot be looked at"
+        $b = New-RcSheetBay "r9-b"
+        $c = [IO.File]::ReadAllText($b.Config) | ConvertFrom-Json
+        $c | Add-Member -NotePropertyName clientSecret -NotePropertyValue ("not-a-real-secret-" + [guid]::NewGuid().ToString("N"))
+        [IO.File]::WriteAllText($b.Config, ($c | ConvertTo-Json -Depth 6), $RcUtf8Bom)
+        $secDir = Join-Path $b.Root "secrets"; $secFile = Join-Path $secDir "clientsecret.dpapi"
+        Protect-RcSecretAt $secFile
+        & icacls.exe $secFile /deny ("{0}:(RA)" -f $rcMe) | Out-Null
+        & icacls.exe $secDir /deny ("{0}:(RD)" -f $rcMe) | Out-Null
+        try {
+            $certsBefore = @(Get-D0RunCerts).Count
+            foreach ($extra in @("", " -EnrollForce")) {
+                $r = Invoke-D0Agent -Bay $b -Arguments (($RcEnroll -f $D0OwnApp) + $extra) -Sheet
+                Write-RcNote ("console line{0}: exit={1} '{2}' reason '{3}' | key made: {4} | state written: {5}" -f $extra, $r.ExitCode, (Get-D0FirstResult $r.StdOut), (Get-D0ReportField $r.StdOut "Reason code"), (@(Get-D0RunCerts).Count -gt $certsBefore), (Test-Path -LiteralPath $b.State))
+            }
+        } finally { & icacls.exe $secDir /remove:d $rcMe | Out-Null; & icacls.exe $secFile /remove:d $rcMe | Out-Null }
+
+        Write-RcNote "--- c: a bay enrolled, registered and READY; THEN a sealed file it cannot look at appears at the named standard place"
+        $b = New-RcSheetBay "r9-c"
+        $r = Invoke-D0Agent -Bay $b -Arguments ($RcEnroll -f $D0OwnApp) -Sheet
+        $tp = Get-D0ReportField $r.StdOut "Thumbprint"
+        Register-D0Certificate -AppId $D0OwnApp -CerPath (Join-Path $b.Root ("state\bay-cert-{0}.cer" -f $tp))
+        $r = Invoke-D0Agent -Bay $b -Arguments ($RcEnroll -f $D0OwnApp) -Sheet
+        Write-RcNote ("before the file appears: '{0}'" -f (Get-D0FirstResult $r.StdOut))
+        $secDir = Join-Path $b.Root "secrets"; $secFile = Join-Path $secDir "clientsecret.dpapi"
+        Protect-RcSecretAt $secFile
+        & icacls.exe $secFile /deny ("{0}:(RA)" -f $rcMe) | Out-Null
+        & icacls.exe $secDir /deny ("{0}:(RD)" -f $rcMe) | Out-Null
+        try {
+            foreach ($extra in @("", " -EnrollForce")) {
+                $r = Invoke-D0Agent -Bay $b -Arguments (($RcEnroll -f $D0OwnApp) + $extra) -Sheet
+                Write-RcNote ("console line{0}: exit={1} '{2}' reason '{3}'" -f $extra, $r.ExitCode, (Get-D0FirstResult $r.StdOut), (Get-D0ReportField $r.StdOut "Reason code"))
+            }
+            $mark = Get-D0Mark
+            $r = Invoke-D0Agent -Bay $b -Arguments "-Once"; Show-RcRun $r "the agent, one pass"
+            Write-RcNote ("requests the agent sent: {0}" -f @(Get-D0RequestsSince $mark).Count)
+        } finally { & icacls.exe $secDir /remove:d $rcMe | Out-Null; & icacls.exe $secFile /remove:d $rcMe | Out-Null }
     }
 
     # ================================================================== R7
