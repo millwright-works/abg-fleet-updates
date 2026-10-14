@@ -210,7 +210,7 @@ function Get-BmFileArgs([string]$CommandText) {
   foreach ($m in @([regex]::Matches([string]$CommandText, '(?i)-File\s+(?:"([^"]+)"|(\S+))'))) {
     $out += $(if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value })
   }
-  return , $out
+  return $out
 }
 
 function ConvertTo-BmSid([string]$Account) {
@@ -277,16 +277,16 @@ function Convert-BmConfigText {
 
 function Get-BmJsonLeaves($Node, [string]$Prefix) {
   $out = @()
-  if ($null -eq $Node) { return , @(@{ Path = $Prefix; Value = $null }) }
+  if ($null -eq $Node) { return @(@{ Path = $Prefix; Value = $null }) }
   if ($Node -is [System.Management.Automation.PSCustomObject]) {
     foreach ($p in @($Node.PSObject.Properties)) { $out += @(Get-BmJsonLeaves $p.Value ($Prefix + "." + $p.Name)) }
-    return , $out
+    return $out
   }
   if ($Node -is [Array]) {
     for ($i = 0; $i -lt $Node.Count; $i++) { $out += @(Get-BmJsonLeaves $Node[$i] ($Prefix + "[" + $i + "]")) }
-    return , $out
+    return $out
   }
-  return , @(@{ Path = $Prefix; Value = $Node })
+  return @(@{ Path = $Prefix; Value = $Node })
 }
 
 function Read-BmBytesAsText([string]$Path) {
@@ -317,7 +317,7 @@ function Get-BmTreeManifest([string]$Root) {
   # Every entry under $Root as "relative path|kind|length|last write ticks|link target", from directory listings only:
   # no file is opened. A link is listed with its target and never followed.
   $list = New-Object System.Collections.ArrayList
-  if (-not [IO.Directory]::Exists($Root)) { return , @() }
+  if (-not [IO.Directory]::Exists($Root)) { return @() }
   $full = (Get-BmFullPath $Root)
   $stack = New-Object System.Collections.Stack
   $stack.Push((New-Object IO.DirectoryInfo($full)))
@@ -335,7 +335,7 @@ function Get-BmTreeManifest([string]$Root) {
       }
     }
   }
-  return , @($list.ToArray() | Sort-Object)
+  return @($list.ToArray() | Sort-Object)
 }
 
 function Get-BmLinkTarget([string]$Path) {
@@ -351,7 +351,7 @@ function Get-BmLinks([string]$Root) {
     $f = $line.Split('|')
     if ($f[1] -eq "link" -or $f[1] -eq "filelink") { $out += @{ Rel = $f[0]; Kind = $f[1]; Target = $f[4] } }
   }
-  return , $out
+  return $out
 }
 
 function Compare-BmManifest([string[]]$Before, [string[]]$After, [string[]]$Ignore) {
@@ -365,7 +365,7 @@ function Compare-BmManifest([string[]]$Before, [string[]]$After, [string[]]$Igno
     elseif ($a[$k] -ne $b[$k] -and -not ($b[$k].Split('|')[1] -eq 'link')) { $d += "different $k" }
   }
   foreach ($k in @($a.Keys | Sort-Object)) { if (-not $b.ContainsKey($k)) { $d += "extra $k" } }
-  return , $d
+  return $d
 }
 
 function Get-BmDaclSddl([string]$Path) {
@@ -376,7 +376,7 @@ function Test-BmScriptText([string]$Path, [string]$MustNotName) {
   # A script that is going to be started by a task: it exists, is not a stub, parses, is ASCII, and does not name the
   # root it is moving away from (a release whose bootstrap still hardcodes the old root would start nothing).
   $why = @()
-  if (-not [IO.File]::Exists($Path)) { return , @("not found") }
+  if (-not [IO.File]::Exists($Path)) { return @("not found") }
   $len = (New-Object IO.FileInfo($Path)).Length
   if ($len -lt $BmMinScriptBytes) { $why += "only $len bytes" }
   $bytes = [IO.File]::ReadAllBytes($Path)
@@ -390,7 +390,7 @@ function Test-BmScriptText([string]$Path, [string]$MustNotName) {
     $body = ($text -split '# SIG # Begin signature block')[0]
     if (Test-BmNamesRoot $body $MustNotName) { $why += "still names $MustNotName" }
   }
-  return , $why
+  return $why
 }
 
 # ------------------------------------------------------------------ machine reads and writes (each through a cmdlet or program)
@@ -491,7 +491,7 @@ function Get-BmKioskSessions([string]$User) {
     $u = [string]$p.UserName
     if ($u -ieq $User -or $u -like ("*\" + $User)) { $ids += [int]$p.SessionId }
   }
-  return , @($ids | Sort-Object -Unique)
+  return @($ids | Sort-Object -Unique)
 }
 
 function Get-BmProcessesNaming([string]$Root) {
@@ -502,7 +502,7 @@ function Get-BmProcessesNaming([string]$Root) {
       $hits += @{ Id = [int]$p.ProcessId; Name = [string]$p.Name; CommandLine = $cl }
     }
   }
-  return , $hits
+  return $hits
 }
 
 function Get-BmSigningCert([string]$SignedFile) {
@@ -771,7 +771,7 @@ function Invoke-BmStage($P, [string]$SourceDir, [string]$BaseUrl, [string]$MustN
       }
     } catch { $why += ("{0}: {1}" -f $b.ToName, $_.Exception.Message) }
   }
-  return , $why
+  return $why
 }
 
 # ------------------------------------------------------------------ undo
@@ -788,7 +788,11 @@ function Invoke-BmUndoStep($U) {
     }
     "delete-file"     { if ([IO.File]::Exists($U.path)) { [IO.File]::Delete($U.path) } }
     "create-file"     { [IO.File]::WriteAllText($U.path, [string]$U.text) }
-    "write-file"      { Write-BmFileAtomic $U.path ([IO.File]::ReadAllBytes($U.fromFile)) }
+    "write-file"      {
+      # The saved copy kept the file's write time (File.Copy keeps it); the file gets its bytes and its time back.
+      Write-BmFileAtomic $U.path ([IO.File]::ReadAllBytes($U.fromFile))
+      [IO.File]::SetLastWriteTimeUtc($U.path, [IO.File]::GetLastWriteTimeUtc($U.fromFile))
+    }
     "move-dir"        { [IO.Directory]::Move($U.from, $U.to) }
     "move-file"       { [IO.File]::Move($U.from, $U.to) }
     "remove-empty-dir" { if ([IO.Directory]::Exists($U.path)) { [IO.Directory]::Delete($U.path, $false) } }
@@ -810,14 +814,25 @@ function Invoke-BmUndoStep($U) {
 function Invoke-BmRollback {
   # Puts back every step done, newest first. Forgiving: a step that cannot be undone is recorded and the rest still
   # run. Returns what was left.
+  # A link is re-pointed after its folder moved, so putting it back comes before the folder moves back, when its old
+  # target does not exist yet (a junction cannot be made to a missing folder). Such a step waits until every other step
+  # has run, then re-points the link where it then is (back in the old folder if that moved back).
   $left = @()
+  $later = @()
   $steps = @($script:BmJ.undo)
   for ($i = $steps.Count - 1; $i -ge 0; $i--) {
     $u = $steps[$i]
+    if ([string]$u.kind -eq "relink" -and -not [IO.Directory]::Exists([string]$u.target)) { $later += $u; continue }
     try { Invoke-BmUndoStep $u; Write-BmLine ("  put back: " + $u.label) "Yellow" }
     catch { $left += ("{0}: {1}" -f $u.label, $_.Exception.Message); Write-BmLine ("  COULD NOT put back: " + $u.label + ": " + $_.Exception.Message) "Red" }
   }
-  return , $left
+  foreach ($u in $later) {
+    $at = [string]$u.link
+    if ($u.linkBack -and [IO.Directory]::Exists([string]$u.linkBack)) { $at = [string]$u.linkBack }
+    try { Set-BmJunction -Link $at -Target ([string]$u.target); Write-BmLine ("  put back: the link $at pointed back to $($u.target)") "Yellow" }
+    catch { $left += ("{0}: {1}" -f $u.label, $_.Exception.Message); Write-BmLine ("  COULD NOT put back: " + $u.label + ": " + $_.Exception.Message) "Red" }
+  }
+  return $left
 }
 
 function Set-BmJunction([string]$Link, [string]$Target) {
@@ -916,7 +931,7 @@ function Invoke-BmCutover($P, [string]$JDir) {
   foreach ($l in @($P.Links)) {
     $lp = Join-Path $to $l.Rel
     Set-BmJunction -Link $lp -Target $l.NewTarget
-    Add-BmUndo @{ kind = "relink"; link = $lp; target = $l.OldTarget; label = "the link $lp pointed back to $($l.OldTarget)" }
+    Add-BmUndo @{ kind = "relink"; link = $lp; linkBack = (Join-Path $from $l.Rel); target = $l.OldTarget; label = "the link $lp pointed back to $($l.OldTarget)" }
     Write-BmLine ("  link {0} -> {1}" -f $lp, $l.NewTarget)
   }
   $bsTo = Join-Path $to $BmBootstrapRel
@@ -1042,7 +1057,7 @@ function Test-BmDone {
   }
   $shell = Get-BmRegValue $BmWinlogonKey "Shell"
   if ($null -ne $shell -and (Test-BmNamesRoot ([string]$shell) $from)) { $bad += "the Winlogon Shell still names $from" }
-  return , $bad
+  return $bad
 }
 
 # ------------------------------------------------------------------ Verify (after the reboot)
@@ -1078,7 +1093,7 @@ function Invoke-BmVerify([string]$Root, [string]$Other, $TaskNames) {
   if ($null -ne $shell -and (Test-BmNamesRoot ([string]$shell) $Other)) { $bad += "the Winlogon Shell names $Other" }
   foreach ($x in $ok) { Write-BmLine ("  ok: " + $x) "Green" }
   foreach ($x in $bad) { Write-BmLine ("  NOT OK: " + $x) "Red" }
-  return , $bad
+  return $bad
 }
 
 # ------------------------------------------------------------------ main
