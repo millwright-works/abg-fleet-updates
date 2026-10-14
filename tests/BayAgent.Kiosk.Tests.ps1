@@ -1211,7 +1211,8 @@ try {
     $wallPc = [IO.File]::ReadAllText($sessPath)
     $script:Patches.Clear(); Process-Command -token "t" -cmd (New-ResetRow "s-other")
     $p0 = $(if ($script:Patches.Count -gt 0) { $script:Patches[0] } else { @{ Body = @{}; IfMatch = "" } })
-    Assert-True ($script:Patches.Count -eq 1 -and @($p0.Body.Keys).Count -eq 1 -and $p0.Body[$Col_Status] -eq 100000005 -and $p0.IfMatch -eq 'W/"1"') "Process-Command: another booking's Reset while s-pc plays: ONE write, status Skipped only, under the row's etag (no lock, no execution fields)"
+    Assert-True ($script:Patches.Count -eq 1 -and @($p0.Body.Keys).Count -eq 2 -and $p0.Body[$Col_Status] -eq 100000005 -and $p0.IfMatch -eq 'W/"1"') "Process-Command: another booking's Reset while s-pc plays: ONE write, status Skipped only, under the row's etag (no lock, no execution fields)"
+    Assert-True ($script:Patches.Count -eq 1 -and @($p0.Body.Keys).Count -eq 2 -and $p0.Body["build_lasterrorcode"] -ceq "reset-other-session" -and $p0.Body["build_lasterrorcode"] -is [string]) "A0.502 Process-Command: the refused Reset's Skipped write carries build_lasterrorcode exactly reset-other-session (and nothing else but the status)"
     Assert-True ([IO.File]::ReadAllText($sessPath) -ceq $wallPc) "...and the wall is untouched"
     $script:FailSkip = $true; $script:Patches.Clear(); Process-Command -token "t" -cmd (New-ResetRow "s-other"); $script:FailSkip = $false
     $last = $(if ($script:Patches.Count -gt 0) { $script:Patches[$script:Patches.Count - 1] } else { @{ Body = @{}; IfMatch = "" } })
@@ -1691,7 +1692,8 @@ try {
         $script:Patches3.Clear()
         Process-Command -token "t" -cmd (New-CmdRow $rowSpec.T $rowSpec.P)
         $p1 = Get-FirstPatch
-        Assert-True ($script:Patches3.Count -eq 1 -and @($p1.Body.Keys).Count -eq 1 -and $p1.Body[$Col_Status] -eq 100000005 -and (Get-BookingWrites) -eq 0) "item 2 the canceled s-h2's $($rowSpec.N) row during its warning: ONE write, status Skipped only (no lock, no execution fields, no booking write)"
+        Assert-True ($script:Patches3.Count -eq 1 -and @($p1.Body.Keys).Count -eq 2 -and $p1.Body[$Col_Status] -eq 100000005 -and (Get-BookingWrites) -eq 0) "item 2 the canceled s-h2's $($rowSpec.N) row during its warning: ONE write, status Skipped plus the refusal kind only (no lock, no execution fields, no booking write)"
+        Assert-True ($p1.Body["build_lasterrorcode"] -ceq "cancel-warning" -and $p1.Body["build_lasterrorcode"] -is [string]) "A0.502 the canceled s-h2's $($rowSpec.N) row: the Skipped write carries build_lasterrorcode exactly cancel-warning"
     }
     Assert-True ((Get-RecSid) -eq "s-h2" -and (Get-SessStatus) -eq "ENDING/s-h2") "item 2 ...and none of them moved the warning"
     $script:FailSkip3 = $true; $script:Patches3.Clear()
@@ -1706,7 +1708,17 @@ try {
     $script:Patches3.Clear()
     Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION '{"mode":"End","baySessionId":"s-h3","closeLauncher":false}')
     $p3 = Get-FirstPatch
-    Assert-True ($script:Patches3.Count -eq 1 -and $p3.Body[$Col_Status] -eq 100000005 -and @($p3.Body.Keys).Count -eq 1) "item 2 a repeated End of the ended s-h3: one write, Skipped"
+    Assert-True ($script:Patches3.Count -eq 1 -and $p3.Body[$Col_Status] -eq 100000005 -and @($p3.Body.Keys).Count -eq 2) "item 2 a repeated End of the ended s-h3: one write, Skipped plus the kind"
+    Assert-True ($p3.Body["build_lasterrorcode"] -ceq "ended-replay" -and $p3.Body["build_lasterrorcode"] -is [string]) "A0.502 a repeated End of the ended s-h3: the Skipped write carries build_lasterrorcode exactly ended-replay"
+    foreach ($erSpec in @(
+        @{ T = $CMD_STARTSESSION; N = "Start"; P = '{"mode":"Start","baySessionId":"s-h3","closeLauncher":false}' },
+        @{ T = $CMD_STARTSESSION; N = "Prep"; P = '{"mode":"Prep","baySessionId":"s-h3"}' },
+        @{ T = $CMD_UPDATESESSIONDISPLAY; N = "display update"; P = '{"mode":"Warn5","baySessionId":"s-h3"}' })) {
+        $script:Patches3.Clear()
+        Process-Command -token "t" -cmd (New-CmdRow $erSpec.T $erSpec.P)
+        $pe = Get-FirstPatch
+        Assert-True ($script:Patches3.Count -eq 1 -and @($pe.Body.Keys).Count -eq 2 -and $pe.Body[$Col_Status] -eq 100000005 -and $pe.Body["build_lasterrorcode"] -ceq "ended-replay") "A0.502 a replayed $($erSpec.N) of the ended s-h3: one Skipped write carrying build_lasterrorcode exactly ended-replay"
+    }
     $script:Patches3.Clear()
     Process-Command -token "t" -cmd (New-CmdRow $CMD_STARTSESSION ('{"mode":"Start","baySessionId":"s-h4","bookingId":"b0000000-0000-0000-0000-0000000000h4","playEndUtc":"' + $endIso + '","closeLauncher":false}'))
     Assert-True ($script:Patches3.Count -ge 2 -and $script:Patches3[0].Body[$Col_Status] -eq $STATUS_INPROGRESS -and (Get-BookingWrites) -eq 1 -and (Get-RecSid) -eq "s-h4") "item 2 a fresh booking's Start is not turned away: locked, run, booking written In-process"
@@ -1770,7 +1782,7 @@ try {
         Assert-True ((Get-SessStatus) -eq "PREP/s-n11" -and [IO.File]::ReadAllText($sessPath) -ceq $wallBeforeRetry -and (Get-BookingWrites) -eq 1) "R2 ...the retry left the next booking's wall alone (PREP/s-n11) and, as the first run never got that far, wrote the booking Complete once"
         $script:Patches3.Clear()
         Process-Command -token "t" -cmd (New-CmdRow $CMD_ENDSESSION $endRowPayload)
-        Assert-True ($script:Patches3.Count -eq 1 -and $script:Patches3[0].Body[$Col_Status] -eq 100000005) "R2 a third send of that End, now finished for good: refused as Skipped"
+        Assert-True ($script:Patches3.Count -eq 1 -and $script:Patches3[0].Body[$Col_Status] -eq 100000005 -and $script:Patches3[0].Body["build_lasterrorcode"] -ceq "ended-replay") "R2 a third send of that End, now finished for good: refused as Skipped, kind ended-replay (A0.502)"
     } finally { Remove-StandInLauncher $sl3 }
     # (c) the retry stops after its cap; (d) a session that plays now ends the retry without touching its launcher.
     Clear-Bay
