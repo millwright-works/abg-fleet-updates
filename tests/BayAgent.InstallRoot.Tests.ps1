@@ -170,6 +170,8 @@ try {
             "an 8.3 short name"                    = "$root\tools\UPDATE~1.ps1"
             "a forward slash after the root"       = "$root/tools/x.ps1"
             "forward slashes everywhere"           = ($root.Replace('\', '/') + "/tools/x.ps1")
+            "a forward slash inside a later segment" = "$root\tools/x.ps1"
+            "a forward slash inside the file part" = "$root\tools\a/b.ps1"
             "non-ASCII (e acute)"                  = "$root\tools\x$ae.ps1"
             "non-ASCII (long s in the root)"       = ("C:\" + $rn.Replace("s", [string]$longS) + "\BayAgent\tools\x.ps1")
             "non-ASCII (dotless i in the file)"    = ("$root\tools\" + "Admin".Replace("i", [string]$dotless) + ".ps1")
@@ -245,6 +247,7 @@ try {
             "-f in front of a good -File"              = ('-NoProfile -f C:\Temp\evil.ps1 -File "{0}"' -f $ok)
             "-fil in front of a good -File"            = ('-NoProfile -fil C:\Temp\evil.ps1 -File "{0}"' -f $ok)
             "-File: glued with a colon"                = ('-NoProfile -File:"{0}"' -f $ok)
+            "-File: (glued) in front of a good -File"  = ('-NoProfile -File:C:\Temp\evil.ps1 -File "{0}"' -f $ok)
             "-Command"                                 = ('-NoProfile -Command "& ''{0}''"' -f $ok)
             "-c"                                       = ('-NoProfile -c "x"')
             "no -File at all"                          = '-NoProfile'
