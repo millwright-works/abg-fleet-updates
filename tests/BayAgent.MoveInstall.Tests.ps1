@@ -337,6 +337,10 @@ function Assert-True([bool]$Cond, [string]$Msg) {
   else { $script:Fail++; $script:Failures += $Msg; Write-Host "  FAIL  $Msg" -ForegroundColor Red }
 }
 function Section([string]$T) { Write-Host ""; Write-Host "== $T" -ForegroundColor Cyan }
+# A check that throws (a file the tool should have made is missing) is counted as a FAILED check and the suite still
+# ends with its RESULT line and exit 1. Measured: the sections after the one that threw do NOT run (the error leaves
+# the outer try block), so a run with this line is read from its first failures.
+trap { $script:Fail++; $script:Failures += ("the suite stopped on an error: " + $_.Exception.Message); Write-Host ("  FAIL  the suite stopped on an error: " + $_.Exception.Message) -ForegroundColor Red; continue }
 
 # ------------------------------------------------------------------ lift the tool's functions and constants
 $tok = $null; $err = $null
