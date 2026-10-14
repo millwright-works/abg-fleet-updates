@@ -27,10 +27,10 @@ number), `<stamp>` (the time of the run).
 
 | # | What | Who | Done when |
 |---|---|---|---|
-| P1 | The FLEET-A release (the agent and bootstrap that take their folder from where they are installed) is published, and the fleet attack has passed | orchestrator | release `<version>` exists |
+| P1 | The FLEET-A release (the agent and bootstrap that take their folder from where they are installed) is published, and the fleet attack has passed. `<version>` is ABOVE 1.6.1 (Bay 1 runs a 1.6.1 that still looks for `C:\AllBirdies`; the move's version check could not tell the two apart): see `runsheet-fleet-release.md`, all of it, in order | orchestrator, Kevin | release `<version>` exists at the new repository address |
 | P2 | Bay 1 is updated to `<version>` **at the old folder** with the ordinary Update BayAgent command, and the update guard has finished | orchestrator, Dev | Bay 1 reports `<version>`; on the bay `C:\AllBirdies\BayAgent\state\update-pending.done.json` exists and `update-pending.json` does not |
 | P3 | The plugin's release guard and the `build_fleetrelease_ops` address check accept the tool path under **both** folders, deployed in Dev | portal slice | a read of the deployed check |
-| P4 | The release's three new bootstrap files `AOC.AgentHost.ps1`, `AOC.HostWatchdog.ps1`, `AOC.LauncherShell.ps1` (unsigned or signed, either is fine) are on a USB stick in a folder `bootstrap`, with `Move-BayInstall.ps1` beside it | orchestrator | the stick holds `Move-BayInstall.ps1` and `bootstrap\AOC.*.ps1` |
+| P4 | **All six** of the release's new bootstrap files `AOC.AgentHost.ps1`, `AOC.HostWatchdog.ps1`, `AOC.LauncherShell.ps1`, `AOC.ReleaseFinalize.ps1`, `AOC.RotateClientSecretDpapiAndTest.ps1`, `AOC.SetClientSecretDpapi.ps1` (none carries a signature block; the tool signs each on the bay) are on a USB stick in a folder `bootstrap`, with `Move-BayInstall.ps1` beside it. The tool stages the new counterpart of EVERY `ABG.*` file it finds in Bay 1's `bootstrap\`, so a stick with three files makes Move refuse at staging (exit 1, nothing changed) if Bay 1 holds `ABG.ReleaseFinalize.ps1` or `ABG.SetClientSecretDpapi.ps1` | orchestrator | the stick holds `Move-BayInstall.ps1` and the six `bootstrap\AOC.*.ps1` (step R6 of `runsheet-fleet-release.md`) |
 | P5 | No session is running or booked at Bay 1 for the next hour | Kevin | |
 | P6 | Kevin has BayKiosk's password at hand (needed only if Plan says "needs its password") | Kevin | |
 
