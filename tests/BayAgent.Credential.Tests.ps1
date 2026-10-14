@@ -73,7 +73,9 @@ $wanted = @(
     "Invoke-CredentialEnroll", "Invoke-CredentialTest", "Invoke-CredentialActivate", "Invoke-CredentialRetire",
     "Invoke-CredentialStatus", "Invoke-CredentialRotate",
     "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate", "Sync-FallbackTelemetry",
-    "Start-GenericProcess", "Read-LastUpdateResult", "Test-HasUsableSecret", "New-EnrollCertPayload",
+    "Start-GenericProcess", "Get-BayCmdLaunch", "Test-ScriptPathUnderRoot", "Test-BayCmdPlaceholder", "Test-BayCmdIn", "ConvertFrom-BayCmdPayload",
+    "Split-BayCmdArgs", "Test-BayCmdVersionToken", "Test-BayCmdSegment", "Test-BayCmdDataverseUrl", "Assert-BayCmdPackageUrl",
+    "Assert-BayCmdVersion", "Assert-BayCmdSha256", "Read-LastUpdateResult", "Test-HasUsableSecret", "New-EnrollCertPayload",
     # A0.458: the identity helpers the token path and activate now reach.
     "ConvertTo-AgentGuid", "Get-ActiveClientId", "Test-OwnIdentityActive", "Get-IdentityProbation",
     "Test-IdentityRefusal", "Register-IdentityProbationFailure", "Clear-IdentityProbationFailures", "Invoke-IdentityRevert",
@@ -864,18 +866,27 @@ try {
     Assert-True ($null -ne $f7read -and $f7read.ok -eq $false) "the agent can read the marker back for the heartbeat"
     # A missing executable is refused up front and always was -- that check is correct and is pinned here so
     # the F7 change cannot be mistaken for having weakened it.
-    Assert-Throws { Start-GenericProcess ([pscustomobject]@{ path = "C:\definitely\not\here\nope.exe" }) } "Executable not found" `
-        "StartProcess still refuses a path that does not exist"
-    # The gap was a file that EXISTS but cannot be launched: Start-Process threw, and the throw escaped as an
-    # opaque command failure rather than a result saying the process never ran.
-    $unlaunchable = Join-Path $BaseDir "not-a-program.abgnope"
-    [IO.File]::WriteAllText($unlaunchable, "this is not an executable")
-    $bad = Start-GenericProcess ([pscustomobject]@{ path = $unlaunchable })
+    # K1 (2026-10-14): StartProcess takes the RAW payload text and asks the plugin's closed-allowlist question of it, so a
+    # program that is not one of the two allowed ones is refused by name (it used to be refused only when it did not exist).
+    Assert-Throws { Start-GenericProcess '{"path":"C:\\definitely\\not\\here\\nope.exe"}' } "AOC_CMD_PATH_NOT_ALLOWED" `
+        "StartProcess refuses a program that is not on the closed list"
+    # The gap was an allowed program that cannot be launched: Start-Process threw, and the throw escaped as an
+    # opaque command failure rather than a result saying the process never ran. Start-Process is a stand-in here (nothing
+    # real starts), the bay's root is a fixed string (the check reads only the text of the path), and the token is empty.
+    $k1SavedBase = $BaseDir; $k1SavedTok = ${function:Get-AccessToken}
+    $BaseDir = "C:\AceOfClubs\BayAgent"
+    function Get-AccessToken { return "" }
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) throw "simulated: the program could not be started" }
+    $k1Payload = '{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","args":"-NoProfile -File C:\\AceOfClubs\\BayAgent\\tools\\Update-BayAgent.ps1"}'
+    $bad = Start-GenericProcess $k1Payload
     Assert-True ($bad.started -eq $false -and "$($bad.error)".Length -gt 0) "StartProcess reports started=false with a reason when the launch itself fails"
     Assert-True ((($script:LogLines | Where-Object { $_ -match "^\[ERROR\] StartProcess FAILED to launch" }) | Measure-Object).Count -ge 1) `
         "...and says so in the log"
     # And a launch that DOES work still says started=true, flagged as a launch rather than a completion.
-    $good = Start-GenericProcess ([pscustomobject]@{ path = "C:\Windows\System32\cmd.exe"; args = "/c exit 0" })
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru) return [pscustomobject]@{ Id = 4242 } }
+    $good = Start-GenericProcess $k1Payload
+    Remove-Item -LiteralPath function:Start-Process
+    ${function:Get-AccessToken} = $k1SavedTok; $BaseDir = $k1SavedBase
     Assert-True ($good.started -eq $true -and $good.launchedOnly -eq $true) "a real launch reports started=true, labelled launchedOnly (it does not claim the work succeeded)"
 
     # ============================================================ T21 (F9): the Day-0 trap. A shipped config names a DPAPI

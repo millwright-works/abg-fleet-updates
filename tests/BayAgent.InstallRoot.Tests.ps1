@@ -211,6 +211,11 @@ try {
     # ================================================================== R4
     Section "R4 Start-GenericProcess: every -File is checked, the short forms are refused (lifted by AST, Start-Process recorded)"
     . ([scriptblock]::Create($propFn))
+    foreach ($cn in @("Test-BayCmdPlaceholder", "Test-BayCmdIn", "ConvertFrom-BayCmdPayload", "Split-BayCmdArgs", "Test-BayCmdVersionToken", "Test-BayCmdSegment", "Test-BayCmdDataverseUrl", "Assert-BayCmdPackageUrl", "Assert-BayCmdVersion", "Assert-BayCmdSha256", "Get-BayCmdLaunch")) {
+        $ct = Get-FunctionText $AgentScript $cn
+        if ($null -eq $ct) { throw "the command-check function $cn is missing from BayAgent.ps1" }
+        . ([scriptblock]::Create($ct))
+    }
     . ([scriptblock]::Create($startFn))
     $script:Launched = @()
     function Write-Log { param([string]$Message, [string]$Level = "INFO") }
@@ -220,7 +225,9 @@ try {
     function Invoke-Launch([string]$argLine) {
         $script:Launched = @()
         $err = $null
-        try { [void](Start-GenericProcess ([pscustomobject]@{ path = $ps; args = $argLine })) } catch { $err = $_.Exception.Message }
+        # K1: the agent takes the raw payload text (the plugin's {path, args}), so the line is wrapped as JSON here
+        $json = '{"path":"' + $ps.Replace('\', '\\') + '","args":"' + $argLine.Replace('\', '\\').Replace('"', '\"').Replace("`t", '\t') + '"}'
+        try { [void](Start-GenericProcess $json) } catch { $err = $_.Exception.Message }
         return [pscustomobject]@{ Error = $err; Launched = @($script:Launched).Count }
     }
     foreach ($rn in $RootNames) {
@@ -276,8 +283,13 @@ try {
     foreach ($pa in $setupAst.ParamBlock.Parameters) { if ($pa.DefaultValue) { $dv[$pa.Name.VariablePath.UserPath] = [string]$pa.DefaultValue.Value } }
     Assert-True ($dv["FleetRawBaseUrl"] -ceq "https://raw.githubusercontent.com/millwright-works/aoc-fleet-updates/main/src/BayAgent") "the setup's package address names the new repository outright"
     Assert-True ($dv["Day0Url"] -ceq "https://raw.githubusercontent.com/millwright-works/aoc-fleet-updates/main/tools/AOC-Day0-Setup.ps1") "the setup's Day 0 address names the new repository and the new script name outright"
-    $oldRepo = @($allStrings | Where-Object { $_ -match '(?i)abg-fleet-updates' })
-    Assert-True ($oldRepo.Count -eq 0) ("no string in any shipped script names the old repository (" + $oldRepo.Count + ")")
+    # The ONE place the old name stays is the bay's own copy of the plugin's fleet-asset list (K1: the plugin accepts both
+    # names until the release after the repository has moved; the bay matches it switch for switch).
+    $oldRepoAll = @($allStrings | Where-Object { $_ -match '(?i)abg-fleet-updates' })
+    $oldRepoListed = @($oldRepoAll | Where-Object { $_ -ceq 'BayAgent.ps1|abg-fleet-updates' })
+    $oldRepo = @($oldRepoAll | Where-Object { $_ -cne 'BayAgent.ps1|abg-fleet-updates' })
+    Assert-True ($oldRepo.Count -eq 0) ("no string in any shipped script names the old repository, except the fleet-asset list (" + $oldRepo.Count + ")")
+    Assert-True ($oldRepoListed.Count -eq 1) ("the old repository name appears exactly once in BayAgent.ps1, as the plugin's second list entry (" + $oldRepoListed.Count + ")")
     $readme = [IO.File]::ReadAllText((Join-Path $RepoRoot "README.md"))
     Assert-True ($readme -match '(?m)^# aoc-fleet-updates\s*$' -and $readme -notmatch '(?i)abg-fleet') "README names the new repository"
 
@@ -297,6 +309,10 @@ try {
     Assert-True ($oldNames.Count -eq 0) "no string in any shipped script names an old ABG.* file (found $($oldNames.Count))"
     $oldTasks = @($allStrings | Where-Object { $_ -match 'ABG Bay Agent|ABG Host Watchdog|ABG BayAgent Update Guard' })
     Assert-True ($oldTasks.Count -eq 0) "no string names an old scheduled task (found $($oldTasks.Count))"
+    # K3 (2026-10-14): the six embedded signature blocks certified nothing (five were already HashMismatch at the base, the
+    # rename made the sixth stale) and every delivery path signs on arrival, so no repository script carries one.
+    $signed = @($shipped | Where-Object { [IO.File]::ReadAllText($_.FullName) -match '(?m)^# SIG # Begin signature block' } | ForEach-Object { $_.Name })
+    Assert-True ($signed.Count -eq 0) ("no shipped script carries an embedded signature block (found: " + $(if ($signed.Count) { $signed -join ", " } else { "none" }) + ")")
     $guardDefault = [regex]::Match([IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\tools\Update-BayAgent.ps1")), '\[string\]\$GuardTaskName = "([^"]*)"').Groups[1].Value
     Assert-True ($guardDefault -ceq "AOC BayAgent Update Guard") "the update guard task is named AOC BayAgent Update Guard"
     $tasks = @($allStrings | Where-Object { $_ -match '^Setup-BayPC\.ps1\|AOC Bay Agent$' }) + @($allStrings | Where-Object { $_ -match '^AOC-Day0-Setup\.ps1\|\\AOC (Bay Agent|Host Watchdog)$' })

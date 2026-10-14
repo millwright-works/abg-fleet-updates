@@ -3977,71 +3977,282 @@ function Test-ScriptPathUnderRoot([string]$Path, [string]$Root) {
     return $true
 }
 
-function Start-GenericProcess($payloadObj) {
-    if ($null -eq $payloadObj) { throw "StartProcess payload must be valid JSON." }
+# THE BAY'S OWN COMMAND CHECK, PART 2 (K1, 2026-10-14): a closed allowlist that is the plugin's, switch for switch.
+# GuardBayCommandPlugin.ValidateStartProcessPayload (portal, branch fix/rename-plug-f1d-2026-10-14) decides what a bay
+# command may be; before this the agent kept its own BLOCKLIST (-command, -c, a leaf name) that PowerShell walks around:
+# "-com <code>", a quoted "-c", "-ex bypass", "-e <base64>", and an executable path ending in a dot (the leaf was no longer
+# "powershell.exe", so no PowerShell rule ran, and Windows launched it anyway). A row that reached the bay without passing
+# the plugin ran. Now the agent asks the SAME question the plugin asks, of the raw payload text:
+#   - the payload is read with the framework's own JSON reader (the plugin's), so a repeated member, a member other than
+#     path and args, or a document that is not an object with those two is refused, and the check never reads the parsed
+#     object the agent later decorates with bayLabel, locationLabel and bayId;
+#   - a {placeholder} or <placeholder> anywhere in the text is refused; the text may not exceed 8192 characters;
+#   - the executable is EXACTLY one of two full paths (powershell.exe, shutdown.exe), compared without case;
+#   - PowerShell: every token is a switch of the closed list (bare: -NoProfile -NonInteractive -RequestRestart -Restart
+#     -RollbackDrill -NoRollbackGuard; one value: -File -Version -PackageUrl -Sha256 -WindowStyle) with its value checked
+#     (-File under THIS install's root, -PackageUrl a fleet release asset, -Version, -Sha256, -WindowStyle); no other switch,
+#     no prefix of one, no quoted spelling that is not on the list, and at least one -File;
+#   - shutdown.exe: /r /s /f and /t <digits>, nothing else.
+# What differs from the plugin, by design: the plugin accepts two roots (the old and the new folder), this accepts only the
+# root the agent is installed in; the package URL's repository list is the plugin's (both names) and moves with it.
+# The line that is LAUNCHED is rebuilt from the checked tokens (single spaces, no quotes), so what PowerShell parses is what
+# was checked. Every comparison is ordinal: PowerShell's own -eq and -contains are culture-sensitive and equate "fi" with the
+# one-character ligature. The differential against the plugin's method text (read from git) is in the hand-over; the suite
+# pins the refusals the attack named. Hyphens only in comments, ASCII only.
 
-    $path = Get-PropValue $payloadObj "path" $null
-    $args = Get-PropValue $payloadObj "args" $null
-
-    # Step 7 hardening: prevent StartProcess from bypassing execution policy or running inline PowerShell.
-    # (All scripts must run under LocalMachine=AllSigned; do NOT allow -ExecutionPolicy Bypass / -EncodedCommand.)
-    $argsText = [string]$args
-    if (-not [string]::IsNullOrWhiteSpace($argsText)) {
-        $al = $argsText.ToLowerInvariant()
-
-        $badTokens = @(
-            "-executionpolicy bypass",
-            "-ep bypass",
-            "-executionpolicy unrestricted",
-            "-encodedcommand",
-            "-enc "
-        )
-
-        foreach ($t in $badTokens) {
-            if ($al.Contains($t)) {
-                throw "StartProcess args contains disallowed token '$t'. Remove it and rely on AllSigned."
+function Test-BayCmdPlaceholder([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    foreach ($pair in @(@(123, 125), @(60, 62))) {
+        $open = [int]$pair[0]; $close = [int]$pair[1]
+        for ($i = 0; $i -lt $Text.Length; $i++) {
+            if ([int]$Text[$i] -ne $open) { continue }
+            $j = $i + 1
+            while ($j -lt $Text.Length) {
+                $k = [int]$Text[$j]
+                if (($k -ge 97 -and $k -le 122) -or ($k -ge 65 -and $k -le 90) -or ($k -ge 48 -and $k -le 57) -or $k -eq 95) { $j++ } else { break }
             }
-        }
-
-        # If launching PowerShell, require -File <script> under THIS install's root ($BaseDir, wherever it is installed:
-        # C:\AceOfClubs\BayAgent or, until a bay is moved, C:\AllBirdies\BayAgent) and block -Command.
-        $leaf = ([IO.Path]::GetFileName([string]$path)).ToLowerInvariant()
-        if ($leaf -in @("powershell.exe","pwsh.exe")) {
-            if ($al -match "\s-(command|c)\s+") { throw "StartProcess launching PowerShell cannot use -Command/-c. Use -File <script>." }
-
-            # powershell.exe takes -f, -fi and -fil for -File, and the FIRST one wins: "-fi evil.ps1 -File ok.ps1" ran evil.ps1
-            # past a check that only looked at "-File". Refuse the short forms, and a "-File" glued to a colon or more text.
-            if ([regex]::IsMatch(" " + $argsText, '(?i)\s-f(i(l)?)?(\s|$)') -or [regex]::IsMatch(" " + $argsText, '(?i)\s-file[^\s]')) {
-                throw "StartProcess PowerShell must spell the switch -File, followed by a space (no -f, -fi, -fil, -File:)."
-            }
-
-            # EVERY -File must name a script under this root (the plugin validates every occurrence the same way).
-            $fileMatches = @([regex]::Matches(" " + $argsText, '(?i)\s-file\s+("([^"]+)"|(\S+))'))
-            if ($fileMatches.Count -eq 0) { throw "StartProcess launching PowerShell must use -File <script> (no inline commands)." }
-
-            $allowedBase = $BaseDir
-            foreach ($m in $fileMatches) {
-                $scriptPath = $m.Groups[2].Value
-                if ([string]::IsNullOrWhiteSpace($scriptPath)) { $scriptPath = $m.Groups[3].Value }
-                $scriptPath = $scriptPath.Trim()
-
-                if ([string]::IsNullOrWhiteSpace($scriptPath)) { throw "StartProcess PowerShell args must include a script path after -File." }
-
-                if (-not (Test-ScriptPathUnderRoot $scriptPath $allowedBase)) {
-                    throw "StartProcess PowerShell scripts must be a .ps1 under $allowedBase (plain ASCII name, no traversal, no empty or dotted segments, no stream or wildcard or variable characters). Got: $scriptPath"
-                }
-            }
+            if ($j -gt $i + 1 -and $j -lt $Text.Length -and [int]$Text[$j] -eq $close) { return $true }
         }
     }
+    return $false
+}
 
-    if ([string]::IsNullOrWhiteSpace([string]$path)) { throw "StartProcess requires payload.path" }
+function Test-BayCmdIn([string]$Value, [string[]]$Set) {
+    foreach ($s in $Set) { if ([string]::Equals($Value, $s, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
 
-    if (!(Test-Path $path)) { throw "Executable not found: $path" }
+# The two top-level members, read with the framework's own JSON reader (the plugin's reader, same quotas).
+function ConvertFrom-BayCmdPayload([string]$Json) {
+    $doc = $null
+    try {
+        Add-Type -AssemblyName System.Runtime.Serialization -ErrorAction Stop
+        Add-Type -AssemblyName System.Xml.Linq -ErrorAction Stop
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+        $quotas = New-Object System.Xml.XmlDictionaryReaderQuotas
+        $quotas.MaxDepth = 16
+        $quotas.MaxStringContentLength = 8192
+        $quotas.MaxArrayLength = 8192
+        $quotas.MaxBytesPerRead = 8192
+        $quotas.MaxNameTableCharCount = 8192
+        $reader = [System.Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader($bytes, $quotas)
+        try { $doc = [System.Xml.Linq.XDocument]::Load($reader) } finally { $reader.Close() }
+    } catch {
+        throw "AOC_CMD_PAYLOAD_INVALID: the payload is not valid JSON."
+    }
+    $top = $doc.Root
+    if ($null -eq $top) { throw "AOC_CMD_PAYLOAD_INVALID: the payload is empty." }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $path = $null; $argText = $null
+    foreach ($el in $top.Elements()) {
+        $ia = $el.Attribute('item')
+        $member = $(if ($null -ne $ia) { [string]$ia.Value } else { [string]$el.Name.LocalName })
+        if (-not $seen.Add($member)) { throw "AOC_CMD_PAYLOAD_INVALID: the payload carries '$member' more than once." }
+        if ([string]::Equals($member, "path", [StringComparison]::Ordinal)) { $path = [string]$el.Value }
+        elseif ([string]::Equals($member, "args", [StringComparison]::Ordinal)) { $argText = [string]$el.Value }
+        else { throw "AOC_CMD_PAYLOAD_INVALID: a StartProcess payload may carry only 'path' and 'args'. Got: $member" }
+    }
+    return [pscustomobject]@{ Path = $path; Args = $argText }
+}
+
+# Splits a Windows argument string into tokens, honouring double quotes; an unclosed quote is refused.
+function Split-BayCmdArgs([string]$ArgText) {
+    $tokens = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrEmpty($ArgText)) { return , @($tokens.ToArray()) }
+    $i = 0
+    while ($i -lt $ArgText.Length) {
+        while ($i -lt $ArgText.Length -and ([int]$ArgText[$i] -eq 32 -or [int]$ArgText[$i] -eq 9)) { $i++ }
+        if ($i -ge $ArgText.Length) { break }
+        $sb = New-Object System.Text.StringBuilder
+        if ([int]$ArgText[$i] -eq 34) {
+            $i++
+            while ($i -lt $ArgText.Length -and [int]$ArgText[$i] -ne 34) { [void]$sb.Append($ArgText[$i]); $i++ }
+            if ($i -ge $ArgText.Length) { throw "AOC_CMD_ARGS_NOT_ALLOWED: the arguments contain an unclosed quote." }
+            $i++
+        } else {
+            while ($i -lt $ArgText.Length -and [int]$ArgText[$i] -ne 32 -and [int]$ArgText[$i] -ne 9) { [void]$sb.Append($ArgText[$i]); $i++ }
+        }
+        $tokens.Add($sb.ToString())
+    }
+    return , @($tokens.ToArray())
+}
+
+function Test-BayCmdVersionToken([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text) -or $Text.Length -gt 50) { return $false }
+    if (-not ([int]$Text[0] -ge 48 -and [int]$Text[0] -le 57)) { return $false }
+    $seenDash = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        if ($c -ge 48 -and $c -le 57) { continue }
+        if ($c -eq 46) { continue }
+        if ($c -eq 45) { $seenDash = $true; continue }
+        if ($seenDash -and (($c -ge 97 -and $c -le 122) -or ($c -ge 65 -and $c -le 90))) { continue }
+        return $false
+    }
+    return $true
+}
+
+function Test-BayCmdSegment([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text) -or $Text.Length -gt 100) { return $false }
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        $ok = ($c -ge 97 -and $c -le 122) -or ($c -ge 65 -and $c -le 90) -or ($c -ge 48 -and $c -le 57) -or $c -eq 45 -or $c -eq 46 -or $c -eq 95 -or $c -eq 126
+        if (-not $ok) { return $false }
+    }
+    return (-not $Text.StartsWith(".", [StringComparison]::Ordinal))
+}
+
+function Test-BayCmdDataverseUrl([string]$Url) {
+    if ([string]::IsNullOrEmpty($Url)) { return $false }
+    $lower = $Url.ToLowerInvariant()
+    $dyn = ".dynamics.com"
+    $at = $lower.IndexOf(".crm", [StringComparison]::Ordinal)
+    while ($at -ge 0) {
+        $i = $at + 4
+        while ($i -lt $lower.Length -and [int]$lower[$i] -ge 48 -and [int]$lower[$i] -le 57) { $i++ }
+        if ($i + $dyn.Length -le $lower.Length -and [string]::CompareOrdinal($lower, $i, $dyn, 0, $dyn.Length) -eq 0) {
+            $j = $i + $dyn.Length
+            if ($j -ge $lower.Length) { return $true }
+            if ([int]$lower[$j] -eq 47) { return $true }
+            if ([int]$lower[$j] -eq 58) {
+                $j++
+                while ($j -lt $lower.Length -and [int]$lower[$j] -ge 48 -and [int]$lower[$j] -le 57) { $j++ }
+                if ($j -ge $lower.Length -or [int]$lower[$j] -eq 47) { return $true }
+            }
+        }
+        $at = $lower.IndexOf(".crm", $at + 1, [StringComparison]::Ordinal)
+    }
+    return $false
+}
+
+# -PackageUrl: the plugin's GuardFleetReleasePlugin.ValidatePackageUrl (a GitHub release asset of the fleet repository).
+function Assert-BayCmdPackageUrl([string]$Url) {
+    if ([string]::IsNullOrWhiteSpace($Url)) { return }
+    $v = $Url.Trim()
+    $code = "AOC_FLEET_PACKAGE_URL_INVALID"
+    if (Test-BayCmdDataverseUrl $v) { throw "${code}: that is a Dataverse URL, and the updater refuses one by design." }
+    foreach ($ch in $v.ToCharArray()) {
+        $c = [int]$ch
+        if ($c -lt 32 -or $c -eq 127 -or $c -eq 34 -or $c -eq 39 -or $c -eq 96 -or $c -eq 36 -or $c -eq 59 -or $c -eq 124 -or $c -eq 38 -or $c -eq 60 -or $c -eq 62 -or $c -eq 94 -or $c -eq 32 -or $c -eq 9) {
+            throw "${code}: the package URL contains a character that cannot appear in one."
+        }
+    }
+    $prefix = "https://github.com/"
+    if (-not $v.StartsWith($prefix, [StringComparison]::Ordinal)) { throw "${code}: the package URL must be a GitHub release asset over https." }
+    $rest = $v.Substring($prefix.Length)
+    if ($rest.IndexOf([char]63) -ge 0) { throw "${code}: the package URL must carry no query string." }
+    if ($rest.IndexOf([char]35) -ge 0) { throw "${code}: the package URL must carry no fragment." }
+    $parts = $rest.Split([char]47)
+    $repoOk = $false
+    if ($parts.Length -eq 6) { foreach ($r in @("aoc-fleet-updates", "abg-fleet-updates")) { if ([string]::Equals($parts[1], $r, [StringComparison]::Ordinal)) { $repoOk = $true } } }
+    if ($parts.Length -ne 6 -or -not (Test-BayCmdSegment $parts[0]) -or -not $repoOk -or -not [string]::Equals($parts[2], "releases", [StringComparison]::Ordinal) -or -not [string]::Equals($parts[3], "download", [StringComparison]::Ordinal) -or -not (Test-BayCmdSegment $parts[4])) {
+        throw "${code}: the package URL is not a fleet repository release asset."
+    }
+    $file = $parts[5]
+    if (-not $file.EndsWith(".zip", [StringComparison]::Ordinal)) { throw "${code}: the package must be a .zip asset." }
+    $stem = $file.Substring(0, $file.Length - 4)
+    $dash = $stem.IndexOf([char]45)
+    $pkg = $(if ($dash -gt 0) { $stem.Substring(0, $dash) } else { "" })
+    $pkgOk = $false
+    foreach ($n in @("BayAgent", "SessionDisplay", "PromosPack")) { if ([string]::Equals($pkg, $n, [StringComparison]::Ordinal)) { $pkgOk = $true } }
+    if ($dash -le 0 -or -not $pkgOk -or -not (Test-BayCmdVersionToken $stem.Substring($dash + 1))) { throw "${code}: the asset must be named <Package>-<version>.zip." }
+}
+
+function Assert-BayCmdVersion([string]$Version) {
+    if ([string]::IsNullOrWhiteSpace($Version)) { return }
+    if (-not (Test-BayCmdVersionToken $Version.Trim())) { throw "AOC_FLEET_VERSION_INVALID: the version must be digits and dots, optionally with an alphanumeric -suffix." }
+}
+
+function Assert-BayCmdSha256([string]$Sha) {
+    if ([string]::IsNullOrWhiteSpace($Sha)) { return }
+    $v = $Sha.Trim()
+    $ok = ($v.Length -eq 64)
+    if ($ok) {
+        foreach ($ch in $v.ToCharArray()) {
+            $c = [int]$ch
+            if (-not (($c -ge 48 -and $c -le 57) -or ($c -ge 97 -and $c -le 102) -or ($c -ge 65 -and $c -le 70))) { $ok = $false; break }
+        }
+    }
+    if (-not $ok) { throw "AOC_FLEET_SHA256_INVALID: the SHA256 must be exactly 64 hexadecimal characters." }
+}
+
+# The whole decision. Returns what to launch ({ Exe, ArgText, Kind }) or throws the plugin's refusal code. Launches nothing.
+function Get-BayCmdLaunch([string]$PayloadJson, [string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($PayloadJson)) { throw "AOC_CMD_PAYLOAD_INVALID: a StartProcess command needs a {path, args} payload." }
+    if ($PayloadJson.Length -gt 8192) { throw "Payload too large. Max is 8192 chars." }
+    if (Test-BayCmdPlaceholder $PayloadJson) { throw "AOC_CMD_PAYLOAD_UNSUBSTITUTED: this payload still contains an unsubstituted {placeholder}." }
+    $p = ConvertFrom-BayCmdPayload $PayloadJson
+    if ([string]::IsNullOrWhiteSpace($p.Path)) { throw "AOC_CMD_PAYLOAD_INVALID: a StartProcess payload needs a 'path'." }
+
+    $psExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $shutdownExe = "C:\Windows\System32\shutdown.exe"
+    $want = $p.Path.Trim()
+    $exe = $null
+    foreach ($a in @($psExe, $shutdownExe)) { if ([string]::Equals($a, $want, [StringComparison]::OrdinalIgnoreCase)) { $exe = $a; break } }
+    if ($null -eq $exe) { throw "AOC_CMD_PATH_NOT_ALLOWED: a bay may only be told to launch $psExe or $shutdownExe. Got: $($p.Path)" }
+
+    $tokens = Split-BayCmdArgs $p.Args   # no @(): the function returns the array wrapped, so an empty one stays empty
+    $out = New-Object System.Collections.Generic.List[string]
+    if ([string]::Equals($exe, $shutdownExe, [StringComparison]::Ordinal)) {
+        for ($i = 0; $i -lt $tokens.Count; $i++) {
+            $t = [string]$tokens[$i]
+            if (Test-BayCmdIn $t @("/r", "/s", "/f")) { $out.Add($t); continue }
+            if ([string]::Equals($t, "/t", [StringComparison]::OrdinalIgnoreCase)) {
+                if ($i + 1 -ge $tokens.Count) { throw "AOC_CMD_ARGS_NOT_ALLOWED: /t needs a value." }
+                $i++
+                $v = [string]$tokens[$i]
+                $digits = ($v.Length -gt 0 -and $v.Length -le 6)
+                foreach ($ch in $v.ToCharArray()) { if ([int]$ch -lt 48 -or [int]$ch -gt 57) { $digits = $false } }
+                if (-not $digits) { throw "AOC_CMD_ARGS_NOT_ALLOWED: /t must be a number of seconds." }
+                $out.Add($t); $out.Add($v); continue
+            }
+            throw "AOC_CMD_ARGS_NOT_ALLOWED: '$t' is not a shutdown.exe switch a bay command may carry. Allowed: /r /s /f /t <seconds>."
+        }
+        return [pscustomobject]@{ Exe = $exe; ArgText = ($out.ToArray() -join " "); Kind = "shutdown" }
+    }
+
+    if ($tokens.Count -eq 0) { throw "AOC_CMD_ARGS_NOT_ALLOWED: launching PowerShell with no arguments would open a shell on the bay." }
+    $bare = @("-NoProfile", "-NonInteractive", "-RequestRestart", "-Restart", "-RollbackDrill", "-NoRollbackGuard")
+    $valued = @("-File", "-Version", "-PackageUrl", "-Sha256", "-WindowStyle")
+    $styles = @("Hidden", "Normal", "Minimized", "Maximized")
+    $sawFile = $false
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $t = [string]$tokens[$i]
+        if (Test-BayCmdIn $t $bare) { $out.Add($t); continue }
+        if (-not (Test-BayCmdIn $t $valued)) { throw "AOC_CMD_ARGS_NOT_ALLOWED: '$t' is not a switch a bay command may carry. Allowed: $(($bare + $valued) -join ' ')." }
+        if ($i + 1 -ge $tokens.Count) { throw "AOC_CMD_ARGS_NOT_ALLOWED: '$t' needs a value." }
+        $i++
+        $v = [string]$tokens[$i]
+        if ([string]::IsNullOrWhiteSpace($v)) { throw "AOC_CMD_ARGS_NOT_ALLOWED: '$t' was given an empty value." }
+        $send = $v
+        if ([string]::Equals($t, "-File", [StringComparison]::OrdinalIgnoreCase)) {
+            $sawFile = $true
+            if (-not (Test-ScriptPathUnderRoot $v $Root)) { throw "AOC_CMD_ARGS_NOT_ALLOWED: -File must name a .ps1 under $Root with no traversal. Got: $v" }
+        }
+        elseif ([string]::Equals($t, "-PackageUrl", [StringComparison]::OrdinalIgnoreCase)) { Assert-BayCmdPackageUrl $v; $send = $v.Trim() }
+        elseif ([string]::Equals($t, "-Sha256", [StringComparison]::OrdinalIgnoreCase)) { Assert-BayCmdSha256 $v; $send = $v.Trim() }
+        elseif ([string]::Equals($t, "-Version", [StringComparison]::OrdinalIgnoreCase)) { Assert-BayCmdVersion $v; $send = $v.Trim() }
+        elseif ([string]::Equals($t, "-WindowStyle", [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not (Test-BayCmdIn $v $styles)) { throw "AOC_CMD_ARGS_NOT_ALLOWED: -WindowStyle '$v' is not one of $($styles -join ', ')." }
+        }
+        $out.Add($t); $out.Add($send)
+    }
+    if (-not $sawFile) { throw "AOC_CMD_ARGS_NOT_ALLOWED: launching PowerShell requires -File <script under $Root>." }
+    return [pscustomobject]@{ Exe = $exe; ArgText = ($out.ToArray() -join " "); Kind = "powershell" }
+}
+
+# StartProcess. The parameter is the RAW payload text (never the parsed object, which the agent decorates with bayLabel,
+# locationLabel and bayId before any handler runs). Nothing here launches a program the plugin would not have let through.
+function Start-GenericProcess([string]$PayloadJson) {
+    $launch = Get-BayCmdLaunch $PayloadJson $BaseDir
+    $path = $launch.Exe
+    $argText = $launch.ArgText
+
+    if (!(Test-Path -LiteralPath $path)) { throw "Executable not found: $path" }
 
     # Write the agent's Dataverse token to a temp file so child scripts (e.g. Update-BayAgent.ps1)
     # can authenticate to Dataverse file downloads without exposing the token in process arguments.
-    $leaf = ([IO.Path]::GetFileName([string]$path)).ToLowerInvariant()
-    if ($leaf -in @("powershell.exe","pwsh.exe")) {
+    if ($launch.Kind -eq "powershell") {
         try {
             $dvTok = Get-AccessToken
             if (-not [string]::IsNullOrWhiteSpace($dvTok)) {
@@ -4064,17 +4275,17 @@ function Start-GenericProcess($payloadObj) {
     # What is fixed HERE is narrower and still worth having: a launch that THROWS must not be reported as a
     # launch that worked.
     try {
-        if ([string]::IsNullOrWhiteSpace([string]$args)) {
+        if ([string]::IsNullOrWhiteSpace($argText)) {
             $p = Start-Process -FilePath $path -PassThru
         } else {
-            $p = Start-Process -FilePath $path -ArgumentList $args -PassThru
+            $p = Start-Process -FilePath $path -ArgumentList $argText -PassThru
         }
     } catch {
         Write-Log ("StartProcess FAILED to launch '{0}': {1}" -f $path, $_.Exception.Message) "ERROR"
         return @{
             started = $false
             path = $path
-            args = $args
+            args = $argText
             error = $_.Exception.Message
             note = "the process did not launch; nothing ran"
         }
@@ -4084,7 +4295,7 @@ function Start-GenericProcess($payloadObj) {
         started = $true
         launchedOnly = $true   # says what started=true does and does not claim; see lastUpdateResult
         path = $path
-        args = $args
+        args = $argText
         pid = $p.Id
     }
 }
@@ -5268,7 +5479,8 @@ $CMD_EMERGENCY_STOP {
             }
         }
         $CMD_STARTPROCESS {
-            return (Start-GenericProcess $payloadObj)
+            # the RAW payload text: the check reads what the plugin read, not the object decorated with bayLabel and bayId
+            return (Start-GenericProcess $PayloadJson)
         }
 
         $CMD_STOPPROCESS {
