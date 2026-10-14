@@ -3,7 +3,23 @@ param([switch]$FromAgent)
 
 $ErrorActionPreference = "Stop"
 
-$BaseDir    = "C:\AllBirdies\BayAgent"
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$BaseDir    = Get-BayInstallRoot $PSScriptRoot
 $ControlDir = Join-Path $BaseDir "control"
 $LogDir     = Join-Path $BaseDir "logs"
 

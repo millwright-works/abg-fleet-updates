@@ -35,7 +35,7 @@ param([string]$AgentScript = "", [string]$ShellScript = "")
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($AgentScript)) { $AgentScript = Join-Path $PSScriptRoot "..\src\BayAgent\BayAgent.ps1" }
-if ([string]::IsNullOrWhiteSpace($ShellScript)) { $ShellScript = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\ABG.KioskShell.ps1" }
+if ([string]::IsNullOrWhiteSpace($ShellScript)) { $ShellScript = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\AOC.KioskShell.ps1" }
 $AgentScript = (Resolve-Path $AgentScript).Path
 $ShellScript = (Resolve-Path $ShellScript).Path
 
@@ -109,7 +109,7 @@ try {
     foreach ($n in @("Get-KioskProp", "Read-KioskJsonFile", "ConvertTo-KioskUtc", "Get-KioskPolicyDecision", "Get-KioskLauncherWanted")) {
         $a = (Get-DefText $AgentDefs $n) -replace "`r", ""
         $s = (Get-DefText $ShellDefs $n) -replace "`r", ""
-        Assert-True ($a -ceq $s) "$n is identical in BayAgent.ps1 and ABG.KioskShell.ps1"
+        Assert-True ($a -ceq $s) "$n is identical in BayAgent.ps1 and AOC.KioskShell.ps1"
     }
 
     # ============================================================ K1
@@ -362,7 +362,7 @@ try {
     Section "K7 the activation verifier refuses every shape but a verified file, in order"
     $relKiosk = Join-Path $Sandbox "releases\1.4.0\kiosk"
     New-Item -ItemType Directory -Force -Path $relKiosk | Out-Null
-    $goodShell = Join-Path $relKiosk "ABG.KioskShell.ps1"
+    $goodShell = Join-Path $relKiosk "AOC.KioskShell.ps1"
     [IO.File]::Copy($ShellScript, $goodShell, $true)
     $script:SigFake = @{ Status = "Valid"; Timestamped = $true; Thumbprint = "AAAA" }
     function Get-KioskAuthenticode([string]$Path) { return $script:SigFake }
@@ -371,13 +371,13 @@ try {
     Assert-True ($v.Ok -and $v.Why -eq "verified" -and $v.SignerMatches) "a parsed, big enough, Valid, timestamped file signed by the agent's certificate: verified"
     Assert-True ($v.Sha256 -match '^[0-9a-f]{64}$') "...and its sha256 is reported"
     Assert-True (-not (Test-V (Join-Path $relKiosk "missing.ps1")).Ok) "missing file: refused"
-    $outside = Join-Path $Sandbox "current\kiosk\ABG.KioskShell.ps1"
+    $outside = Join-Path $Sandbox "current\kiosk\AOC.KioskShell.ps1"
     [IO.File]::Copy($ShellScript, $outside, $true)
     $vo = Test-V $outside
     Assert-True (-not $vo.Ok -and $vo.Why -match "not inside") "a good file OUTSIDE this version's release folder (current\kiosk): refused (version-pinned path)"
-    $vt = Test-V ($relKiosk + "\..\..\1.4.0\kiosk\ABG.KioskShell.ps1")
+    $vt = Test-V ($relKiosk + "\..\..\1.4.0\kiosk\AOC.KioskShell.ps1")
     Assert-True ($vt.Ok) "a path with .. that resolves inside the folder is judged on its full path"
-    $vt2 = Test-V ($relKiosk + "\..\..\..\current\kiosk\ABG.KioskShell.ps1")
+    $vt2 = Test-V ($relKiosk + "\..\..\..\current\kiosk\AOC.KioskShell.ps1")
     Assert-True (-not $vt2.Ok) "a path with .. that resolves outside the folder: refused"
     $small = Join-Path $relKiosk "small.ps1"; Set-TestFile $small "Write-Host 1"
     $vs = Test-V $small
@@ -411,8 +411,8 @@ try {
     Assert-True (Test-KioskShellCommandLine $myShellCl) "the command line the agent builds is recognized"
     $older = $myShellCl.Replace("\1.4.0\", "\1.3.9\")
     Assert-True (Test-KioskShellCommandLine $older) "an older version's shell of this install is recognized (it keeps running after an update)"
-    Assert-True (-not (Test-KioskShellCommandLine '"powershell.exe" -File "D:\Other\releases\1.4.0\kiosk\ABG.KioskShell.ps1"')) "a shell file under another root is not this install's"
-    Assert-True (-not (Test-KioskShellCommandLine ('"powershell.exe" -File "{0}"' -f (Join-Path $Sandbox "current\kiosk\ABG.KioskShell.ps1")))) "the current\ copy is not a release-folder shell"
+    Assert-True (-not (Test-KioskShellCommandLine '"powershell.exe" -File "D:\Other\releases\1.4.0\kiosk\AOC.KioskShell.ps1"')) "a shell file under another root is not this install's"
+    Assert-True (-not (Test-KioskShellCommandLine ('"powershell.exe" -File "{0}"' -f (Join-Path $Sandbox "current\kiosk\AOC.KioskShell.ps1")))) "the current\ copy is not a release-folder shell"
     Assert-True (-not (Test-KioskShellCommandLine '"notepad.exe" C:\x.txt')) "an unrelated program is not"
     Assert-True (-not (Test-KioskShellCommandLine $null)) "an unreadable command line is not"
     $hbPath = Join-Path $Sandbox "probe-hb.json"
@@ -758,16 +758,16 @@ try {
     Assert-True ($closeText -match 'Test-KioskIsConfiguredLauncher -Proc \$fresh -Cfg \$S\.Cfg -SessionId \$S\.SessionId\) -or \$null -eq \$fst -or \$fst -ne \$rec\.Start' -and $closeText -match 'Test-KioskIsConfiguredLauncher -Proc \$p ') "...and it re-checks name, path, session and start time before asking and before ending"
     Assert-True (@($shellCode | Where-Object { $_ -match '(?i)^Remove-Item$' }).Count -eq 1 -and (Get-DefText $ShellDefs "Remove-KioskOldLogs") -match 'Remove-Item') "the shell's only Remove-Item is the 14-day log retention"
     Assert-True ($shellText -notmatch '(?i)Invoke-RestMethod|Invoke-WebRequest|EffectiveConfig|ConfigItem|BayProfile|dataverse|crm\.dynamics') "the shell reads nothing from the platform (I6)"
-    Assert-True (@([regex]::Matches($shellText, '(?m)^\$BaseDir = "C:\\AllBirdies\\BayAgent"\r?$')).Count -eq 1) "the shell has exactly one install-path literal (the launch test repoints only it)"
+    Assert-True (@([regex]::Matches($shellText, '(?m)^\$BaseDir = Get-BayInstallRoot \$PSScriptRoot\r?$')).Count -eq 1) "the shell has exactly one install-path literal (the launch test repoints only it)"
     Assert-True (($agentText + $shellText) -notmatch '@\(\s*Get-KioskProp') "no call wraps Get-KioskProp in @() (it returns an array as one object; @() would nest it)"
     $kioskFns = @($AgentDefs | Where-Object { $_.Name -match 'Kiosk' })
     $stopsInKiosk = @($kioskFns | ForEach-Object { @($_.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -match '(?i)^(Stop-Process|kill|spps|taskkill)$' }, $true)) })
     Assert-True ($stopsInKiosk.Count -eq 1 -and ((Get-DefText $AgentDefs "Invoke-KioskReconcileTick") -match 'Stop-Process -Id \$procId')) "the agent's kiosk code stops a process in exactly one place, by id, in the reconciler"
     $tick = Get-DefText $AgentDefs "Invoke-KioskReconcileTick"
     Assert-True ($tick -match '(?s)if \(\$live\.State -eq "hung"\) \{.*?& \$StopProcess') "...and only on the hung branch"
-    $argOut = Get-KioskShellArgumentList "C:\x\releases\1.4.0\kiosk\ABG.KioskShell.ps1"
+    $argOut = Get-KioskShellArgumentList "C:\x\releases\1.4.0\kiosk\AOC.KioskShell.ps1"
     Assert-True ($argOut -notmatch '(?i)ExecutionPolicy|Bypass|-Command|-ep |-enc') "the shell's command line carries no execution-policy override (AllSigned applies)"
-    Assert-True ($argOut -ceq '-NoProfile -NonInteractive -WindowStyle Hidden -File "C:\x\releases\1.4.0\kiosk\ABG.KioskShell.ps1" -Companion') "...and is exactly the documented one"
+    Assert-True ($argOut -ceq '-NoProfile -NonInteractive -WindowStyle Hidden -File "C:\x\releases\1.4.0\kiosk\AOC.KioskShell.ps1" -Companion') "...and is exactly the documented one"
     $exec = Get-DefText $AgentDefs "Execute-Command"
     $iStart = $exec.IndexOf('$kioskIntent = Set-KioskIntentForCommand -CommandType $CMD_STARTSESSION')
     $iLaunch = $exec.IndexOf('Start-LauncherIfNeeded "StartSession:Start"')
@@ -1820,7 +1820,7 @@ try {
         $root = $(if ($null -ne $Reuse) { $Reuse.Root } else { Join-Path $Sandbox ("realloop-" + $Name) })
         foreach ($d in @("", "logs", "secrets", "state")) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null }
         $text = [IO.File]::ReadAllText($AgentScript)
-        $needle = '$BaseDir = "C:\AllBirdies\BayAgent"'
+        $needle = '$BaseDir = Get-BayInstallRoot $PSScriptRoot'
         if (-not $text.Contains($needle)) { throw "the BaseDir literal was not found in the agent" }
         $text = $text.Replace($needle, ('$BaseDir = "{0}"' -f $root))
         if (-not [string]::IsNullOrEmpty($KillAnchor)) {

@@ -1,13 +1,13 @@
 <#
-ABG.AgentHost.ps1 (Step 7.2.1)
-- Single, stable entrypoint launched by Scheduled Task: \ABG Bay Agent (Run as BayKiosk)
-- Starts and supervises BayAgent.ps1 from C:\AllBirdies\BayAgent\current
+AOC.AgentHost.ps1 (Step 7.2.1)
+- Single, stable entrypoint launched by Scheduled Task: \AOC Bay Agent (Run as BayKiosk)
+- Starts and supervises BayAgent.ps1 from C:\AceOfClubs\BayAgent\current
 - IMPORTANT for AllSigned: does NOT use -ExecutionPolicy Bypass.
 
 Hardening in this version:
 - Single-instance lock (mutex) for AgentHost itself
 - Pre-start cleanup: kills orphan BayAgent instances before launching a new one
-- Writes structured logs to C:\AllBirdies\BayAgent\logs\AgentHost-YYYYMMDD.log
+- Writes structured logs to C:\AceOfClubs\BayAgent\logs\AgentHost-YYYYMMDD.log
 #>
 
 [CmdletBinding()]
@@ -18,7 +18,23 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$BaseDir = "C:\AllBirdies\BayAgent"
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$BaseDir = Get-BayInstallRoot $PSScriptRoot
 $LogDir  = Join-Path $BaseDir "logs"
 $StopFile = Join-Path $BaseDir "stop.host"
 
@@ -38,7 +54,7 @@ function Write-HostLog([string]$msg, [ValidateSet("DEBUG","INFO","WARN","ERROR")
 $mutex = $null
 $createdNew = $false
 try {
-  $mutex = New-Object System.Threading.Mutex($true, "Global\ABG.AgentHost", [ref]$createdNew)
+  $mutex = New-Object System.Threading.Mutex($true, "Global\AOC.AgentHost", [ref]$createdNew)
   if (-not $createdNew) {
     Write-HostLog "Another AgentHost instance is already running. Exiting." "WARN"
     exit 0
@@ -57,7 +73,7 @@ function Get-PSProcessesByCmdLike([string]$pattern) {
 
 function Stop-OrphanBayAgents {
   # Match any BayAgent.ps1 running from current or releases
-  $procs = @(Get-PSProcessesByCmdLike "*\AllBirdies\BayAgent\*\BayAgent.ps1*")
+  $procs = @(Get-PSProcessesByCmdLike ("*" + $BaseDir.TrimEnd('\') + "\*\BayAgent.ps1*"))
   if ($procs.Count -gt 0) {
     Write-HostLog ("Found {0} BayAgent process(es) already running. Killing before launch to prevent duplicates." -f $procs.Count) "WARN"
     foreach ($p in $procs) {

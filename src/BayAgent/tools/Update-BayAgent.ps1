@@ -4,11 +4,11 @@ Update-BayAgent.ps1
 Purpose
 - Download a versioned BayAgent zip from HTTPS (e.g., GitHub Releases)
 - Verify SHA256
-- Expand into:   C:\AllBirdies\BayAgent\releases\<version>\
-- Promote into:  C:\AllBirdies\BayAgent\current\
+- Expand into:   C:\AceOfClubs\BayAgent\releases\<version>\
+- Promote into:  C:\AceOfClubs\BayAgent\current\
 - Sign installed scripts (BayAgent.ps1 and any .ps1/.psm1/.psd1 in current) to satisfy AllSigned,
   RFC 3161 timestamped so the signature outlives the signing certificate's own expiry
-- Optionally request restart by writing: C:\AllBirdies\BayAgent\control\restart.host
+- Optionally request restart by writing: C:\AceOfClubs\BayAgent\control\restart.host
 
 ZIP structure supported:
 A) Files at root (BayAgent.ps1, manifest.json, etc.)
@@ -17,7 +17,7 @@ B) A single top-level folder containing those files
 
 Typical usage (via StartProcess BayCommand):
 
-  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-BayAgent.ps1" `
+  powershell.exe -NoProfile -File "C:\AceOfClubs\BayAgent\tools\Update-BayAgent.ps1" `
     -Version "1.1.8" `
     -PackageUrl "https://github.com/<owner>/<repo>/releases/download/<tag>/BayAgent-1.1.8.zip" `
     -Sha256 "<sha256>" `
@@ -55,12 +55,12 @@ REMOTE INSTALL WITH NOBODY ON SITE (1.3.1, A0.437)
      (and every shipped tools\ file) hashes equal to releases\<version>.
   2. A SNAPSHOT OF WHAT IS RUNNING IS TAKEN FIRST (rollback\current, rollback\tools, rollback\snapshot.json,
      hash-verified). It is local and already signed, so a rollback needs no download and no live agent.
-  3. current\ IS NEVER A LINK WHEN IT IS WRITTEN. ABG.ReleaseFinalize.ps1 can make current\ a junction to
+  3. current\ IS NEVER A LINK WHEN IT IS WRITTEN. AOC.ReleaseFinalize.ps1 can make current\ a junction to
      releases\<v>; a /MIR into it would overwrite that release, the very copy a rollback needs. The link is
      removed NON-recursively (the target is never touched) and replaced by a real folder first.
   4. A ROLLBACK GUARD WATCHES THE NEW AGENT (tools\Watch-BayAgentUpdate.ps1, launched from the snapshot so the
      package being installed cannot change it). It runs OUTSIDE the agent's process tree and scheduled task (its
-     own per-user task, falling back to WMI): the restart that brings the new agent up ends \ABG Bay Agent and
+     own per-user task, falling back to WMI): the restart that brings the new agent up ends \AOC Bay Agent and
      stops processes by command line, and the guard's at-logon trigger re-arms it if the bay reboots. It must
      confirm it is armed before anything is promoted; if it cannot arm, nothing is promoted and the run fails
      with stage "guard". If the new code does not prove itself back (an alive record carrying the hash of the
@@ -81,7 +81,7 @@ param(
   [Parameter(Mandatory = $true)][string]$PackageUrl,
   [Parameter(Mandatory = $true)][string]$Sha256,
 
-  [string]$BaseDir = "C:\AllBirdies\BayAgent",
+  [string]$BaseDir = "",   # empty = the root this script is installed in (Get-BayInstallRoot)
 
   # If you provide -CertThumbprint we'll use that exact cert.
   [string]$CertThumbprint = "",
@@ -122,7 +122,7 @@ param(
   # to judge, and rolling back cannot be shown to be better).
   [int]$GuardMaxWaitSeconds = 21600,
   [int]$GuardArmTimeoutSeconds = 60,
-  [string]$GuardTaskName = "ABG BayAgent Update Guard",
+  [string]$GuardTaskName = "AOC BayAgent Update Guard",
   [switch]$NoRollbackGuard,
   [switch]$RollbackDrill
 )
@@ -230,6 +230,24 @@ $script:InstallId = ""
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = Get-BayInstallRoot $PSScriptRoot }
+
 if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $BaseDir "logs\Update-BayAgent.log" }
 
 function Invoke-Robo([string]$src, [string]$dst, [string[]]$extraArgs) {
@@ -276,8 +294,9 @@ function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
     # which silently drops the placeholder and prints a URL-less message on an unmanned machine.
     $msg = ("PackageUrl points at Dataverse ({0}). Dataverse file-column hosting is retired: " +
             "this script no longer impersonates a user to read file columns. Publish the package " +
-            "as a GitHub Release asset and set the Fleet.BayAgent.PackageUrl ConfigItem to that " +
-            "URL -- the SHA256 does not change, because the package bytes do not change.")
+            "as a GitHub Release asset and put its address in the Package URL of the fleet release " +
+            "row (the one source of a release; the three Fleet.BayAgent.* settings are retired and nothing reads them) " +
+            "-- the SHA256 does not change, because the package bytes do not change.")
     throw ($msg -f $url)
   }
 
@@ -456,7 +475,7 @@ function Get-UpdateGuardArguments([string]$guardScript, [string]$installId, [str
 }
 
 function Start-UpdateGuard([string]$guardScript, [string]$installId) {
-  # Launch the guard OUTSIDE this process tree. The agent is restarted by HostWatchdog ending the \ABG Bay Agent
+  # Launch the guard OUTSIDE this process tree. The agent is restarted by HostWatchdog ending the \AOC Bay Agent
   # scheduled task and stopping processes by command line, so the guard must belong to neither. MEASURED 2026-10-07
   # (Windows 11 26300, tests\BayAgent.UpdateGuard.Tests.ps1 K): ending a task did NOT stop a plain child it had
   # started, but nothing here relies on that either way. First choice: a per-user scheduled task (its own task; an

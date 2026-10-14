@@ -1,7 +1,7 @@
 <#
 BayAgent.SetupRun.Tests.ps1
 
-Runs the REAL text of Setup-BayPC.ps1 and ABG-Day0-Setup.ps1, top to bottom, against recorders on a modeled blank PC,
+Runs the REAL text of Setup-BayPC.ps1 and AOC-Day0-Setup.ps1, top to bottom, against recorders on a modeled blank PC,
 in every argument shape a run sheet or an installer uses, and a second time; then asserts on what was written and on
 what was printed.
 
@@ -32,10 +32,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$RootName = if ([string]::IsNullOrWhiteSpace($env:AOC_TEST_ROOT_NAME)) { "AceOfClubs" } else { $env:AOC_TEST_ROOT_NAME }   # run the suite twice: AceOfClubs (default) and AllBirdies (a bay not yet moved)
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($SetupScript)) { $SetupScript = Join-Path $RepoRoot "src\BayAgent\tools\Setup-BayPC.ps1" }
-if ([string]::IsNullOrWhiteSpace($Day0Script))  { $Day0Script  = Join-Path $RepoRoot "tools\ABG-Day0-Setup.ps1" }
+if ([string]::IsNullOrWhiteSpace($Day0Script))  { $Day0Script  = Join-Path $RepoRoot "tools\AOC-Day0-Setup.ps1" }
 $SetupScript = (Resolve-Path $SetupScript).Path
 $Day0Script  = (Resolve-Path $Day0Script).Path
 $Harness = Join-Path $PSScriptRoot "SetupRun.Harness.ps1"
@@ -135,9 +136,9 @@ $KeyRdp = "hklm:\system\currentcontrolset\control\terminal server|fdenytsconnect
 $KeyUsb = "hklm:\system\currentcontrolset\services\usbstor|start"
 $KeyWinlogon = "hklm:\software\microsoft\windows nt\currentversion\winlogon|"
 $LockdownRows = @("USB storage disabled", "Admin shell override (HKCU)", "Win+L (lock) disabled", "Task Manager disabled")
-$AllRows = @("Windows 11 Pro", "Computer name = BAY1KIOSK", "Bootstrap: ABG.AgentHost.ps1", "Bootstrap: ABG.HostWatchdog.ps1", "Tool: Update-BayAgent.ps1",
+$AllRows = @("Windows 11 Pro", "Computer name = BAY1KIOSK", "Bootstrap: AOC.AgentHost.ps1", "Bootstrap: AOC.HostWatchdog.ps1", "Tool: Update-BayAgent.ps1",
     "agent-config.json present", "Agent package installed (current\BayAgent.ps1)", "No DPAPI secret file (certificate bay)", "Code signing certificate",
-    "Scheduled task: ABG Bay Agent", "Scheduled task: ABG Host Watchdog", "BayKiosk user exists", "Auto-login enabled", "Remote Desktop off",
+    "Scheduled task: AOC Bay Agent", "Scheduled task: AOC Host Watchdog", "BayKiosk user exists", "Auto-login enabled", "Remote Desktop off",
     "USB storage disabled", "Dataverse connectivity", "Shell wrapper script", "Custom shell (HKLM)", "Admin shell override (HKCU)",
     "Win+L (lock) disabled", "Task Manager disabled", "Display count (3 required)", "Execution policy (AllSigned)")
 
@@ -165,7 +166,7 @@ try {
     foreach ($row in $LockdownRows) { Assert-True (Test-Row $r1 $row "PENDING") "lockdown row '$row': PENDING, because the lockdown was skipped on purpose" }
     Assert-True (Test-Row $r1 "Agent package installed (current\BayAgent.ps1)" "PENDING") "Agent package installed: PENDING on a blank PC"
     Assert-True (Test-Row $r1 "No DPAPI secret file (certificate bay)" "PASS") "No DPAPI secret file: PASS"
-    Assert-True ((Test-Row $r1 "Scheduled task: ABG Bay Agent" "PASS") -and (Test-Row $r1 "Scheduled task: ABG Host Watchdog" "PASS")) "both scheduled task rows: PASS"
+    Assert-True ((Test-Row $r1 "Scheduled task: AOC Bay Agent" "PASS") -and (Test-Row $r1 "Scheduled task: AOC Host Watchdog" "PASS")) "both scheduled task rows: PASS"
     Assert-True (Test-Row $r1 "Execution policy (AllSigned)" "PASS") "Execution policy: PASS"
     Assert-True ($r1.policy -eq "AllSigned") "the machine script policy is AllSigned after a run that skipped the lockdown (the tasks can start)"
     Assert-True ((Get-LogCount $r1 '^POLICY   Set-ExecutionPolicy AllSigned -Scope LocalMachine') -eq 1) "...set once, through Set-ExecutionPolicy -Scope LocalMachine, whose override error did not stop the run"
@@ -175,7 +176,7 @@ try {
     Assert-True ((Get-LogCount $r1 'fDenyTSConnections') -eq 0 -and (Get-RunReg $r1 $KeyRdp) -eq 1) "with the lockdown skipped nothing writes the Remote Desktop value, and it is still 1 (off)"
     Assert-True ((Get-LogCount $r1 '^FIREWALL') -eq 0) "...and no firewall rule is touched"
     Assert-True ((Get-RunReg $r1 $KeyUsb) -eq 3) "...and USB storage is still allowed (the lockdown really was skipped)"
-    Assert-True ((@($r1.tasks) -join ",") -eq "ABG Bay Agent,ABG Host Watchdog") "both scheduled tasks were registered"
+    Assert-True ((@($r1.tasks) -join ",") -eq "AOC Bay Agent,AOC Host Watchdog") "both scheduled tasks were registered"
     Assert-True ((@($r1.users) -join ",") -eq "BayKiosk" -and (Get-LogCount $r1 '^USER     created local user BayKiosk') -eq 1) "the BayKiosk account was created once"
     Assert-True ((Get-RunReg $r1 ($KeyWinlogon + "defaultdomainname")) -eq "BAY1KIOSK" -and "$(Get-RunReg $r1 ($KeyWinlogon + 'autoadminlogon'))" -eq "1" -and (Get-RunReg $r1 ($KeyWinlogon + "defaultusername")) -eq "BayKiosk") "automatic sign-in: on, as BayKiosk, with the bay's name"
     $dl1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^DOWNLOAD ' })
@@ -289,7 +290,7 @@ try {
     Assert-True ($null -ne $o1r.configText -and ([string]$o1r.configText) -notmatch '<[a-z-]+>' -and $ot1 -match 'environmentUrl, tenantId, clientId and bayId were filled from this command line') "...with no <placeholder> left, and Day0 says all four were filled"
     Assert-True (-not ([string]$o1r.configText).Contains($VendorShared) -and -not $ot1.Contains($VendorShared)) "the vendor's shared app id is in neither the configuration nor anything printed"
     $enrO = @(Get-EnrollLines $o1r)
-    $wantLine = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<root>\AllBirdies\BayAgent\current\BayAgent.ps1" -EnrollCert -EnrollClientId ' + $OwnApp)
+    $wantLine = (('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<root>\{0}\BayAgent\current\BayAgent.ps1" -EnrollCert -EnrollClientId ' -f $RootName) + $OwnApp)
     Assert-True ($enrO.Count -eq 2 -and @($enrO | Where-Object { $_ -cne $wantLine }).Count -eq 0) ("both enroll lines are exactly the line a person runs, with the bay's own app id (found: " + ($enrO -join " || ") + ")")
     Assert-True (-not $ot1.Contains($EnrollWords)) "...and the words-to-replace appear nowhere when the id was typed"
     Assert-True ($ot1 -match "RESULT: ENROLLED" -and $ot1 -match "RESULT: READY" -and $ot1 -match "NO 'RESULT:' LINE AT ALL" -and $ot1 -match "NOT as administrator") "the screen says what the line must end with, twice, that no RESULT line means the wrong agent, and not to run it as administrator"
@@ -356,9 +357,9 @@ try {
     )
     $s1 = Get-PlanRun $sec 0; $st = Get-RunText $s1
     Assert-True ($s1.ended -eq "ran to its last line") ("it reaches the last line (" + $s1.ended + " " + $s1.stoppedAt + ")")
-    Assert-True ((Get-LogCount $s1 '^DOWNLOAD .*/bootstrap/ABG\.SetClientSecretDpapi\.ps1$') -eq 1 -and $s1.secretToolOnDisk -eq $true) "the secret tool is downloaded once and is on disk"
+    Assert-True ((Get-LogCount $s1 '^DOWNLOAD .*/bootstrap/AOC\.SetClientSecretDpapi\.ps1$') -eq 1 -and $s1.secretToolOnDisk -eq $true) "the secret tool is downloaded once and is on disk"
     Assert-True ((Get-LogCount $s1 '^SIGN .*SetClientSecretDpapi') -eq 0 -and (Get-LogCount $s1 '^SIGN ') -eq 5) "...and is not signed (five signed files, as before)"
-    Assert-True ($st -match 'bootstrap\\ABG\.SetClientSecretDpapi\.ps1' -and (Test-Row $s1 "DPAPI secret exists" "PENDING")) "the screen gives the command that runs it, and the row reads PENDING until the file exists"
+    Assert-True ($st -match 'bootstrap\\AOC\.SetClientSecretDpapi\.ps1' -and (Test-Row $s1 "DPAPI secret exists" "PENDING")) "the screen gives the command that runs it, and the row reads PENDING until the file exists"
 
     # =========================================================================================== values that are not values
     Section "PLAN bad-values: a typed value that is not one is not written; a later run never rewrites the file"
@@ -423,7 +424,7 @@ try {
     $p1 = Get-PlanRun $pol 0
     Assert-True ($p1.ended -eq "ran to its last line") ("it still reaches the last line (" + $p1.ended + " " + $p1.stoppedAt + ")")
     Assert-True (Test-Row $p1 "Execution policy (AllSigned)" "FAIL") "Execution policy: FAIL (never a text outside the summary's buckets)"
-    Assert-True ((Test-Row $p1 "Scheduled task: ABG Bay Agent" "FAIL") -and (Test-Row $p1 "Scheduled task: ABG Host Watchdog" "FAIL")) "both scheduled task rows: FAIL, because a registered task that cannot start is not a pass"
+    Assert-True ((Test-Row $p1 "Scheduled task: AOC Bay Agent" "FAIL") -and (Test-Row $p1 "Scheduled task: AOC Host Watchdog" "FAIL")) "both scheduled task rows: FAIL, because a registered task that cannot start is not a pass"
     Assert-True ((Get-RunText $p1) -match '(?m)^\d+ PASSED, 3 FAILED, \d+ PENDING\s*$') "the summary counts those three failures"
     Assert-True ((Get-RunText $p1) -match "The machine script policy reads 'Undefined', not AllSigned" -and (Get-RunText $p1) -notmatch "Machine script policy: AllSigned\.") "and the script-policy step itself says the policy did not take (it goes by the read-back, not by the absence of an error)"
     Assert-True ($t1 -match "Machine script policy: AllSigned\.") "(on the ordinary first run that step says AllSigned)"

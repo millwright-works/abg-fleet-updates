@@ -1,11 +1,11 @@
 <#
-ABG DPAPI Secret Setup (LocalMachine) - v2
+Ace of Clubs DPAPI Secret Setup (LocalMachine) - v2
 - Prompts for an Entra app client secret and writes it encrypted with DPAPI LocalMachine scope.
 - Locks ACLs on the secrets folder + file (best-effort).
 
 Usage:
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ABG.SetClientSecretDpapi.ps1 `
-    -OutPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" `
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\AOC.SetClientSecretDpapi.ps1 `
+    -OutPath "C:\AceOfClubs\BayAgent\secrets\clientsecret.dpapi" `
     -AgentAccount ".\BayKiosk"
 #>
 
@@ -17,7 +17,7 @@ Usage:
 # Requiring a valid Authenticode signature to run the tool that recovers from a
 # code-signing problem (expired cert, broken trust chain, etc.) is a chicken-and-egg
 # lockout: exactly the failure this script may need to be run to fix. Same reasoning
-# applies to ABG.RotateClientSecretDpapiAndTest.ps1, and matches ABG-Day0-Setup.ps1's
+# applies to AOC.RotateClientSecretDpapiAndTest.ps1, and matches AOC-Day0-Setup.ps1's
 # existing signing list, which excludes both of these scripts too.
 
 param(

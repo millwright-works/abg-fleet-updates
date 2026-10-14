@@ -4,9 +4,9 @@ Update-PromosPack.ps1
 - Validates SHA256 (optional)
 - Validates promos.json parses
 - Validates every referenced bg.src under /promos/ exists in the pack
-- Mirrors promos/ assets into C:\AllBirdies\SessionDisplay\data\promos\ (deletes old files not in pack)
-- Atomically replaces C:\AllBirdies\SessionDisplay\data\promos.json
-- Logs to C:\AllBirdies\BayAgent\logs\Update-PromosPack.log
+- Mirrors promos/ assets into C:\AceOfClubs\SessionDisplay\data\promos\ (deletes old files not in pack)
+- Atomically replaces C:\AceOfClubs\SessionDisplay\data\promos.json
+- Logs to C:\AceOfClubs\BayAgent\logs\Update-PromosPack.log
 
 Run via BayCommand StartProcess.
 #>
@@ -16,9 +16,30 @@ param(
   [Parameter(Mandatory=$true)][string]$PackageUrl,
   [string]$Sha256 = "",
 
-  [string]$SessionDisplayDir = "C:\AllBirdies\SessionDisplay",
-  [string]$LogPath = "C:\AllBirdies\BayAgent\logs\Update-PromosPack.log"
+  [string]$SessionDisplayDir = "",   # empty = SessionDisplay beside the BayAgent folder this script is installed in
+  [string]$LogPath = ""   # empty = logs\Update-PromosPack.log in the BayAgent folder
 )
+
+
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$InstallRoot = Get-BayInstallRoot $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($SessionDisplayDir)) { $SessionDisplayDir = Join-Path (Split-Path -Parent $InstallRoot) "SessionDisplay" }
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $InstallRoot "logs\Update-PromosPack.log" }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"

@@ -1,5 +1,5 @@
 <#
-ABG.KioskShell.ps1 (A0.363, BayAgent 1.4.0)
+AOC.KioskShell.ps1 (A0.363, BayAgent 1.4.0)
 
 WHAT THIS IS
   The bay kiosk shell: a small supervisor that runs in the BayKiosk desktop session and keeps the bay's two
@@ -7,7 +7,7 @@ WHAT THIS IS
     - the golf launcher, restarted after it closes ONLY while BayAgent says a session wants it, placed and
       maximized on the control screen (the touchscreen), and closed if a member reopens it after the session ended;
     - the wall display (Edge, the same profile folder BayAgent uses), kept up on the session screen (the TV).
-  Design: C:\aoc-wt\reports\kiosk-shell-design-2026-10-06.md. It replaces the never-shipped ABG.LauncherShell.ps1,
+  Design: C:\aoc-wt\reports\kiosk-shell-design-2026-10-06.md. It replaces the never-shipped AOC.LauncherShell.ps1,
   which reopened the launcher 2 s after ANY exit (free play after every session) and never placed it.
 
 WHAT THIS RELEASE DOES AND DOES NOT DO
@@ -60,7 +60,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ---------------- Paths (one literal; the launch test repoints exactly this line) ----------------
-$BaseDir = "C:\AllBirdies\BayAgent"
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$BaseDir = Get-BayInstallRoot $PSScriptRoot
 
 $KioskShellCodeVersion = "1.6.1"
 # THE AUTHORITY FOR THE MODE IS THIS LINE OF SIGNED CODE (twin of BayAgent.ps1's $KioskReleaseMode; the build refuses a
@@ -482,12 +496,12 @@ function Read-KioskLocalConfig([string]$Path) {
         LauncherName     = "UneekorLauncher"
         WallEnabled      = $true
         EdgePath         = ""
-        WallUrl          = "file:///C:/AllBirdies/SessionDisplay/current/index.html"
-        ProfileDir       = "C:\AllBirdies\SessionDisplay\edge-profile"
+        WallUrl          = ("file:///" + ((Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\current\index.html") -replace '\\', '/'))
+        ProfileDir       = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\edge-profile")
         WallMode         = "kiosk"
         ControlSelector  = $null
         SessionSelector  = $null
-        SessionJsonPath  = "C:\AllBirdies\SessionDisplay\data\session.json"
+        SessionJsonPath  = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\data\session.json")
     }
     $read = Read-KioskJsonFile -Path $Path -MaxBytes 262144
     if (-not $read.Ok) { $c.Source = "defaults (agent-config.json " + $read.Why + ")"; return $c }
@@ -1021,7 +1035,7 @@ Remove-KioskOldLogs -Dir $KioskLogDir -Days $KioskLogRetentionDays -NowUtc ((Get
 
 $KioskMutex = $null
 $KioskOwnsMutex = $false
-try { $KioskMutex = New-Object System.Threading.Mutex($true, "Local\ABG.KioskShell", [ref]$KioskOwnsMutex) } catch { $KioskOwnsMutex = $true }
+try { $KioskMutex = New-Object System.Threading.Mutex($true, "Local\AOC.KioskShell", [ref]$KioskOwnsMutex) } catch { $KioskOwnsMutex = $true }
 if (-not $KioskOwnsMutex) {
     Write-KioskLog ("another kiosk shell already runs in this session; this copy (pid {0}) exits" -f $PID) "INFO"
     exit 0

@@ -31,7 +31,7 @@ WHAT IT NEVER DOES
 RUN
   Launched by Update-BayAgent.ps1 only (a per-user scheduled task, or WMI as the fallback), from the SNAPSHOT copy
   rollback\tools\Watch-BayAgentUpdate.ps1, so the package being installed cannot change the code that judges it.
-  The command line never contains "\BayAgent.ps1", so ABG.HostWatchdog.ps1 and ABG.AgentHost.ps1, which stop
+  The command line never contains "\BayAgent.ps1", so AOC.HostWatchdog.ps1 and AOC.AgentHost.ps1, which stop
   processes whose command line names the agent script, leave it alone.
 
 Exit code 0 always (a scheduled task has nobody to read it); the outcome is state\update-guard.json.
@@ -40,13 +40,32 @@ Hyphens only in comments (em-dashes break AllSigned parsing).
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$InstallId,
-  [string]$BaseDir = "C:\AllBirdies\BayAgent",
+  [string]$BaseDir = "",   # empty = the root this script is installed in (Get-BayInstallRoot)
   [string]$TaskName = "",
   [int]$PollSeconds = 5,
   [int]$ProbeEverySeconds = 30,
   # How long to wait for the updater to begin promotion before standing down (it may have failed early).
   [int]$NeverPromotedSeconds = 1800
 )
+
+
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = Get-BayInstallRoot $PSScriptRoot }
 
 function Get-GuardUtcNow { return (Get-Date).ToUniversalTime() }
 function Format-GuardUtc([DateTime]$d) { return $d.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }

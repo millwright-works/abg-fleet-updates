@@ -35,6 +35,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$RootName = if ([string]::IsNullOrWhiteSpace($env:AOC_TEST_ROOT_NAME)) { "AceOfClubs" } else { $env:AOC_TEST_ROOT_NAME }   # run the suite twice: AceOfClubs (default) and AllBirdies (a bay not yet moved)
 try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -564,7 +565,7 @@ try {
     # A REAL enroll result at the default key length must fit with room to spare.
     $sizeCert = New-BayClientCertificate -Subject "CN=ABG-BayAgent 44d35503-6d63-f011-bec2-0022480b527b" -ValidityDays 730 -Store "CurrentUser" -KeyLength 2048
     [void]$script:CreatedCerts.Add($sizeCert.Thumbprint)
-    $enrollRes = Build-CredentialEnrollResult -cert $sizeCert -cerPath "C:\AllBirdies\BayAgent\state\bay-cert-$($sizeCert.Thumbprint).cer" -reused $false -activatedDirectly $false
+    $enrollRes = Build-CredentialEnrollResult -cert $sizeCert -cerPath "C:\$RootName\BayAgent\state\bay-cert-$($sizeCert.Thumbprint).cer" -reused $false -activatedDirectly $false
     $rawLen = (($enrollRes | ConvertTo-Json -Depth 10 -Compress)).Length
     $enrollJson = Limit-ResultJson -ResultObj $enrollRes
     Write-Host ("  enroll result RSA2048: raw={0} chars, stored={1} chars, cap={2}" -f $rawLen, $enrollJson.Length, $ResultJsonMaxChars)
@@ -588,7 +589,7 @@ try {
         subject = $sizeCert.Subject; store = "CurrentUser\My"
         notBeforeUtc = "2026-08-29T00:00:00Z"; notAfterUtc = "2028-08-28T00:00:00Z"
         publicCertBase64 = [Convert]::ToBase64String($sizeCert.RawData)
-        publicCertPath = "C:\AllBirdies\BayAgent\state\bay-cert-x.cer"
+        publicCertPath = "C:\$RootName\BayAgent\state\bay-cert-x.cer"
         next = ("N" * 600)
     }
     $fatRaw = (($fat | ConvertTo-Json -Depth 10 -Compress)).Length
@@ -1027,14 +1028,14 @@ try {
     Assert-True ($gdef.Count -eq 1) "the decision is a function, so it can be tested rather than only printed"
     . ([scriptblock]::Create($gdef[0].Extent.Text))
 
-    $gCert = Get-Day0CredentialGuidance -Mode "Certificate" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
+    $gCert = Get-Day0CredentialGuidance -Mode "Certificate" -DpapiPath "C:\$RootName\BayAgent\secrets\clientsecret.dpapi" -Root "C:\$RootName" -BayKioskUser "BayKiosk"
     Assert-True ($gCert.dpapiRequired -eq $false) "certificate mode does NOT require a DPAPI secret"
     Assert-True (($gCert.lines -join " ") -match "EnrollCert") "...and it tells the operator to run -EnrollCert"
     Assert-True (-not (($gCert.lines -join " ") -match "SetClientSecretDpapi")) `
         "...and does NOT tell them to create the secret 1.2.0 exists to remove"
     Assert-True (($gCert.lines -join " ") -match "(?i)do not create") "...it says so in words, not by omission"
 
-    $gSec = Get-Day0CredentialGuidance -Mode "Secret" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
+    $gSec = Get-Day0CredentialGuidance -Mode "Secret" -DpapiPath "C:\$RootName\BayAgent\secrets\clientsecret.dpapi" -Root "C:\$RootName" -BayKioskUser "BayKiosk"
     Assert-True ($gSec.dpapiRequired -eq $true) "secret mode still requires the DPAPI file (the legacy path is not removed, only un-defaulted)"
     Assert-True (($gSec.lines -join " ") -match "SetClientSecretDpapi") "...and still gives the exact command"
     Assert-True (($gSec.lines -join " ") -match "(?i)pending") `

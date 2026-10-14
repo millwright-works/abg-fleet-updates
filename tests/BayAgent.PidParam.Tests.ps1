@@ -197,7 +197,7 @@ try {
 
     # the agent reads the bay-root config, never the one inside current\
     $agentSrc = [IO.File]::ReadAllText($AgentScript)
-    Assert-True ($agentSrc -match '(?m)^\$BaseDir = "C:\\AllBirdies\\BayAgent"' -and $agentSrc -match '(?m)^\$CfgPath = Join-Path \$BaseDir "agent-config\.json"') `
+    Assert-True ($agentSrc -match '(?m)^\$BaseDir = Get-BayInstallRoot \$PSScriptRoot' -and $agentSrc -match '(?m)^\$CfgPath = Join-Path \$BaseDir "agent-config\.json"') `
         "the agent reads <BayAgent root>\agent-config.json (not current\)"
     # the installer only ever writes to releases\<v>, current\ and tools\
     $installer = Join-Path $RepoRoot "src/BayAgent/tools/Update-BayAgent.ps1"

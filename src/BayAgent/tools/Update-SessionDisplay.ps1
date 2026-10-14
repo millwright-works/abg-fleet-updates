@@ -4,11 +4,11 @@ Update-SessionDisplay.ps1
 Purpose
 - Pull a versioned SessionDisplay package (zip) from HTTPS (e.g., GitHub Releases)
 - Verify SHA256
-- Expand into:   C:\AllBirdies\SessionDisplay\releases\<version>\
-- Promote into:  C:\AllBirdies\SessionDisplay\current\   (active UI bundle)
+- Expand into:   C:\AceOfClubs\SessionDisplay\releases\<version>\
+- Promote into:  C:\AceOfClubs\SessionDisplay\current\   (active UI bundle)
 - Preserve runtime/persistent folders:
-    C:\AllBirdies\SessionDisplay\data\
-    C:\AllBirdies\SessionDisplay\edge-profile\
+    C:\AceOfClubs\SessionDisplay\data\
+    C:\AceOfClubs\SessionDisplay\edge-profile\
 - Stop the Edge instance that is using the SessionDisplay profile directory so files are not locked.
 
 Notes
@@ -20,7 +20,7 @@ Notes
   Anything deeper than one folder level is not recommended.
 
 Usage example (via StartProcess BayCommand):
-  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-SessionDisplay.ps1" `
+  powershell.exe -NoProfile -File "C:\AceOfClubs\BayAgent\tools\Update-SessionDisplay.ps1" `
     -Version "1.0.0" `
     -PackageUrl "https://github.com/<owner>/<repo>/releases/download/<tag>/SessionDisplay-1.0.0.zip" `
     -Sha256 "<sha256>" `
@@ -35,13 +35,13 @@ param(
   [Parameter(Mandatory = $true)][string]$Sha256,
 
   # SessionDisplay base
-  [string]$BaseDir = "C:\AllBirdies\SessionDisplay",
+  [string]$BaseDir = "",   # empty = SessionDisplay beside the BayAgent folder this script is installed in
 
   # Where the active UI bundle lives (BaseDir\current)
   [string]$CurrentDirName = "current",
 
   # Edge profile dir used for the Session Display instance
-  [string]$ProfileDir = "C:\AllBirdies\SessionDisplay\edge-profile",
+  [string]$ProfileDir = "",   # empty = edge-profile inside the SessionDisplay folder
 
   # If provided, we stop the Edge process and leave it stopped.
   # (Your BayAgent can re-open it via UpdateSessionDisplay command.)
@@ -52,8 +52,31 @@ param(
   [switch]$LegacyBaseMirror,
 
   # Optional log file (helpful when running from StartProcess)
-  [string]$LogPath = "C:\AllBirdies\BayAgent\logs\Update-SessionDisplay.log"
+  [string]$LogPath = ""   # empty = logs\Update-SessionDisplay.log in the BayAgent folder
 )
+
+
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$InstallRoot = Get-BayInstallRoot $PSScriptRoot
+$SessionDisplayRoot = Join-Path (Split-Path -Parent $InstallRoot) "SessionDisplay"
+if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = $SessionDisplayRoot }
+if ([string]::IsNullOrWhiteSpace($ProfileDir)) { $ProfileDir = Join-Path $SessionDisplayRoot "edge-profile" }
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $InstallRoot "logs\Update-SessionDisplay.log" }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"

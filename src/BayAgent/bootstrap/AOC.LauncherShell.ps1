@@ -1,5 +1,5 @@
 <#
-ABG.LauncherShell.ps1 (BA-20)
+AOC.LauncherShell.ps1 (BA-20)
 Custom Windows shell for BayKiosk user. Replaces explorer.exe.
 
 Launched by WinLogon as the shell process for BayKiosk. Manages:
@@ -22,7 +22,23 @@ $ErrorActionPreference = "Stop"
 # ------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------
-$BaseDir  = "C:\AllBirdies\BayAgent"
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$BaseDir  = Get-BayInstallRoot $PSScriptRoot
 $LogDir   = Join-Path $BaseDir "logs"
 $CfgPath  = Join-Path $BaseDir "agent-config.json"
 
@@ -214,8 +230,8 @@ while ($true) {
         }
 
         # ---- Resolve session display settings ----
-        $sdUrl = "file:///C:/AllBirdies/SessionDisplay/current/index.html"
-        $sdProfileDir = "C:\AllBirdies\SessionDisplay\edge-profile"
+        $sdUrl = ("file:///" + ((Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\current\index.html") -replace '\\', '/'))
+        $sdProfileDir = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\edge-profile")
 
         if ($null -ne $cfg -and $null -ne $cfg.sessionDisplay) {
             $sd = $cfg.sessionDisplay

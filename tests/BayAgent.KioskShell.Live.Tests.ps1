@@ -4,7 +4,7 @@ BayAgent.KioskShell.Live.Tests.ps1 (A0.363, BayAgent 1.4.0)
 WHY THIS EXISTS
   The unit suite lifts the shell's functions by AST. That cannot show the SHIPPED FILE starting, running its loop,
   keeping state across ticks, writing its heartbeat and log, or exiting when it should (the AG-48 lesson: 230 green
-  tests and the first bay died in a second). This suite installs the shipped ABG.KioskShell.ps1 into a sandbox with
+  tests and the first bay died in a second). This suite installs the shipped AOC.KioskShell.ps1 into a sandbox with
   exactly one literal repointed ($BaseDir), proves the copy is the shipped file, and starts it in a real Windows
   PowerShell 5.1 with THE ARGUMENT LIST BayAgent builds (Get-KioskShellArgumentList, lifted from BayAgent.ps1), so the
   test cannot drift from what a bay runs. The golf launcher and the wall browser are two tiny WinForms programs this
@@ -42,7 +42,7 @@ param([string]$ShellScript = "", [string]$AgentScript = "")
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($ShellScript)) { $ShellScript = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\ABG.KioskShell.ps1" }
+if ([string]::IsNullOrWhiteSpace($ShellScript)) { $ShellScript = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\AOC.KioskShell.ps1" }
 if ([string]::IsNullOrWhiteSpace($AgentScript)) { $AgentScript = Join-Path $PSScriptRoot "..\src\BayAgent\BayAgent.ps1" }
 $ShellScript = (Resolve-Path $ShellScript).Path
 $AgentScript = (Resolve-Path $AgentScript).Path
@@ -65,8 +65,8 @@ if ($argDef.Count -ne 1) { throw "Get-KioskShellArgumentList not found in BayAge
 $Root = Join-Path $env:TEMP ("bayagent-kiosk-live-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 $RelKiosk = Join-Path $Root "releases\1.4.0\kiosk"
 foreach ($d in @($RelKiosk, (Join-Path $Root "current\kiosk"), (Join-Path $Root "state"), (Join-Path $Root "control"), (Join-Path $Root "logs"), (Join-Path $Root "edge-profile"))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-$ShellCopy = Join-Path $RelKiosk "ABG.KioskShell.ps1"
-$needle = '$BaseDir = "C:\AllBirdies\BayAgent"'
+$ShellCopy = Join-Path $RelKiosk "AOC.KioskShell.ps1"
+$needle = '$BaseDir = Get-BayInstallRoot $PSScriptRoot'
 $shipped = [IO.File]::ReadAllText($ShellScript)
 if (-not $shipped.Contains($needle)) { throw "the BaseDir literal is not in the shell" }
 # Two installs of the shipped file. $ShellCopy is built AS THE COMPANION RELEASE would be (the signed mode constant set to
@@ -75,7 +75,7 @@ if (-not $shipped.Contains($needle)) { throw "the BaseDir literal is not in the 
 $modeNeedle = '$KioskShellReleaseMode = "explorer"'
 if (-not $shipped.Contains($modeNeedle)) { throw "the release-mode constant is not in the shell as shipped (explorer)" }
 [IO.File]::WriteAllText($ShellCopy, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $Root)).Replace($modeNeedle, '$KioskShellReleaseMode = "companion"'), (New-Object Text.UTF8Encoding($false)))
-$ShellCopyAsShipped = Join-Path $RelKiosk "ABG.KioskShell.asshipped.ps1"
+$ShellCopyAsShipped = Join-Path $RelKiosk "AOC.KioskShell.asshipped.ps1"
 [IO.File]::WriteAllText($ShellCopyAsShipped, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $Root)), (New-Object Text.UTF8Encoding($false)))
 $PolicyPath = Join-Path $Root "current\kiosk\kiosk-policy.json"
 $IntentPath = Join-Path $Root "state\kiosk-intent.json"

@@ -3,7 +3,7 @@ BayAgent.KioskPackage.Tests.ps1 (A0.363, BayAgent 1.4.0)
 
 The kiosk mode changes ONLY through a signed, hash-pinned fleet release, so the package build is where a wrong mode
 must be stopped. This suite runs the real tools\Build-ReleasePackage.ps1 against sandbox copies of the source tree:
-  P1  the shipped tree builds; the zip carries kiosk/ABG.KioskShell.ps1 and kiosk/kiosk-policy.json byte for byte;
+  P1  the shipped tree builds; the zip carries kiosk/AOC.KioskShell.ps1 and kiosk/kiosk-policy.json byte for byte;
       two builds hash the same (reproducible)
   P2  a policy the bay would silently read as "explorer" is refused at build time: mode "shell" (not built), a mode in
       another case, schema 2, minShellBytes too small or larger than the shell, not JSON, an array
@@ -71,9 +71,9 @@ try {
         $z = [IO.Compression.ZipFile]::OpenRead($b1.Zip)
         try {
             $names = @($z.Entries | ForEach-Object { $_.FullName })
-            Assert-True ($names -contains "kiosk/ABG.KioskShell.ps1" -and $names -contains "kiosk/kiosk-policy.json") "the zip carries kiosk/ABG.KioskShell.ps1 and kiosk/kiosk-policy.json"
+            Assert-True ($names -contains "kiosk/AOC.KioskShell.ps1" -and $names -contains "kiosk/kiosk-policy.json") "the zip carries kiosk/AOC.KioskShell.ps1 and kiosk/kiosk-policy.json"
             Assert-True ($names.Count -eq 10) "ten entries ($($names.Count))"
-            foreach ($pair in @(@("kiosk/kiosk-policy.json", "kiosk\kiosk-policy.json"), @("kiosk/ABG.KioskShell.ps1", "kiosk\ABG.KioskShell.ps1"))) {
+            foreach ($pair in @(@("kiosk/kiosk-policy.json", "kiosk\kiosk-policy.json"), @("kiosk/AOC.KioskShell.ps1", "kiosk\AOC.KioskShell.ps1"))) {
                 $e = $z.GetEntry($pair[0]); $ms = New-Object IO.MemoryStream; $s = $e.Open(); try { $s.CopyTo($ms) } finally { $s.Dispose() }
                 $src = [IO.File]::ReadAllBytes((Join-Path $t1 ("src\BayAgent\" + $pair[1])))
                 Assert-True ([Convert]::ToBase64String($ms.ToArray()) -eq [Convert]::ToBase64String($src)) ("{0} in the zip is the source byte for byte" -f $pair[0])
@@ -125,7 +125,7 @@ try {
 
     Section "P4 the shell's version constant must match"
     $t = New-Tree
-    $sp = Join-Path $t "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+    $sp = Join-Path $t "src\BayAgent\kiosk\AOC.KioskShell.ps1"
     [IO.File]::WriteAllText($sp, ([IO.File]::ReadAllText($sp).Replace('$KioskShellCodeVersion = "1.6.1"', '$KioskShellCodeVersion = "1.3.9"')), (New-Object Text.UTF8Encoding($false)))
     $b = Invoke-Build $t
     Assert-True ($b.Exit -ne 0 -and $b.Out -match "KioskShellCodeVersion = '1.3.9'") "a shell saying 1.3.9 in a 1.6.1 package is refused"
@@ -142,7 +142,7 @@ try {
     Assert-True ($b.Exit -ne 0 -and $b.Out -match "must ship kiosk/kiosk-policy.json") "refused: the package must ship the policy"
 
     function Set-ReleaseModeConstants([string]$root, [string]$mode) {
-        $ap = Join-Path $root "src\BayAgent\BayAgent.ps1"; $sp2 = Join-Path $root "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+        $ap = Join-Path $root "src\BayAgent\BayAgent.ps1"; $sp2 = Join-Path $root "src\BayAgent\kiosk\AOC.KioskShell.ps1"
         $at = [IO.File]::ReadAllText($ap); $st2 = [IO.File]::ReadAllText($sp2)
         if (-not $at.Contains('$KioskReleaseMode           = "explorer"') -or -not $st2.Contains('$KioskShellReleaseMode = "explorer"')) { throw "release-mode constants not found as shipped" }
         [IO.File]::WriteAllText($ap, $at.Replace('$KioskReleaseMode           = "explorer"', ('$KioskReleaseMode           = "{0}"' -f $mode)), (New-Object Text.UTF8Encoding($true)))
@@ -167,7 +167,7 @@ try {
     $b = Invoke-Build $t
     Assert-True ($b.Exit -ne 0 -and $null -eq $b.Zip -and $b.Out -match "the kiosk mode disagrees") "code built companion under an explorer policy: refused"
     $t = New-Tree
-    $sp3 = Join-Path $t "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+    $sp3 = Join-Path $t "src\BayAgent\kiosk\AOC.KioskShell.ps1"
     [IO.File]::WriteAllText($sp3, ([IO.File]::ReadAllText($sp3).Replace('$KioskShellReleaseMode = "explorer"', '$KioskShellReleaseMode = "companion"')), (New-Object Text.UTF8Encoding($false)))
     $b = Invoke-Build $t
     Assert-True ($b.Exit -ne 0 -and $b.Out -match "the kiosk mode disagrees") "the shell's constant alone disagreeing: refused"

@@ -2,7 +2,7 @@
 BayAgent.SetupShell.Tests.ps1
 
 AG-47: Setup-BayPC.ps1 Phase 5A used to set HKLM Winlogon Shell to
-C:\AllBirdies\BayAgent\bootstrap\ABG.LauncherShell.ps1 UNCONDITIONALLY -- the Set-ItemProperty call ran
+C:\AceOfClubs\BayAgent\bootstrap\AOC.LauncherShell.ps1 UNCONDITIONALLY -- the Set-ItemProperty call ran
 first, and only afterward did the script Test-Path the file and print a warning if it was missing. On Bay
 1, 2026-09-21 07:45 ET, that file was absent (Day0 does not download it and no fleet package ships it; it
 exists only in this repo's source tree). The next BayKiosk logon would have started a missing file and
@@ -27,8 +27,8 @@ WHAT THIS PROVES
 
 WHAT THIS DOES NOT PROVE
   It does not touch the registry, and it does not prove the launcher shell script itself is fit to run as
-  a Windows shell (ABG.LauncherShell.ps1 is a separate, unrelated question). It also does not close the
-  residual: nothing today places ABG.LauncherShell.ps1 onto a bay at all, so on every bay running the
+  a Windows shell (AOC.LauncherShell.ps1 is a separate, unrelated question). It also does not close the
+  residual: nothing today places AOC.LauncherShell.ps1 onto a bay at all, so on every bay running the
   fixed script, the plan below will fall back to explorer.exe until that residual is closed (see
   REPORT.md).
 
@@ -162,7 +162,7 @@ try {
             "the HKLM Shell Set-ItemProperty -Value is a member access on `$$planVarName (the variable the plan's result was assigned to) -- not a re-derived, hardcoded, or bypassed value (catches mutant M5: -Value `$shellCommand, plan computed and then ignored)"
 
         Section "Behavior: wrapper file absent -> fall back to explorer.exe, and say so truthfully"
-        $missingPath = Join-Path $BaseDir "does-not-exist\ABG.LauncherShell.ps1"
+        $missingPath = Join-Path $BaseDir "does-not-exist\AOC.LauncherShell.ps1"
         $planMissing = Get-ShellActivationPlan -WrapperPath $missingPath -ShellCommand "powershell -File `"$missingPath`""
         Assert-True ($planMissing.action -ne "ActivateLauncher") "absent wrapper: action is not ActivateLauncher"
         Assert-True ($planMissing.shellValue -eq "explorer.exe") "absent wrapper: shellValue is explorer.exe"
@@ -172,7 +172,7 @@ try {
             "absent wrapper: message does NOT repeat the shipped script's false claim that a fleet update deploys the file"
 
         Section "Behavior: wrapper present but implausibly small (0 bytes) -> also falls back, not activated"
-        $tinyPath = Join-Path $BaseDir "tiny\ABG.LauncherShell.ps1"
+        $tinyPath = Join-Path $BaseDir "tiny\AOC.LauncherShell.ps1"
         New-Item -ItemType Directory -Force -Path (Split-Path $tinyPath) | Out-Null
         [IO.File]::WriteAllBytes($tinyPath, [byte[]]@())
         $planTiny = Get-ShellActivationPlan -WrapperPath $tinyPath -ShellCommand "powershell -File `"$tinyPath`""
@@ -181,9 +181,9 @@ try {
         Assert-True ($planTiny.verified -eq $false) "0-byte wrapper: verified is false"
 
         Section "Behavior: wrapper present and a real size -> activated, with a read-back size and hash recorded"
-        $realPath = Join-Path $BaseDir "real\ABG.LauncherShell.ps1"
+        $realPath = Join-Path $BaseDir "real\AOC.LauncherShell.ps1"
         New-Item -ItemType Directory -Force -Path (Split-Path $realPath) | Out-Null
-        $sourceWrapper = Join-Path $PSScriptRoot "..\src\BayAgent\bootstrap\ABG.LauncherShell.ps1"
+        $sourceWrapper = Join-Path $PSScriptRoot "..\src\BayAgent\bootstrap\AOC.LauncherShell.ps1"
         Copy-Item -LiteralPath (Resolve-Path $sourceWrapper).Path -Destination $realPath -Force
         $expectedHash = (Get-FileHash -LiteralPath $realPath -Algorithm SHA256).Hash
         $shellCmd = "powershell -NoProfile -WindowStyle Hidden -File `"$realPath`""

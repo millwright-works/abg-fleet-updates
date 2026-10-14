@@ -1,11 +1,11 @@
 <#
-ABG.HostWatchdog.ps1 (Step 7.2.5)
+AOC.HostWatchdog.ps1 (Step 7.2.5)
 
 Runs as SYSTEM via Task Scheduler.
 Purpose:
-- Ensure ABG.AgentHost is running (via scheduled task \ABG Bay Agent).
+- Ensure AOC.AgentHost is running (via scheduled task \AOC Bay Agent).
 - Consume restart requests written by RestartBayAgent.ps1:
-    C:\AllBirdies\BayAgent\control\restart.host
+    C:\AceOfClubs\BayAgent\control\restart.host
 
 IMPORTANT HARDENING NOTE:
 - This script intentionally avoids using "-or" in places that could be mis-parsed as a cmdlet parameter
@@ -18,12 +18,28 @@ $ErrorActionPreference = "Stop"
 # ---------------------------
 # Config
 # ---------------------------
-$BaseDir       = "C:\AllBirdies\BayAgent"
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$BaseDir       = Get-BayInstallRoot $PSScriptRoot
 $ControlDir    = Join-Path $BaseDir "control"
 $LogDir        = Join-Path $BaseDir "logs"
 
-$HostTaskName    = "\ABG Bay Agent"
-$HostScriptPath  = Join-Path $BaseDir "bootstrap\ABG.AgentHost.ps1"
+$HostTaskName    = "\AOC Bay Agent"
+$HostScriptPath  = Join-Path $BaseDir "bootstrap\AOC.AgentHost.ps1"
 
 $StopFile1     = Join-Path $BaseDir "stop.host"
 $StopFile2     = Join-Path $ControlDir "stop.host"
@@ -54,7 +70,7 @@ function Get-AgentHostProcs() {
   foreach ($p in (Get-PowerShellProcs)) {
     $cl = $p.CommandLine
     if ([string]::IsNullOrWhiteSpace($cl)) { continue }
-    if ($cl -match "ABG\.AgentHost\.ps1") { $hits += $p }
+    if ($cl -match "AOC\.AgentHost\.ps1") { $hits += $p }
   }
   return @($hits)
 }
@@ -64,7 +80,7 @@ function Get-BayAgentProcs() {
   foreach ($p in (Get-PowerShellProcs)) {
     $cl = $p.CommandLine
     if ([string]::IsNullOrWhiteSpace($cl)) { continue }
-    if ($cl -match "\\AllBirdies\\BayAgent\\.*\\BayAgent\.ps1") { $hits += $p }
+    if ($cl -match ([regex]::Escape($BaseDir.TrimEnd('\') + "\") + ".*\\BayAgent\.ps1")) { $hits += $p }
   }
   return @($hits)
 }
@@ -103,7 +119,7 @@ function End-HostTask() {
 # ---------------------------
 # Main (single instance)
 # ---------------------------
-$mutex = New-Object System.Threading.Mutex($false, "Global\ABG.HostWatchdog")
+$mutex = New-Object System.Threading.Mutex($false, "Global\AOC.HostWatchdog")
 if (-not $mutex.WaitOne(0)) { exit 0 }
 
 try {

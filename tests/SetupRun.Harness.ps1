@@ -1,7 +1,7 @@
 <#
 SetupRun.Harness.ps1  (not a suite; BayAgent.SetupRun.Tests.ps1 starts it in its own Windows PowerShell 5.1 process)
 
-Runs the REAL text of Setup-BayPC.ps1 and ABG-Day0-Setup.ps1, top to bottom, on a MODELED blank PC. Every command
+Runs the REAL text of Setup-BayPC.ps1 and AOC-Day0-Setup.ps1, top to bottom, on a MODELED blank PC. Every command
 that touches the machine is replaced by a recorder: a function of the same name (a function outranks a cmdlet and a
 program). Nothing is written outside -Root: no registry, no account, no certificate, no task, no policy, no download.
 
@@ -32,6 +32,7 @@ param(
   [Parameter(Mandatory = $true)][string]$ResultFile
 )
 $ErrorActionPreference = 'Stop'
+$RootName = if ([string]::IsNullOrWhiteSpace($env:AOC_TEST_ROOT_NAME)) { "AceOfClubs" } else { $env:AOC_TEST_ROOT_NAME }   # run the suite twice: AceOfClubs (default) and AllBirdies (a bay not yet moved)
 $SrhMarker = 'SRHMARKPW' + [guid]::NewGuid().ToString('N').Substring(0, 12)
 
 if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Root)) { Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path $Root | Out-Null }
@@ -103,11 +104,11 @@ function global:Remove-Item { [CmdletBinding()] param([Parameter(Position = 0)][
 function global:Invoke-WebRequest {
   [CmdletBinding()] param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$MaximumRedirection)
   if ($global:Srh.FailDownloadMatch -and $Uri -match $global:Srh.FailDownloadMatch) { SrhRec "DOWNLOAD $Uri -> 404 (injected)"; throw "The remote server returned an error: (404) Not Found." }
-  $m = [regex]::Match($Uri, '^https://raw\.githubusercontent\.com/millwright-works/abg-fleet-updates/main/(.+)$')
+  $m = [regex]::Match($Uri, '^https://raw\.githubusercontent\.com/millwright-works/aoc-fleet-updates/main/(.+)$')
   if (-not $m.Success) { SrhRec "DOWNLOAD $Uri -> REFUSED (not an address of this repository's main branch under its current owner)"; throw "HARNESS: a download address this harness does not serve: $Uri" }
   $rel = $m.Groups[1].Value -replace '/', '\'
   $src = Join-Path $global:Srh.RepoRoot $rel
-  if ($rel -eq 'tools\ABG-Day0-Setup.ps1') { $src = $global:Srh.Day0Source }
+  if ($rel -eq 'tools\AOC-Day0-Setup.ps1') { $src = $global:Srh.Day0Source }
   if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $src)) { SrhRec "DOWNLOAD $Uri -> 404 (not in the repository tree)"; throw "The remote server returned an error: (404) Not Found." }
   SrhAssertScratch $OutFile
   Microsoft.PowerShell.Management\Copy-Item -LiteralPath $src -Destination $OutFile -Force
@@ -214,7 +215,7 @@ try {
 
   $plan = [IO.File]::ReadAllText($PlanFile) | ConvertFrom-Json
   SrhSeedBlankPc
-  $allRoot = Join-Path $Root 'AllBirdies'
+  $allRoot = Join-Path $Root $RootName
   foreach ($run in @($plan.runs)) {
     # ---- the modeled facts this run starts from
     $model = $run.model
@@ -238,7 +239,7 @@ try {
     }
     $setupArgs = @{}
     foreach ($p in $run.args.PSObject.Properties) { $setupArgs[$p.Name] = $p.Value }
-    $setupArgs['AllBirdiesRoot'] = $allRoot
+    $setupArgs['AceOfClubsRoot'] = $allRoot
     $env:COMPUTERNAME = [string]$run.computerName
     $global:Srh.Log.Clear()
     $console = New-Object System.Collections.ArrayList
@@ -246,7 +247,7 @@ try {
     # A wide page, so a long line is one line in the record (a bay's console wraps; the record must not).
     try { & $setupCopy @setupArgs *>&1 | Out-String -Stream -Width 4096 | ForEach-Object { [void]$console.Add(([string]$_).TrimEnd()) } }
     catch {
-      $where = (("$($_.ScriptStackTrace)" -split "`n") | Where-Object { $_ -match 'Setup-BayPC\.harness\.ps1|ABG-Day0-Setup\.ps1' } | Select-Object -First 1)
+      $where = (("$($_.ScriptStackTrace)" -split "`n") | Where-Object { $_ -match 'Setup-BayPC\.harness\.ps1|AOC-Day0-Setup\.ps1' } | Select-Object -First 1)
       $stoppedAt = ("$where" -replace [regex]::Escape($global:Srh.Root), '<root>').Trim()
       $ended = ("STOPPED: " + (("$($_.Exception.Message) " + $(if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { '' })) -replace '\s+', ' ').Trim())
     }
@@ -267,7 +268,7 @@ try {
       tasks           = @($global:Srh.Tasks.Keys | Sort-Object)
       users           = @($global:Srh.Users.Keys | Sort-Object)
       configText      = $cfgText
-      secretToolOnDisk = [bool](Microsoft.PowerShell.Management\Test-Path -LiteralPath (Join-Path $allRoot 'BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1'))
+      secretToolOnDisk = [bool](Microsoft.PowerShell.Management\Test-Path -LiteralPath (Join-Path $allRoot 'BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1'))
       markerInConsole = [bool]($consoleText.Contains($global:Srh.Marker))
     }
   }

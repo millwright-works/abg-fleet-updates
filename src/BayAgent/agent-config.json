@@ -2,7 +2,7 @@
   "environmentUrl": "https://<your-org-placeholder>.crm.dynamics.com",
   "tenantId": "<tenant-guid-placeholder>",
   "clientId": "<app-client-id-placeholder>",
-  "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "clientSecretDpapiPath": "C:\\AceOfClubs\\BayAgent\\secrets\\clientsecret.dpapi",
   "clientCertThumbprint": "",
   "bayId": "<bay-guid-placeholder>",
   "pollSeconds": 3,
@@ -12,7 +12,7 @@
   "postSessionThanksEnabled": true,
   "knownGoodSeconds": 60,
   "logLevel": "DEBUG",
-  "sessionJsonPath": "C:\\AllBirdies\\SessionDisplay\\data\\session.json",
+  "sessionJsonPath": "C:\\AceOfClubs\\SessionDisplay\\data\\session.json",
   "launcher": {
     "path": "C:\\Uneekor\\Launcher\\UneekorLauncher.exe",
     "args": "",
@@ -24,8 +24,8 @@
   "sessionDisplay": {
     "mode": "kiosk",
     "displayRole": "session",
-    "url": "file:///C:/AllBirdies/SessionDisplay/current/index.html",
-    "profileDir": "C:\\AllBirdies\\SessionDisplay\\edge-profile"
+    "url": "file:///C:/AceOfClubs/SessionDisplay/current/index.html",
+    "profileDir": "C:\\AceOfClubs\\SessionDisplay\\edge-profile"
   },
   "displayRouting": {
     "enabled": true,
@@ -45,7 +45,7 @@
     }
   },
   "kiosk": {
-    "shell": "C:\\AllBirdies\\BayAgent\\bootstrap\\ABG.LauncherShell.ps1",
+    "shell": "C:\\AceOfClubs\\BayAgent\\bootstrap\\AOC.LauncherShell.ps1",
     "allowedProcesses": ["UneekorLauncher"],
     "comment": "allowedProcesses: populate with child exe names after Uneekor installation"
   },

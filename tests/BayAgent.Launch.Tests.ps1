@@ -15,7 +15,7 @@ WHY THIS EXISTS
   assertion ran. Nothing in the suite had ever STARTED the script.
 
   This test starts the script. In a real child powershell.exe 5.1, launched with the argument list
-  ABG.AgentHost.ps1 uses on a bay, against a real on-disk install layout, and then reads the agent's own
+  AOC.AgentHost.ps1 uses on a bay, against a real on-disk install layout, and then reads the agent's own
   log file the way a person standing at the bay would.
 
 WHAT IT COVERS
@@ -34,13 +34,13 @@ WHAT IT COVERS
   Write-Log did not exist that early and the try/catch around it swallowed that failure too.
 
 HOW THE INSTALL PATH IS HANDLED, AND WHY THE FILE UNDER TEST IS A COPY
-  BayAgent.ps1 hardcodes $BaseDir = "C:\AllBirdies\BayAgent". A test may not write there: on a bay that
-  is the live install, and on any other machine it is a system location. So the test installs a copy into
-  a sandbox with that ONE literal repointed, and then proves the copy is the shipped file in every
-  respect this test is measuring:
+  BayAgent.ps1 used to hardcode its install folder; it now finds it from where it sits (Get-BayInstallRoot). A test
+  may not write to a real root: on a bay that is the live install, and on any other machine it is a system location.
+  So the test installs the shipped file, UNCHANGED, into a sandbox folder named like a real root (set AOC_TEST_ROOT_NAME
+  to AllBirdies for the old one; the default is AceOfClubs), and then proves the copy is the shipped file:
 
     - identical line count
-    - exactly one line differs, and it is the $BaseDir assignment
+    - no line differs (and the SHA-256 is equal)
     - identical function names, in identical order, at identical line numbers
 
   The defect class here is ORDER. The equivalence assertions above pin the order exactly, so a pass on
@@ -67,6 +67,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$RootName = if ([string]::IsNullOrWhiteSpace($env:AOC_TEST_ROOT_NAME)) { "AceOfClubs" } else { $env:AOC_TEST_ROOT_NAME }   # run the suite twice: AceOfClubs (default) and AllBirdies (a bay not yet moved)
 try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } catch {}
 
 if ([string]::IsNullOrWhiteSpace($AgentScript)) { $AgentScript = Join-Path $PSScriptRoot "..\src\BayAgent\BayAgent.ps1" }
@@ -170,19 +171,17 @@ function New-BayInstall {
         $ExtraConfig = $null
     )
 
-    $root = Join-Path $SandboxRoot $Name
+    # The install sits under a folder named like a real root (<sandbox>\<name>\<AceOfClubs or AllBirdies>\BayAgent), because
+    # the agent now finds its root from where it is installed: the root name reaches the code, so the suite runs under both.
+    $root = Join-Path $SandboxRoot ("{0}\{1}\BayAgent" -f $Name, $RootName)
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $root "logs") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $root "secrets") | Out-Null
 
-    # The one edited literal. BayAgent.ps1 is ASCII-only (Build-ReleasePackage gate 2), so reading and
-    # rewriting as text cannot change a byte other than the ones intended.
-    $shipped = [IO.File]::ReadAllText($AgentScript)
-    $needle  = '$BaseDir = "C:\AllBirdies\BayAgent"'
-    if (-not $shipped.Contains($needle)) { throw "could not find the BaseDir literal in $AgentScript" }
-    $patched = $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $root))
+    # The shipped script is installed BYTE FOR BYTE: it takes its root from where it sits (<root>\BayAgent.ps1 is the root itself),
+    # so nothing is repointed any more (it used to be one literal, $BaseDir = "C:\...").
     $agentCopy = Join-Path $root "BayAgent.ps1"
-    [IO.File]::WriteAllText($agentCopy, $patched, (New-Object Text.UTF8Encoding($false)))
+    Copy-Item -LiteralPath $AgentScript -Destination $agentCopy -Force
     Copy-Item -LiteralPath $ManifestSrc -Destination (Join-Path $root "manifest.json") -Force
 
     if ($WithSecretFile) {
@@ -221,7 +220,7 @@ function New-BayInstall {
 
 function Start-BayAgentLikeAgentHost {
     <#
-      Launches exactly as bootstrap\ABG.AgentHost.ps1 does:
+      Launches exactly as bootstrap\AOC.AgentHost.ps1 does:
          powershell.exe -NoProfile -WindowStyle Minimized -File "<agent>"
       plus the switch that makes it a bounded test rather than a 24/7 loop. No -ExecutionPolicy flag,
       same as AgentHost: on a bay that is deliberate, so AllSigned is enforced.
@@ -302,7 +301,7 @@ Write-Host "Mock token endpoint listening on http://127.0.0.1:$port (a MOCK, not
 
 try {
     # ============================================================ L0 the copy is the shipped file
-    Section "L0 the installed copy differs from the shipped script in exactly one literal"
+    Section "L0 the installed copy IS the shipped script (byte for byte), and finds its root from where it sits"
     $probe = New-BayInstall -Name "equivalence" -TokenPort $port -WithSecretFile
 
     $shippedLines = [IO.File]::ReadAllLines($AgentScript)
@@ -314,11 +313,9 @@ try {
     for ($i = 0; $i -lt [Math]::Min($shippedLines.Count, $copyLines.Count); $i++) {
         if ($shippedLines[$i] -ne $copyLines[$i]) { $diffIdx += $i }
     }
-    Assert-True ($diffIdx.Count -eq 1) "exactly one line differs (differing lines: $($diffIdx.Count))"
-    if ($diffIdx.Count -eq 1) {
-        Assert-True ($shippedLines[$diffIdx[0]].Trim().StartsWith('$BaseDir =')) `
-            "...and it is the `$BaseDir assignment (line $($diffIdx[0] + 1))"
-    }
+    Assert-True ($diffIdx.Count -eq 0) "no line differs (differing lines: $($diffIdx.Count)); the install is the shipped file"
+    Assert-True (((Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256).Hash) -eq ((Get-FileHash -LiteralPath $probe.Agent -Algorithm SHA256).Hash)) "...and its SHA-256 equals the shipped file's"
+    Assert-True ($probe.Root -like ("*\{0}\BayAgent" -f $RootName)) "...installed under a root named $RootName"
 
     # The strongest form of the claim: every function is in the same place in both files.
     function Get-FuncMap([string]$p) {
@@ -467,7 +464,7 @@ try {
     # Two installs: the dormant release (policy explorer, as 1.4.0 ships) and a companion policy with the shell file in
     # place but UNSIGNED (a sandbox copy cannot carry the bay's signature). Both must start cleanly; neither may start a
     # shell; both must report the kiosk block in the capabilities PATCH. environmentUrl is the MOCK.
-    $shellSrc = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\ABG.KioskShell.ps1"
+    $shellSrc = Join-Path $PSScriptRoot "..\src\BayAgent\kiosk\AOC.KioskShell.ps1"
     # "tampered": the agent exactly as shipped (built dormant) with a policy FILE edited to companion: it must decide
     # explorer and report the disagreement (security review 2026-10-08). "companion": the agent built as the companion
     # release builds it (its signed $KioskReleaseMode constant set to companion), so the file and the code agree.
@@ -494,8 +491,8 @@ try {
         New-Item -ItemType Directory -Force -Path (Join-Path $l7.Root "current\kiosk") | Out-Null
         New-Item -ItemType Directory -Force -Path (Join-Path $l7.Root "releases\1.6.1\kiosk") | Out-Null
         [IO.File]::WriteAllText((Join-Path $l7.Root "current\kiosk\kiosk-policy.json"), ("{`"schema`":1,`"mode`":`"$kmode`",`"minShellBytes`":4096}"), (New-Object Text.UTF8Encoding($false)))
-        $shellCopy7 = Join-Path $l7.Root "releases\1.6.1\kiosk\ABG.KioskShell.ps1"
-        [IO.File]::WriteAllText($shellCopy7, ([IO.File]::ReadAllText($shellSrc).Replace('$BaseDir = "C:\AllBirdies\BayAgent"', ('$BaseDir = "{0}"' -f $l7.Root))), (New-Object Text.UTF8Encoding($false)))
+        $shellCopy7 = Join-Path $l7.Root "releases\1.6.1\kiosk\AOC.KioskShell.ps1"
+        Copy-Item -LiteralPath $shellSrc -Destination $shellCopy7 -Force
         $r7 = Start-BayAgentLikeAgentHost -Install $l7 -BoundingSwitch "-Once"
         Show-Evidence $r7 ("L7-" + $kcase)
         Assert-True (-not $r7.TimedOut -and $r7.ExitCode -eq 0) "[$kcase] exit code 0 (got $($r7.ExitCode))"
@@ -510,7 +507,7 @@ try {
         } else {
             Assert-True ($null -ne $rec7 -and [string]$rec7.action -eq "none") "[explorer] nothing was done"
         }
-        $shellProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { [string]$_.CommandLine -like ("*" + $l7.Root + "*ABG.KioskShell.ps1*") })
+        $shellProcs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { [string]$_.CommandLine -like ("*" + $l7.Root + "*AOC.KioskShell.ps1*") })
         Assert-True ($shellProcs.Count -eq 0) "[$kcase] no kiosk shell process exists for this install"
         foreach ($sp7 in $shellProcs) { try { Stop-Process -Id $sp7.ProcessId -Force } catch { } }
         $int7 = $null; try { $int7 = [IO.File]::ReadAllText((Join-Path $l7.Root "state\kiosk-intent.json")) | ConvertFrom-Json } catch { }

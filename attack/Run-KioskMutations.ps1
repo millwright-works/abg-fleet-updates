@@ -22,7 +22,7 @@ New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $Results = Join-Path $WorkDir $ResultsName
 $Paths = @{
     agent     = Join-Path $Repo "src\BayAgent\BayAgent.ps1"
-    shell     = Join-Path $Repo "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+    shell     = Join-Path $Repo "src\BayAgent\kiosk\AOC.KioskShell.ps1"
     builder   = Join-Path $Repo "tools\Build-ReleasePackage.ps1"
     ordertest = Join-Path $Repo "tests\BayAgent.StartupOrder.Tests.ps1"
 }
@@ -114,7 +114,7 @@ $Muts = @(
     # ---- agent: liveness and reconciler
     (M "A40" "agent" "unit" "foreign process treated as the shell" @('if (-not (Test-KioskShellCommandLine $cl)) { $l.State = "foreign";') @('if ($false) { $l.State = "foreign";'))
     (M "A41" "agent" "unit" "foreign process treated as HUNG (would be stopped)" @('if (-not (Test-KioskShellCommandLine $cl)) { $l.State = "foreign";') @('if (-not (Test-KioskShellCommandLine $cl)) { $l.State = "hung";'))
-    (M "A42" "agent" "unit" "command-line match loosened to the file name" @('return ($CommandLine -match (''(?i)'' + $root + ''[^\\"]+\\kiosk\\ABG\.KioskShell\.ps1''))') @('return ($CommandLine -match ''(?i)ABG\.KioskShell\.ps1'')'))
+    (M "A42" "agent" "unit" "command-line match loosened to the file name" @('return ($CommandLine -match (''(?i)'' + $root + ''[^\\"]+\\kiosk\\AOC\.KioskShell\.ps1''))') @('return ($CommandLine -match ''(?i)AOC\.KioskShell\.ps1'')'))
     (M "A43" "agent" "unit" "hung after 60 s" @('if ($age -gt $KioskShellHungSeconds) {') @('if ($age -gt $KioskShellAliveSeconds) {'))
     (M "A44" "agent" "unit" "alive up to 180 s" @('if ($age -le $KioskShellAliveSeconds) {') @('if ($age -le $KioskShellHungSeconds) {'))
     (M "A45" "agent" "unit" "unreadable lastLoopUtc read as alive" @('if ($null -eq $last) { $l.State = "hung";') @('if ($null -eq $last) { $l.State = "alive";'))
@@ -206,7 +206,7 @@ $Muts = @(
     (M "R07" "builder" "package" "policy and signed constants may disagree" @('if ($amode[0].Groups[1].Value -cne $pMode.Value -or $smode[0].Groups[1].Value -cne $pMode.Value) {') @('if ($false) {'))
 
     # ---- the order test's drift guard
-    (M "O01" "ordertest" "order" "kiosk shell left out of the analyzed list" @('    "src\BayAgent\kiosk\ABG.KioskShell.ps1"') @('    # MUTANT dropped'))
+    (M "O01" "ordertest" "order" "kiosk shell left out of the analyzed list" @('    "src\BayAgent\kiosk\AOC.KioskShell.ps1"') @('    # MUTANT dropped'))
 )
 if ($Only) { $Muts = @($Muts | Where-Object { $_.Id -in ($Only -split ",") }) }
 # (Not named $Suites: that is the suite-path table above, and PowerShell names are case-insensitive.)
@@ -258,7 +258,7 @@ try {
         Copy-Item -LiteralPath $Paths.builder -Destination (Join-Path $repoCopy "tools\Build-ReleasePackage.ps1") -Force
         Copy-Item -LiteralPath (Join-Path $Repo "tests\BayAgent.KioskPackage.Tests.ps1") -Destination (Join-Path $repoCopy "tests") -Force
         Copy-Item -LiteralPath $Paths.ordertest -Destination (Join-Path $repoCopy "tests\BayAgent.StartupOrder.Tests.ps1") -Force
-        $map = @{ agent = "src\BayAgent\BayAgent.ps1"; shell = "src\BayAgent\kiosk\ABG.KioskShell.ps1"; builder = "tools\Build-ReleasePackage.ps1"; ordertest = "tests\BayAgent.StartupOrder.Tests.ps1" }
+        $map = @{ agent = "src\BayAgent\BayAgent.ps1"; shell = "src\BayAgent\kiosk\AOC.KioskShell.ps1"; builder = "tools\Build-ReleasePackage.ps1"; ordertest = "tests\BayAgent.StartupOrder.Tests.ps1" }
         foreach ($k in $Paths.Keys) { Write-Src (Join-Path $repoCopy $map[$k]) $orig[$k] $texts[$k] }
         $agentCopy = Join-Path $repoCopy $map.agent
         $shellCopy = Join-Path $repoCopy $map.shell

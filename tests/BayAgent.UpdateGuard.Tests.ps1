@@ -12,7 +12,7 @@ WHY THIS EXISTS
 
     G   static: the build gates (code version, manifest length) refuse what they must; the package ships the guard;
         the guard's command line has no -ExecutionPolicy and is NOT matched by the kill patterns in
-        ABG.HostWatchdog.ps1 and ABG.AgentHost.ps1 (read from those files; the agent's own command line is the
+        AOC.HostWatchdog.ps1 and AOC.AgentHost.ps1 (read from those files; the agent's own command line is the
         positive control); the updater launches the guard from the snapshot.
     F   F1 regression: the 1.3.0 updater (git 514ad6d) leaves a same-size, same-time stale manifest.json in current\
         (red control); the 1.3.1 updater copies it and verifies current\ by hash.
@@ -25,8 +25,8 @@ WHY THIS EXISTS
         proves itself back is confirmed; one that does not is rolled back (current\ and tools\ restored by hash,
         rolled-back result, restart requested) and the restored agent confirmed; an unreachable cloud never rolls
         back; a drill rolls back on purpose.
-    K   the restart proof: the updater runs INSIDE a scheduled task standing in for \ABG Bay Agent, the task is ended
-        the way ABG.HostWatchdog.ps1 ends it (schtasks /End), and the guard survives and finishes. Whether a plain
+    K   the restart proof: the updater runs INSIDE a scheduled task standing in for \AOC Bay Agent, the task is ended
+        the way AOC.HostWatchdog.ps1 ends it (schtasks /End), and the guard survives and finishes. Whether a plain
         child of the ended task survives is recorded, not asserted (it did on Windows 11 26300, 2026-10-07); the
         watchdog's command-line kill patterns are covered statically in G.
     U   guard rules one at a time: wrong hash, alive before promotion, soak not met, damaged snapshot, junction at
@@ -48,6 +48,7 @@ param([switch]$SkipTaskTests, [string]$Only = "")
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$RootName = if ([string]::IsNullOrWhiteSpace($env:AOC_TEST_ROOT_NAME)) { "AceOfClubs" } else { $env:AOC_TEST_ROOT_NAME }   # run the suite twice: AceOfClubs (default) and AllBirdies (a bay not yet moved)
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $IsWin = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
@@ -250,15 +251,19 @@ try {
     $uAst = [System.Management.Automation.Language.Parser]::ParseFile($Updater, [ref]$null, [ref]$null)
     $fnArgs = $uAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq "Get-UpdateGuardArguments" }, $true) | Select-Object -First 1
     . ([scriptblock]::Create($fnArgs.Extent.Text))
-    $BaseDir = "C:\AllBirdies\BayAgent"
-    $guardArgs = Get-UpdateGuardArguments "C:\AllBirdies\BayAgent\rollback\tools\Watch-BayAgentUpdate.ps1" ([guid]::NewGuid().ToString()) "ABG BayAgent Update Guard"
+    $BaseDir = "C:\$RootName\BayAgent"
+    $guardArgs = Get-UpdateGuardArguments "C:\$RootName\BayAgent\rollback\tools\Watch-BayAgentUpdate.ps1" ([guid]::NewGuid().ToString()) "AOC BayAgent Update Guard"
     $guardCl = ('"{0}" {1}' -f "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe", $guardArgs)
-    Assert-True ($guardArgs -notmatch '(?i)-ExecutionPolicy|-Command|-EncodedCommand|\s-c\s|\s-enc\s' -and $guardArgs -match '(?i)-File "C:\\AllBirdies\\BayAgent\\rollback\\tools\\Watch-BayAgentUpdate\.ps1"') "the guard runs with -File and no execution-policy override (AllSigned applies to it)"
-    $wdText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\ABG.HostWatchdog.ps1"))
-    $wdRx = [regex]::Match($wdText, 'function Get-BayAgentProcs[\s\S]*?\$cl -match "([^"]+)"').Groups[1].Value
-    $ahText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\ABG.AgentHost.ps1"))
-    $ahLike = [regex]::Match($ahText, 'Get-PSProcessesByCmdLike "([^"]+)"').Groups[1].Value
-    $agentCl = '"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -WindowStyle Minimized -File "C:\AllBirdies\BayAgent\current\BayAgent.ps1"'
+    Assert-True ($guardArgs -notmatch '(?i)-ExecutionPolicy|-Command|-EncodedCommand|\s-c\s|\s-enc\s' -and $guardArgs -match ('(?i)-File "C:\\{0}\\BayAgent\\rollback\\tools\\Watch-BayAgentUpdate\.ps1"' -f $RootName)) "the guard runs with -File and no execution-policy override (AllSigned applies to it)"
+    $wdText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\AOC.HostWatchdog.ps1"))
+    # Both patterns are built from the install root now ($BaseDir, found from where the script sits), so the test reads the
+    # expression out of each bootstrap file and evaluates it for THIS root (run under both roots: AceOfClubs and AllBirdies).
+    $wdExpr = [regex]::Match($wdText, 'function Get-BayAgentProcs[\s\S]*?\$cl -match (\(.+\))\) \{ \$hits').Groups[1].Value
+    $wdRx = ""; if ($wdExpr.Length -gt 0) { $wdRx = [string](& ([scriptblock]::Create('param($BaseDir) ' + $wdExpr)) "C:\$RootName\BayAgent") }
+    $ahText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\AOC.AgentHost.ps1"))
+    $ahExpr = [regex]::Match($ahText, 'Get-PSProcessesByCmdLike (\(.+\))\)').Groups[1].Value
+    $ahLike = ""; if ($ahExpr.Length -gt 0) { $ahLike = [string](& ([scriptblock]::Create('param($BaseDir) ' + $ahExpr)) "C:\$RootName\BayAgent") }
+    $agentCl = ('"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -WindowStyle Minimized -File "C:\{0}\BayAgent\current\BayAgent.ps1"' -f $RootName)
     Assert-True ($wdRx.Length -gt 0 -and $ahLike.Length -gt 0 -and ($agentCl -match $wdRx) -and ($agentCl -like $ahLike)) "(positive control) both kill patterns, read from the bootstrap files, DO match the agent's own command line ('$wdRx' / '$ahLike')"
     Assert-True (-not ($guardCl -match $wdRx) -and -not ($guardCl -like $ahLike)) "neither kill pattern matches the guard's command line, so a restart does not stop the guard"
     $uText = [IO.File]::ReadAllText($Updater)
@@ -617,7 +622,7 @@ try {
         $tnOuter = "AoC-ba131-test-outer-" + [guid]::NewGuid().ToString("N").Substring(0, 8); $tasks.Add($tnOuter)
         $outer = Join-Path $tmp "outer-task.ps1"
         $sleeperPidFile = Join-Path $tmp "outer-sleeper.pid"
-        # The stand-in for \ABG Bay Agent: a plain child (the control), then the updater IN THIS PROCESS (as a StartProcess
+        # The stand-in for \AOC Bay Agent: a plain child (the control), then the updater IN THIS PROCESS (as a StartProcess
         # child of the agent would be: inside the task), then it stays alive so there is a running task to end.
         $outerText = @"
 `$p = Start-Process -FilePath "$Ps51" -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 600") -PassThru -WindowStyle Hidden

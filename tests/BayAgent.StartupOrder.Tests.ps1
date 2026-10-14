@@ -83,15 +83,15 @@ $ShippedScripts = @(
     "src\BayAgent\tools\Update-SessionDisplay.ps1"
     "src\BayAgent\tools\Update-PromosPack.ps1"
     "src\BayAgent\tools\Watch-BayAgentUpdate.ps1"
-    "src\BayAgent\kiosk\ABG.KioskShell.ps1"
+    "src\BayAgent\kiosk\AOC.KioskShell.ps1"
     "src\BayAgent\tools\Setup-BayPC.ps1"
-    "src\BayAgent\bootstrap\ABG.AgentHost.ps1"
-    "src\BayAgent\bootstrap\ABG.HostWatchdog.ps1"
-    "src\BayAgent\bootstrap\ABG.LauncherShell.ps1"
-    "src\BayAgent\bootstrap\ABG.ReleaseFinalize.ps1"
-    "src\BayAgent\bootstrap\ABG.RotateClientSecretDpapiAndTest.ps1"
-    "src\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1"
-    "tools\ABG-Day0-Setup.ps1"
+    "src\BayAgent\bootstrap\AOC.AgentHost.ps1"
+    "src\BayAgent\bootstrap\AOC.HostWatchdog.ps1"
+    "src\BayAgent\bootstrap\AOC.LauncherShell.ps1"
+    "src\BayAgent\bootstrap\AOC.ReleaseFinalize.ps1"
+    "src\BayAgent\bootstrap\AOC.RotateClientSecretDpapiAndTest.ps1"
+    "src\BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1"
+    "tools\AOC-Day0-Setup.ps1"
 )
 
 # ---------------------------------------------------------------- automatic and built-in variables
