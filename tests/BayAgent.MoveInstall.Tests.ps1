@@ -525,7 +525,7 @@ function New-Model([int]$AgentLogon = 1) {
 }
 
 function Get-MoveArgs([string]$Mode, [hashtable]$Extra = @{}) {
-  $a = [ordered]@{ Mode = $Mode; OldRoot = $Old; NewRoot = $New; JournalRoot = $JRoot; ExpectAgentVersion = $AgentVersion; BootstrapSource = $NewBoot; StopTimeoutSeconds = 10 }
+  $a = [ordered]@{ Mode = $Mode; OldRoot = $Old; NewRoot = $New; JournalRoot = $JRoot; JournalTrustStop = $S; JournalExtraTrustedSid = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); ExpectAgentVersion = $AgentVersion; BootstrapSource = $NewBoot; StopTimeoutSeconds = 10 }
   foreach ($k in @($Extra.Keys)) { $a[$k] = $Extra[$k] }
   return $a
 }
@@ -675,6 +675,19 @@ try {
   $jj = $(if ($jDirs.Count -eq 1) { [IO.File]::ReadAllText((Join-Path $jDirs[0] "journal.json")) | ConvertFrom-Json } else { $null })
   Assert-True ($null -ne $jj -and $jj.state -eq "moved" -and [IO.File]::Exists((Join-Path $jDirs[0] "replaced-bootstrap\ABG.AgentHost.ps1")) -and [IO.File]::Exists((Join-Path $jDirs[0] "task-ABG_Bay_Agent.xml"))) "Move: one journal, state moved, holding the old bootstrap files and the old task definitions"
 
+  # Security review: a journal in a folder a standard user can write is refused by Back (its saved files are put back as
+  # scripts that run as SYSTEM). The folder the Move just made is admin-only; open it to BUILTIN\Users, try Back, close it again.
+  $jd0 = @([IO.Directory]::GetDirectories($JRoot) | Where-Object { $_ -match '-move$' } | Sort-Object -Descending)[0]
+  $jdAclSaved = Get-Acl -LiteralPath $jd0
+  $jdAclOpen = Get-Acl -LiteralPath $jd0
+  $jdAclOpen.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")))
+  Set-Acl -LiteralPath $jd0 -AclObject $jdAclOpen
+  $snapPl0 = Get-Snapshot
+  $rpl = Invoke-Harness "planted-journal" @([ordered]@{ title = "Back with a journal a standard user can write"; args = (Get-MoveArgs "Back" @{ BootstrapSource = "" }); answers = @("BACK", "pw:good") }) $model $machine
+  Set-Acl -LiteralPath $jd0 -AclObject $jdAclSaved
+  $xpl = Get-Run $rpl 0
+  $snapPl1 = Get-Snapshot
+  Assert-True ($xpl.exit -eq 1 -and (Get-Console $xpl) -match 'not in an admin-only folder' -and @($xpl.log | Where-Object { $_ -notmatch '^(PROMPT|SIGN|DOWNLOAD)' }).Count -eq 0 -and $snapPl1.newTree -eq $snapPl0.newTree) ("Back refuses a journal in a folder BUILTIN\Users can write, and changes nothing (exit " + $xpl.exit + ")")
   $r2 = Invoke-Harness "main-back" $runs2 $model $machine
   Assert-True ($r2.census -eq "ok" -and [string]::IsNullOrEmpty([string]$r2.harnessError) -and @($r2.runs).Count -eq 3) ("harness clean, Verify, Verify and Back ran on the same modeled machine (" + $r2.harnessError + ")")
   $v1 = Get-Run $r2 0; $v2 = Get-Run $r2 1; $bk = Get-Run $r2 2
@@ -768,6 +781,8 @@ try {
     @{ name = "other-task"; why = "another task starts something under the old root"; addTask = "Bay Nightly Thing"; expect = 'this tool does not move it' },
     @{ name = "kiosk-shell"; why = "BayKiosk's own Shell value names the old root"; regSet = @{ ($KioskWinlogon + "|shell") = $ShellOld }; expect = 'own Shell value' },
     @{ name = "target-exists"; why = "the new root already holds a BayAgent folder"; mkNew = $true; expect = 'already exists; a move never merges' },
+    @{ name = "new-root-open"; why = "the new root already exists and BUILTIN\Users can write it"; mkNewOpen = $true; expect = 'already exists and is not admin-only' },
+    @{ name = "journal-root-open"; why = "the journal folder already exists and BUILTIN\Users can write it"; mkJournalOpen = $true; expect = 'journal folder is not admin-only' },
     @{ name = "link-outside"; why = "a link points outside the old root"; linkOutside = $true; expect = 'points outside the old root' },
     @{ name = "no-source"; why = "a new bootstrap file is missing from the source"; dropNew = "AOC.HostWatchdog.ps1"; expect = 'AOC.HostWatchdog.ps1: not in' },
     @{ name = "still-hardcoded"; why = "a new bootstrap file still names the old root"; hardcode = $true; expect = 'still names' },
@@ -785,6 +800,15 @@ try {
     if ($rc.ContainsKey("addTask")) { $run.addTasks = @([ordered]@{ name = $rc.addTask; xml = (New-ModelTaskXml -Kind "logon" -Arguments ('-File "' + $Old + '\BayAgent\tools\Watch-BayAgentUpdate.ps1"') -User "BAY1KIOSK\BayKiosk" -LogonType 3) }) }
     if ($rc.ContainsKey("regSet")) { $run.regSet = $rc.regSet }
     if ($rc.ContainsKey("mkNew")) { [void][IO.Directory]::CreateDirectory((Join-Path $New "BayAgent")) }
+    foreach ($openKey in @("mkNewOpen", "mkJournalOpen")) {
+      if ($rc.ContainsKey($openKey)) {
+        $openDir = $(if ($openKey -eq "mkNewOpen") { $New } else { $JRoot })
+        [void][IO.Directory]::CreateDirectory($openDir)
+        $oa = Get-Acl -LiteralPath $openDir
+        $oa.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")))
+        Set-Acl -LiteralPath $openDir -AclObject $oa
+      }
+    }
     if ($rc.ContainsKey("linkOutside")) { [void][IO.Directory]::CreateDirectory((Join-Path $S "elsewhere")); Microsoft.PowerShell.Management\New-Item -ItemType Junction -Path (Join-Path $Old "BayAgent\staging\out") -Value (Join-Path $S "elsewhere") | Out-Null }
     if ($rc.ContainsKey("dropNew")) { [IO.File]::Delete((Join-Path $NewBoot $rc.dropNew)) }
     if ($rc.ContainsKey("hardcode")) { [IO.File]::AppendAllText((Join-Path $NewBoot "AOC.AgentHost.ps1"), "`r`n# `$BaseDir = `"" + $Old + "\BayAgent`"`r`n`$x = `"" + $Old + "\BayAgent`"`r`n") }

@@ -63,6 +63,12 @@ param(
   [string]$BayKioskUser = "BayKiosk",
   [string]$JournalRoot = "",
   [string]$Journal = "",
+  # Where the "is this folder admin-only" walk up from a journal folder stops (exclusive). Default: %ProgramData%, which
+  # standard users may create folders in by design; every folder BELOW it must be admin-only. A suite names its scratch.
+  [string]$JournalTrustStop = "",
+  # Extra SIDs treated as admins for the "admin-only" rules (and granted full control on the journal folder this tool
+  # creates). Empty on a bay; a suite that is not elevated names its own user so it can read what the tool wrote.
+  [string[]]$JournalExtraTrustedSid = @(),
   [string]$TimeStampServer = "http://timestamp.digicert.com",
   [int]$StopTimeoutSeconds = 120
 )
@@ -110,6 +116,59 @@ function Write-BmStep([string]$Text) { Write-BmLine "" ; Write-BmLine ("== " + $
 # ------------------------------------------------------------------ pure helpers (no machine access)
 function Get-BmFullPath([string]$Path) {
   return [IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+# ------------------------------------------------------------------ who may write where (the tool runs elevated)
+# The journal is read back by Back and its saved files are put back as bootstrap scripts that run as SYSTEM, and a folder
+# this tool moves INTO is where the agent then lives. A folder a standard user created, or can write to, lets that user plant
+# either. So: the owner must be Administrators, SYSTEM or TrustedInstaller, and no other principal may hold an allow rule
+# that writes, appends, deletes, changes permissions or takes ownership (a rule that only inherits to children is skipped).
+$BmTrustedSids = @("S-1-5-32-544", "S-1-5-18", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+$script:BmExtraTrusted = @(@($JournalExtraTrustedSid) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+function Get-BmUntrustedWriters([string]$Path) {
+  $why = @()
+  $BmTrustedSids = @($BmTrustedSids) + @($script:BmExtraTrusted)
+  $acl = Get-Acl -LiteralPath $Path
+  $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  if ($BmTrustedSids -notcontains $owner) { $why += "owned by $owner" }
+  $mask = 0x10000000 -bor 0x40000000 -bor 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288
+  foreach ($r in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+    if ([string]$r.AccessControlType -ne "Allow") { continue }
+    if (([int]$r.PropagationFlags -band 2) -ne 0) { continue }
+    $sid = $r.IdentityReference.Value
+    if ($BmTrustedSids -contains $sid -or $sid -eq "S-1-3-0") { continue }
+    if (([int]$r.FileSystemRights -band $mask) -ne 0) { $why += "$sid may write" }
+  }
+  return $why
+}
+function Get-BmUntrustedTree([string]$Path, [string]$StopAt) {
+  # The folder and each ancestor, up to (not including) $StopAt and the volume root.
+  $out = @()
+  $p = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+  $stop = $(if ([string]::IsNullOrWhiteSpace($StopAt)) { "" } else { [IO.Path]::GetFullPath($StopAt).TrimEnd('\') })
+  while (-not [string]::IsNullOrEmpty($p)) {
+    $parent = [IO.Path]::GetDirectoryName($p)
+    if ([string]::IsNullOrEmpty($parent)) { break }
+    if ($stop -ne "" -and $p -ieq $stop) { break }
+    if ([IO.Directory]::Exists($p)) { foreach ($w in @(Get-BmUntrustedWriters $p)) { $out += ("{0} ({1})" -f $p, $w) } }
+    $p = $parent
+  }
+  return $out
+}
+function New-BmAdminDirs([string]$Path) {
+  # Creates the missing folders of $Path, each born with an admin-only, non-inheriting rule set (no window in which it
+  # carries its parent's rules).
+  $missing = @()
+  $p = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+  while (-not [IO.Directory]::Exists($p)) { $missing = @($p) + $missing; $p = [IO.Path]::GetDirectoryName($p) }
+  foreach ($m in $missing) {
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in (@("S-1-5-18", "S-1-5-32-544") + @($script:BmExtraTrusted))) {
+      $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+    }
+    [void][IO.Directory]::CreateDirectory($m, $sec)
+  }
 }
 
 function Test-BmUnder([string]$Path, [string]$Root) {
@@ -563,6 +622,12 @@ function New-BmPlan {
   if ((Test-BmUnder $here $From) -or (Test-BmUnder $here $To)) { Refuse "the current folder ($here) is inside a root this tool moves; cd to another folder first" }
   if ((Test-BmUnder $From $To) -or (Test-BmUnder $To $From)) { Refuse "the two roots are inside one another ($From, $To)" }
   if ([IO.Path]::GetPathRoot((Get-BmFullPath $From)) -ine [IO.Path]::GetPathRoot((Get-BmFullPath $To))) { Refuse "the two roots are on different volumes; a move must be a rename on one volume" }
+
+  # -- the folder the install moves INTO: if it already exists it must be admin-only (a folder a standard user made, or can
+  #    write to, would let that user replace what the agent runs as it moves in)
+  if ([IO.Directory]::Exists($To)) {
+    foreach ($w in @(Get-BmUntrustedWriters $To)) { Refuse "$To already exists and is not admin-only ($w); delete it (it should be empty) or fix its owner and access rules, then run again" }
+  }
 
   # -- the folders
   foreach ($f in @($Folders)) {
@@ -1120,6 +1185,9 @@ $jIn = $null
 if ($Mode -eq "Back") {
   $jIn = $(if (-not [string]::IsNullOrWhiteSpace($Journal)) { $Journal } else { Get-BmLatestJournal $JournalRoot })
   if ($null -eq $jIn -or -not [IO.File]::Exists((Join-Path $jIn "journal.json"))) { Write-BmLine "REFUSED: no journal of a completed Move was found under $JournalRoot; name one with -Journal" "Red"; exit 1 }
+  $jTrustStop = $(if ([string]::IsNullOrWhiteSpace($JournalTrustStop)) { $env:ProgramData } else { $JournalTrustStop })
+  $jUntrusted = @(Get-BmUntrustedTree $jIn $jTrustStop)
+  if ($jUntrusted.Count -gt 0) { Write-BmLine ("REFUSED: the journal is not in an admin-only folder, so it cannot be trusted (it names files that are put back as scripts that run as SYSTEM): {0}" -f ($jUntrusted -join "; ")) "Red"; exit 1 }
   $jj = [IO.File]::ReadAllText((Join-Path $jIn "journal.json")) | ConvertFrom-Json
   if ([string]$jj.mode -ne "Move" -or [string]$jj.state -ne "moved") { Write-BmLine "REFUSED: $jIn is not the journal of a completed Move" "Red"; exit 1 }
   if ((Get-BmFullPath ([string]$jj.from)) -ine $OldRoot -or (Get-BmFullPath ([string]$jj.to)) -ine $NewRoot) { Write-BmLine "REFUSED: that journal moved $($jj.from) to $($jj.to), not $OldRoot to $NewRoot" "Red"; exit 1 }
@@ -1134,6 +1202,11 @@ $fileMap = $(if ($Mode -eq "Back") { Get-BmReverseMap $BmBootstrapNameMap } else
 $stageDir = $null
 if ($Mode -ne "Plan") {
   if ((Test-BmUnder $JournalRoot $OldRoot) -or (Test-BmUnder $JournalRoot $NewRoot)) { Write-BmLine "REFUSED: the journal folder may not be inside a root this tool moves" "Red"; exit 4 }
+  # The journal folder is created admin-only; one that already exists must already be (see Get-BmUntrustedWriters).
+  $jTrustStop = $(if ([string]::IsNullOrWhiteSpace($JournalTrustStop)) { $env:ProgramData } else { $JournalTrustStop })
+  New-BmAdminDirs $JournalRoot
+  $jUntrusted = @(Get-BmUntrustedTree $JournalRoot $jTrustStop)
+  if ($jUntrusted.Count -gt 0) { Write-BmLine ("REFUSED: the journal folder is not admin-only ({0}); nothing was changed. Delete it, fix its owner and access rules, or name another with -JournalRoot" -f ($jUntrusted -join "; ")) "Red"; exit 1 }
   $script:BmJDir = Join-Path $JournalRoot ((Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss") + "-" + $Mode.ToLowerInvariant())
   [void][IO.Directory]::CreateDirectory($script:BmJDir)
   $script:BmLogFile = Join-Path $script:BmJDir "log.txt"

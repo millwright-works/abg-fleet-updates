@@ -154,7 +154,7 @@ foreach ($rn in @("AceOfClubs", "AllBirdies")) {
         "an empty value"                     = @($ARGS_BAD, (P $psExe "-NoProfile -File $good -Version `"`""))
         "a bad -WindowStyle"                 = @($ARGS_BAD, (P $psExe "-NoProfile -WindowStyle Bogus -File $good"))
         "a value after a bare switch"        = @($ARGS_BAD, (P $psExe "-RollbackDrill extra -File $good"))
-        "a stray token"                      = @($ARGS_BAD, (P $psExe "-NoProfile stray -File $good"))
+        "an unknown word between switches"   =@($ARGS_BAD, (P $psExe "-NoProfile stray -File $good"))
         "a version with an injection"        = @("AOC_FLEET_VERSION_INVALID", (P $psExe "-NoProfile -File $good -Version 1.7.0;x"))
         "a short -Sha256"                    = @("AOC_FLEET_SHA256_INVALID", (P $psExe "-NoProfile -File $good -Sha256 abc"))
         "a -Sha256 that is not hex"          = @("AOC_FLEET_SHA256_INVALID", (P $psExe ("-NoProfile -File $good -Sha256 " + ("g" * 64))))
