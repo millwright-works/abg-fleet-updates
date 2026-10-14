@@ -61,7 +61,7 @@ shipped version; leave them.
 
 ## R4: the two raw addresses
 
-Read each; a 200 on both is the condition. From any PC with PowerShell (nothing here changes anything):
+Read each; a 200 on both is the condition. From any PC with PowerShell, in a **normal window** (this is not a bay sitting; nothing here changes anything, and it needs no administrator rights). Expect `200` on each line:
 
 ```
 (Invoke-WebRequest -UseBasicParsing -Method Head -Uri https://raw.githubusercontent.com/millwright-works/aoc-fleet-updates/main/tools/AOC-Day0-Setup.ps1).StatusCode
@@ -79,7 +79,7 @@ Build from the MERGED tree (not from the integration branch before the merge), a
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\Build-ReleasePackage.ps1 -Version <version>
 ```
 
-It does not sign before zipping (its header says why: signing would change the SHA-256). The zip name is
+Run it in a **normal window** on the orchestrator's PC, in the merged tree's folder (not at a bay). Expect it to end by naming `dist\BayAgent-<version>.zip`. It does not sign before zipping (its header says why: signing would change the SHA-256). The zip name is
 `BayAgent-<version>.zip` under `dist\`. After Kevin publishes it, read the asset address for 200, download it, and compare
 its SHA-256 with the build's. The three Dev command templates and the Fleet Release row use that address and that SHA-256.
 
@@ -92,6 +92,8 @@ The move tool stages the new counterpart of EVERY mapped `ABG.*` file it finds i
 `ABG.SetClientSecretDpapi.ps1` (Day0's secret path places it) or `ABG.ReleaseFinalize.ps1`, a three-file stick makes Move
 refuse at staging: exit 1, nothing changed, but the sitting stalls. Plan does not stage, so Plan says "would proceed" first.
 Which `ABG.*` files Bay 1 holds is not established; six files cover every case.
+
+What the stick must NOT be relied on for: ownership. Nothing about who owns the files on the stick matters, because `runsheet-bay1-move.md` step 2 copies them into `C:BayMove` in the administrator window, sets the owner to Administrators there, and reads it back (2c) before Plan. A copy made in a normal window is owned by the person who made it (measured 2026-10-14), and Plan then refuses with `-BootstrapSource is not admin-only (owned by S-1-5-21-...)`. This sheet has no step that makes an admin-only folder, so it has no owner step of its own.
 
 ## Not established (read before relying on this sheet)
 

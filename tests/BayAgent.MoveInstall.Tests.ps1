@@ -1042,6 +1042,137 @@ try {
   Assert-True ($xb.exit -eq 0 -and (Get-Console $xb) -match 'RESULT: MOVED to') ("control: the same Back, with the journal as the Move left it, succeeds (exit " + $xb.exit + ")")
 
   # =================================================================================================================
+  Section "E. the run sheet's owner step (docs\runsheet-bay1-move.md, step 2): the tool's own owner check, and the sheet's own commands"
+  # 2026-10-14: a copy made in a normal window is owned by the user, and icacls /grant:r does not change the owner, so Plan
+  # said "-BootstrapSource is not admin-only (owned by S-1-5-21-...)". The sheet now makes, locks, fills and re-owns the
+  # folder in the administrator window and reads the owner back. What this part proves WITHOUT elevation: the tool's own
+  # judgment on the exact shapes (owner = a user SID vs Administrators, rules otherwise identical), the folder this
+  # process really creates, and the sheet's commands (gates, labels, order) by running them. What it cannot prove: the
+  # owner an ELEVATED copy gets (when this suite is run from an administrator window, E3 proves it as well).
+  $savedTrusted = $script:BmExtraTrusted
+  $script:BmExtraTrusted = @()   # as on a bay: no extra trusted account
+  $eRoot = Join-Path $S "e"; [void][IO.Directory]::CreateDirectory($eRoot)
+  $eUserSid = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+  try {
+    # E1. the shapes, as security descriptors (what a copy gets from a normal window vs from an administrator window)
+    $dirRules = "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    $sdU = New-Object Security.AccessControl.RawSecurityDescriptor("O:" + $eUserSid + "G:BAD:PAI" + $dirRules)
+    $sdA = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAG:BAD:PAI" + $dirRules)
+    $pU = @(Get-BmSdProblems $sdU "Full"); $pUr = @(Get-BmSdProblems $sdU "Rename"); $pUo = @(Get-BmSdProblems $sdU "Owner")
+    Assert-True ($pU.Count -eq 1 -and $pU[0] -eq ("owned by " + $eUserSid) -and $pUr.Count -eq 1 -and $pUo.Count -eq 1) ("a folder with the sheet's rules (SYSTEM and Administrators only) but owned by the user is refused for its OWNER alone: '" + ($pU -join "; ") + "'")
+    Assert-True (@(Get-BmSdProblems $sdA "Full").Count -eq 0 -and @(Get-BmSdProblems $sdA "Rename").Count -eq 0 -and @(Get-BmSdProblems $sdA "Owner").Count -eq 0) "the same rules owned by BUILTIN\Administrators are accepted (what the sheet's setowner leaves)"
+    # a file inside the folder: rules inherited from it (the sheet's copy comes after the lock), owner is what judges
+    $fileRules = "(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
+    $sdFU = New-Object Security.AccessControl.RawSecurityDescriptor("O:" + $eUserSid + "G:BAD:AI" + $fileRules)
+    $sdFA = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAG:BAD:AI" + $fileRules)
+    Assert-True (@(Get-BmSdProblems $sdFU "Full").Count -eq 1 -and @(Get-BmSdProblems $sdFA "Full").Count -eq 0) "a file with inherited admin-only rules: refused when the user owns it, accepted when Administrators own it"
+    foreach ($ownerSddl in @("SY", "BA")) {
+      $sdT = New-Object Security.AccessControl.RawSecurityDescriptor("O:" + $ownerSddl + "G:BAD:PAI" + $dirRules)
+      Assert-True (@(Get-BmSdProblems $sdT "Full").Count -eq 0) ("owner " + $ownerSddl + " is accepted")
+    }
+
+    # E2. the folder this process really creates, with the sheet's rules and no extra trusted account
+    $eDir = Join-Path $eRoot "locked"
+    $eSec = New-Object System.Security.AccessControl.DirectorySecurity
+    $eSec.SetAccessRuleProtection($true, $false)
+    foreach ($who in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators")) { $eSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($who, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))) }
+    # the user also gets read-and-execute only: the tool opens the folder to judge it, and a read rule is not a writer
+    $eSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($meSid)), "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")))
+    [void][IO.Directory]::CreateDirectory($eDir, $eSec)
+    try {
+      $eOwner = (New-Object IO.DirectoryInfo($eDir)).GetAccessControl([Security.AccessControl.AccessControlSections]::Owner).GetOwner([Security.Principal.SecurityIdentifier]).Value
+      $eProb = @(Get-BmFolderProblems $eDir $eRoot "Full" "Rename")
+      if ($eOwner -eq "S-1-5-32-544") {
+        Assert-True ($eProb.Count -eq 0) ("E2 (this process is ELEVATED): a folder it creates is owned by Administrators (" + $eOwner + ") and the tool accepts it: this is the elevated-owner proof")
+      } else {
+        Assert-True ($eProb.Count -eq 1 -and $eProb[0] -like ("* (owned by " + $eOwner + ")")) ("E2 (not elevated): a folder this process creates with the sheet's rules is owned by '" + $eOwner + "' and the tool refuses it for that alone: '" + ($eProb -join "; ") + "'")
+      }
+    } finally {
+      Edit-Acl $eDir { param($a) $a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($meSid)), "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))) }
+    }
+
+    # E3. the sheet itself: parse it and run its commands
+    $sheet = (Join-Path $RepoRoot "docs\runsheet-bay1-move.md")
+    $lines = [IO.File]::ReadAllText($sheet).Replace("`r`n", "`n").Split("`n")
+    $blocks = @(); $inB = $false; $lang = ""; $start = 0; $buf = @()
+    for ($n = 0; $n -lt $lines.Count; $n++) {
+      if ($lines[$n] -match '^```(.*)$') {
+        if (-not $inB) { $inB = $true; $lang = $Matches[1].Trim(); $start = $n; $buf = @() }
+        else { $inB = $false; $blocks += [pscustomobject]@{ Lang = $lang; Start = $start; End = $n; Text = ($buf -join "`n") } }
+      } elseif ($inB) { $buf += $lines[$n] }
+    }
+    $cmds = @($blocks | Where-Object { $_.Lang -eq "powershell" })
+    Assert-True (@($blocks | Where-Object { $_.Lang -eq "" }).Count -eq 0) "E3: every fenced block in the sheet is typed (powershell for a command, text for output)"
+    Assert-True ($cmds.Count -ge 7) ("E3: the sheet has its commands as powershell blocks (found " + $cmds.Count + ": 2b, 2c, the owner fix, Plan, Move, Verify, Back)")
+    $labelBad = @(); $guardBad = @(); $expBad = @()
+    foreach ($c in $cmds) {
+      $before = ($lines[([Math]::Max(0, $c.Start - 6))..($c.Start - 1)] -join "`n")
+      $around = ($lines[([Math]::Max(0, $c.Start - 6))..([Math]::Min($lines.Count - 1, $c.End + 14))] -join "`n")
+      if ($before -notmatch 'Window: \*\*(administrator|normal)\*\*') { $labelBad += $c.Start + 1 }
+      if ($c.Text -notmatch 'Write-Host \("Computer: " \+ \$env:COMPUTERNAME\)' -or $c.Text -notmatch '\$env:COMPUTERNAME -ne \$pc' -or $c.Text -notmatch "WRONG PC\. STOP" -or $c.Text -notmatch "\`$pc = '<PC>'") { $guardBad += $c.Start + 1 }
+      if ($before -match 'Window: \*\*administrator\*\*' -and ($c.Text -notmatch 'IsInRole\(\[Security\.Principal\.WindowsBuiltInRole\]::Administrator\)' -or $c.Text -notmatch 'NOT AN ADMINISTRATOR WINDOW')) { $guardBad += $c.Start + 1 }
+      if ($around -notmatch 'Expect') { $expBad += $c.Start + 1 }
+    }
+    Assert-True ($labelBad.Count -eq 0) ("E3: every command says which window it runs in (lines without: " + ($labelBad -join ",") + ")")
+    Assert-True ($guardBad.Count -eq 0) ("E3: every command prints the computer name first, stops on the wrong PC, and an administrator one checks it is elevated (lines failing: " + ($guardBad -join ",") + ")")
+    Assert-True ($expBad.Count -eq 0) ("E3: every command has an Expect line (lines without: " + ($expBad -join ",") + ")")
+    $copyBlock = @($cmds | Where-Object { $_.Text -match 'Copy-Item' })
+    $lockBlock = @($cmds | Where-Object { $_.Text -match 'inheritance:r' })
+    $ownBlock = @($cmds | Where-Object { $_.Text -match 'setowner "BUILTIN\\Administrators" /T /C' })
+    $chkBlock = @($cmds | Where-Object { $_.Text -match "S-1-5-32-544" -and $_.Text -match "GetOwner" })
+    Assert-True ($copyBlock.Count -eq 1 -and $lockBlock.Count -eq 1 -and $copyBlock[0].Start -eq $lockBlock[0].Start) "E3: one block makes, locks and copies (lock first, then copy, so the files inherit the lock)"
+    $t2 = $copyBlock[0].Text
+    Assert-True ($t2.IndexOf("New-Item -ItemType Directory") -lt $t2.IndexOf("inheritance:r") -and $t2.IndexOf("inheritance:r") -lt $t2.IndexOf("Copy-Item") -and $t2.IndexOf("Copy-Item") -lt $t2.IndexOf("/setowner")) "E3: the order in the block is create, lock, copy, set owner"
+    Assert-True ($ownBlock.Count -ge 2 -and $chkBlock.Count -eq 1) "E3: the owner is set (in 2b and in the fix) and read back by the SID of Administrators in 2c"
+    $adminLine = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l -match '^\*\*2a\. Open Windows PowerShell as administrator' })
+    Assert-True ($adminLine -ge 0 -and $adminLine -lt $copyBlock[0].Start) "E3: the administrator window is opened (2a) before the copy"
+    $stepAfter = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l -match '^\*\*3\. Run Plan' })
+    Assert-True ($stepAfter -gt $chkBlock[0].End -and $stepAfter -gt 0) "E3: the read-back (2c) comes before Plan (step 3)"
+    Assert-True (([string]::Join("`n", $lines)) -notmatch '\*\*2\. Copy the tool\*\* from the stick') "E3: the old step 2 (copy first, lock later) is gone"
+
+    # E3 run: the real 2b and 2c commands, with only the PC name, the stick and the folder swapped for scratch values
+    $pcReal = $env:COMPUTERNAME
+    $eStick = Join-Path $eRoot "stick"; [void][IO.Directory]::CreateDirectory((Join-Path $eStick "bootstrap"))
+    [IO.File]::WriteAllText((Join-Path $eStick "Move-BayInstall.ps1"), "# fixture`r`n"); [IO.File]::WriteAllText((Join-Path $eStick "bootstrap\AOC.AgentHost.ps1"), "# fixture`r`n")
+    $isElev = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $runBlock = {
+      param([string]$Text, [string]$Pc, [string]$Dest, [string]$Tag, [bool]$DropAdminGate)
+      $t = $Text.Replace("'<PC>'", "'" + $Pc + "'").Replace("'C:\BayMove'", "'" + $Dest + "'").Replace("'<D>:\'", "'" + $eStick + "\'")
+      if ($DropAdminGate) { $t = $t.Replace('if (-not $admin) {', 'if ($false) {') }
+      $f = Join-Path $eRoot ("run-" + $Tag + ".ps1")
+      [IO.File]::WriteAllText($f, $t.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
+      $ErrorActionPreference = "Continue"
+      $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f 2>&1 | ForEach-Object { [string]$_ }
+      return ($o -join "`n")
+    }
+    $d1 = Join-Path $eRoot "dest-wrongpc"
+    $o1 = & $runBlock $copyBlock[0].Text ("NOT-THIS-PC-" + $RunId) $d1 "2b-wrongpc" $false
+    Assert-True ($o1 -match "WRONG PC\. STOP" -and $o1 -match "Computer: " -and $o1 -notmatch "Copied" -and -not (Test-Path -LiteralPath $d1)) "E3 run: 2b on the wrong PC prints the name, says STOP and creates nothing"
+    $d2 = Join-Path $eRoot "dest-normal"
+    if (-not $isElev) {
+      $o2 = & $runBlock $copyBlock[0].Text $pcReal $d2 "2b-normal" $false
+      Assert-True ($o2 -match ("Computer: " + [regex]::Escape($pcReal)) -and $o2 -match "Administrator window: False" -and $o2 -match "NOT AN ADMINISTRATOR WINDOW\. STOP" -and $o2 -notmatch "Copied" -and -not (Test-Path -LiteralPath $d2)) "E3 run: 2b in a normal window stops before creating or copying anything"
+      # 2c's reading logic (admin gate dropped in this copy only) on a folder this user owns: it names the owner and says STOP
+      $d3 = Join-Path $eRoot "dest-userowned"; [void][IO.Directory]::CreateDirectory($d3)
+      [IO.File]::WriteAllText((Join-Path $d3 "f.ps1"), "# fixture`r`n")
+      $o3 = & $runBlock $chkBlock[0].Text $pcReal $d3 "2c-userowned" $true
+      Assert-True ($o3 -match ("owner is " + [regex]::Escape($meSid) + ": ") -and $o3 -match "STOP\. Photograph" -and $o3 -notmatch "OK: every item") "E3 run: 2c on a folder and file owned by the user lists the owner SID and says STOP (admin gate removed in this copy)"
+      $o3b = & $runBlock $chkBlock[0].Text $pcReal $d3 "2c-gate" $false
+      Assert-True ($o3b -match "NOT AN ADMINISTRATOR WINDOW\. STOP" -and $o3b -notmatch "Items checked") "E3 run: 2c itself in a normal window stops at the gate"
+    } else {
+      $o2 = & $runBlock $copyBlock[0].Text $pcReal $d2 "2b-admin" $false
+      Assert-True ($o2 -match "Copied, locked and owner set") ("E3 run (ELEVATED): 2b ran to the end: " + ($o2 -replace "`n", " | "))
+      $o4 = & $runBlock $chkBlock[0].Text $pcReal $d2 "2c-admin" $false
+      Assert-True ($o4 -match "Owner of .*: BUILTIN\\Administrators" -and $o4 -match "Items checked: 4" -and $o4 -match "OK: every item") ("E3 run (ELEVATED): 2c reads back Administrators as owner of all 4 items: " + ($o4 -replace "`n", " | "))
+      $pcB = @(Get-BmFolderProblems $d2 $eRoot "Full" "Rename")
+      Assert-True ($pcB.Count -eq 0) "E3 run (ELEVATED): the tool's own folder judgment accepts the folder 2b made"
+    }
+    Write-Host ("  (suite elevated: " + $isElev + "; the E3 branches that need elevation ran only if True)")
+  } finally {
+    $script:BmExtraTrusted = $savedTrusted
+  }
+
+  # =================================================================================================================
   Section "C. the real Task Scheduler: export, rewrite, register under the new name"
   $uniq = "AocBmTest-" + $RunId
   $tOld = $uniq + " ABG Bay Agent"; $tNew = $uniq + " AOC Bay Agent"

@@ -41,20 +41,146 @@ Nothing in Dev changes before the move. The three command templates change right
 **1. Sign in as the administrator with Switch user** (leave BayKiosk signed in: the tool reads BayKiosk's own
 settings while it is signed in, and signs it out itself during the move).
 
-**2. Copy the tool** from the stick to `C:\BayMove` (the folder must not be inside `C:\AllBirdies` or
-`C:\AceOfClubs`): `C:\BayMove\Move-BayInstall.ps1` and `C:\BayMove\bootstrap\AOC.*.ps1`.
+**Every command below is pasted whole.** Each starts by printing the computer name and stops if it is not Bay 1's
+(`<PC>`, filled in by the orchestrator from Dev's Bay 1 row before the sitting; `<D>:` is the stick's drive letter, read
+in File Explorer). Each says which window it runs in: **normal** (a PowerShell window opened without "Run as
+administrator") or **administrator** (the title bar starts with `Administrator:`). A command that prints `STOP` has
+changed nothing; read the line, do not retry blindly.
 
-Then make `C:\BayMove` administrator-only, in the administrator window: `icacls C:\BayMove /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F"`, and check with `icacls C:\BayMove` that only those two are listed. The tool signs the files in `-BootstrapSource` with the bay's certificate and refuses a folder that standard users can write (and a folder above it that they can delete from or change); `C:\` gives Authenticated Users Modify on every new folder under it, so without this step Plan says `REFUSED: -BootstrapSource is not admin-only`. The same judgment is made of the new root, the journal folder, and every folder above them (a junction anywhere on a path is refused): Plan prints any such finding with the folder named, so it is safe to run first.
+**2. Copy the tool and lock the folder, in the administrator window.**
 
-**3. Open Windows PowerShell as administrator** and run Plan (it changes nothing):
+Why in that window: a file copied from a normal window belongs to the person who copied it (measured on a PC,
+2026-10-14), and `icacls ... /grant:r` changes who may write, not who OWNS. The tool refuses a folder whose owner is not
+Administrators, SYSTEM or TrustedInstaller (`REFUSED: -BootstrapSource is not admin-only (owned by S-1-5-21-...)`), and
+`C:\` gives Authenticated Users Modify on every new folder under it. So the folder is made, locked and filled in the
+administrator window, and the owner is set to Administrators and read back afterwards. The folder must not be inside
+`C:\AllBirdies` or `C:\AceOfClubs`.
 
+**2a. Open Windows PowerShell as administrator:** Start, type `powershell`, right-click Windows PowerShell, Run as
+administrator, Yes. The title bar must start with `Administrator:`. Keep this window for 2b, 2c and step 3.
+
+**2b. Make `C:\BayMove`, lock it, copy the stick into it, set the owner.** Window: **administrator**. Fill in `<PC>` and `<D>`.
+
+```powershell
+& {
+  $pc = '<PC>'; $dest = 'C:\BayMove'; $stick = '<D>:\'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP. Close it and open one with Run as administrator (2a)." -ForegroundColor Red; return }
+  if (-not (Test-Path -LiteralPath ($stick + 'Move-BayInstall.ps1')) -or -not (Test-Path -LiteralPath ($stick + 'bootstrap'))) { Write-Host ("STOP. Move-BayInstall.ps1 or bootstrap is not at " + $stick + " - fix the drive letter.") -ForegroundColor Red; return }
+  if (Test-Path -LiteralPath $dest) { Write-Host ($dest + " already exists. STOP. Hand this back; do not delete it.") -ForegroundColor Red; return }
+  New-Item -ItemType Directory -Path $dest | Out-Null
+  icacls $dest /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" | Out-Null
+  if ($LASTEXITCODE -ne 0) { Write-Host "STOP. icacls could not lock the folder." -ForegroundColor Red; return }
+  Copy-Item -LiteralPath ($stick + 'Move-BayInstall.ps1') -Destination $dest
+  Copy-Item -LiteralPath ($stick + 'bootstrap') -Destination (Join-Path $dest 'bootstrap') -Recurse
+  icacls $dest /setowner "BUILTIN\Administrators" /T /C | Out-Null
+  if ($LASTEXITCODE -ne 0) { Write-Host "STOP. icacls could not set the owner." -ForegroundColor Red; return }
+  Write-Host "Copied, locked and owner set. Run 2c now."
+}
 ```
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Plan -ExpectAgentVersion <version> -BootstrapSource C:\BayMove\bootstrap
+
+Expect:
+
+```text
+Computer: <PC>
+Administrator window: True
+Copied, locked and owner set. Run 2c now.
 ```
 
-Expect (copied from the modeled run):
+**2c. Read it back.** Window: **administrator**. This is the check that Plan's folder test will pass; it reads the owner
+of the folder and of every file in it, and every access rule.
 
+```powershell
+& {
+  $pc = '<PC>'; $dest = 'C:\BayMove'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP." -ForegroundColor Red; return }
+  if (-not (Test-Path -LiteralPath $dest)) { Write-Host ($dest + " does not exist. STOP. Run 2b.") -ForegroundColor Red; return }
+  $bad = @()
+  $items = @(Get-Item -LiteralPath $dest -Force) + @(Get-ChildItem -LiteralPath $dest -Recurse -Force)
+  foreach ($i in $items) {
+    $acl = Get-Acl -LiteralPath $i.FullName
+    $o = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($o -ne 'S-1-5-32-544') { $bad += ("owner is " + $o + ": " + $i.FullName) }
+    foreach ($r in $acl.Access) {
+      $s = $r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+      if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $s) { $bad += ("a rule for " + $r.IdentityReference + ": " + $i.FullName) }
+    }
+  }
+  Write-Host ("Owner of " + $dest + ": " + (Get-Acl -LiteralPath $dest).Owner)
+  Write-Host ("Items checked: " + $items.Count)
+  if ($bad.Count -gt 0) { $bad | ForEach-Object { Write-Host $_ -ForegroundColor Red }; Write-Host "STOP. Photograph this and hand it back." -ForegroundColor Red }
+  else { Write-Host "OK: every item is owned by Administrators; only SYSTEM and Administrators have rules." -ForegroundColor Green }
+}
 ```
+
+Expect (9 items if the stick holds `Move-BayInstall.ps1` and the six `bootstrap\AOC.*.ps1`, as P4 says: the folder, the
+tool, `bootstrap`, six files):
+
+```text
+Computer: <PC>
+Administrator window: True
+Owner of C:\BayMove: BUILTIN\Administrators
+Items checked: 9
+OK: every item is owned by Administrators; only SYSTEM and Administrators have rules.
+```
+
+If it lists `owner is S-1-5-21-...` lines (the copy was made in a normal window, or by a tool that kept the user as
+owner), run this once in the same window and run 2c again. Window: **administrator**.
+
+```powershell
+& {
+  $pc = '<PC>'; $dest = 'C:\BayMove'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP." -ForegroundColor Red; return }
+  if (-not (Test-Path -LiteralPath $dest)) { Write-Host ($dest + " does not exist. STOP.") -ForegroundColor Red; return }
+  icacls $dest /setowner "BUILTIN\Administrators" /T /C | Out-Null
+  Write-Host ("icacls exit code: " + $LASTEXITCODE)
+}
+```
+
+Expect:
+
+```text
+Computer: <PC>
+Administrator window: True
+icacls exit code: 0
+```
+
+The tool signs the files in `-BootstrapSource` with the bay's certificate and refuses a folder that standard users can
+write (and a folder above it that they can delete from or change). The same judgment is made of the new root, the
+journal folder, and every folder above them (a junction anywhere on a path is refused): Plan prints any such finding
+with the folder named, so it is safe to run first.
+
+**3. Run Plan in the same administrator window** (it changes nothing). Window: **administrator**.
+
+```powershell
+& {
+  $pc = '<PC>'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP. Close it and open one with Run as administrator." -ForegroundColor Red; return }
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Plan -ExpectAgentVersion <version> -BootstrapSource C:\BayMove\bootstrap
+  Write-Host ("Tool exit code: " + $LASTEXITCODE)
+}
+```
+
+Expect (the first two lines and the last are from the guard; the rest was copied from the modeled run):
+
+```text
+Computer: <PC>
+Administrator window: True
 Move-BayInstall 1.0.0  mode Plan  old root C:\AllBirdies  new root C:\AceOfClubs
 
 == Plan: Move from C:\AllBirdies to C:\AceOfClubs
@@ -76,6 +202,7 @@ Move-BayInstall 1.0.0  mode Plan  old root C:\AllBirdies  new root C:\AceOfClubs
   Winlogon Shell: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -WindowStyle Hidden -File "C:\AllBirdies\BayAgent\bootstrap\ABG.LauncherShell.ps1" -> ...AOC.LauncherShell.ps1"
   BayKiosk sessions to sign out: 1
 RESULT: Move would proceed (nothing was changed)
+Tool exit code: 0
 ```
 
 Lines that may differ and are fine: no `re-point link` line (Bay 1's `current` is a real folder after any update
@@ -85,7 +212,7 @@ from the agent task (it then signs in with the interactive token and nothing ask
 **Stop and photograph the screen if** it ends `RESULT: REFUSED`. Each refusal names its reason; what was seen in the
 suite:
 
-```
+```text
   REFUSED: the installed agent is '<installed>' (current\manifest.json), not '<version>': install that release at the old root first
   REFUSED: an update is in flight or still being watched (state\update-pending.json phase 'promoted'); wait for its guard to finish
   REFUSED: BayKiosk's own Shell value starts a file under C:\AllBirdies; this tool does not edit an account's own registry
@@ -99,13 +226,24 @@ that starts something under `C:\AllBirdies` that the sheet did not expect.
 changes yet), then asks you to type `MOVE`, then BayKiosk's password if the plan said "needs its password". BayKiosk is
 signed out during the move; the wall goes dark.
 
-```
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Move -ExpectAgentVersion <version> -BootstrapSource C:\BayMove\bootstrap
+Window: **administrator** (the one from 2a, or a new one opened the same way).
+
+```powershell
+& {
+  $pc = '<PC>'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP. Close it and open one with Run as administrator." -ForegroundColor Red; return }
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Move -ExpectAgentVersion <version> -BootstrapSource C:\BayMove\bootstrap
+  Write-Host ("Tool exit code: " + $LASTEXITCODE)
+}
 ```
 
-Expect, after the plan above (copied from the modeled run):
+Expect, after the plan above (copied from the modeled run; the guard prints `Computer: <PC>` and `Administrator window: True` first and `Tool exit code: 0` last):
 
-```
+```text
 == Stage the bootstrap files (nothing on the bay changes yet)
   ready: AOC.AgentHost.ps1 (signed by <thumbprint>, timestamped)
   ready: AOC.HostWatchdog.ps1 (signed by <thumbprint>, timestamped)
@@ -159,7 +297,7 @@ says it was kept; that is fine.
 **If it ends `RESULT: FAILED and everything was put back`** (exit 2): the bay is as it was before step 4. Photograph
 the `FAILED:` line, restart the PC, and hand the photo back. Two failures seen in the suite:
 
-```
+```text
 FAILED: registering the task 'AOC Bay Agent' failed: The user name or password is incorrect. (8,44):UserId:
 FAILED: 1 process(es) still use C:\AllBirdies after 120 s; close them and run Move again
 ```
@@ -176,16 +314,27 @@ definitions, the old bootstrap files and the old `agent-config.json`.
 **6. Look at the wall.** It shows the session display as before (the same Edge profile, now under
 `C:\AceOfClubs\SessionDisplay\edge-profile`). The suite cannot prove this: Edge is not run by it.
 
-**7. Run Verify** as the administrator (Switch user again, leave BayKiosk signed in), about two minutes after the
+**7. Run Verify** in an administrator window (Switch user again to the administrator, leave BayKiosk signed in; open Windows PowerShell as in 2a), about two minutes after the
 restart:
 
-```
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Verify
+Window: **administrator**.
+
+```powershell
+& {
+  $pc = '<PC>'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP. Close it and open one with Run as administrator." -ForegroundColor Red; return }
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Verify
+  Write-Host ("Tool exit code: " + $LASTEXITCODE)
+}
 ```
 
-Expect (copied from the modeled run, after a modeled restart):
+Expect (copied from the modeled run, after a modeled restart; the guard prints `Computer: <PC>` and `Administrator window: True` first and `Tool exit code: 0` last):
 
-```
+```text
 == Verify: the install is at C:\AceOfClubs
   ok: the task \AOC Bay Agent is Ready
   ok: the task \AOC Host Watchdog is Ready
@@ -220,8 +369,19 @@ is not part of this sheet.
   Verify with the same command as step 7: it finds which folder the install is in and checks that one (the suite saw
   `RESULT: MOVED to C:\AllBirdies` from Back, then the original tasks and files byte for byte).
 
-```
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Back -ExpectAgentVersion <version>
+  Window: **administrator**. Expect: the guard's `Computer: <PC>`, the tool's journal and `RESULT: MOVED to C:\AllBirdies`, then `Tool exit code: 0`.
+
+```powershell
+& {
+  $pc = '<PC>'
+  Write-Host ("Computer: " + $env:COMPUTERNAME)
+  if ($env:COMPUTERNAME -ne $pc) { Write-Host "WRONG PC. STOP. Close this window." -ForegroundColor Red; return }
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  Write-Host ("Administrator window: " + $admin)
+  if (-not $admin) { Write-Host "NOT AN ADMINISTRATOR WINDOW. STOP. Close it and open one with Run as administrator." -ForegroundColor Red; return }
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\BayMove\Move-BayInstall.ps1 -Mode Back -ExpectAgentVersion <version>
+  Write-Host ("Tool exit code: " + $LASTEXITCODE)
+}
 ```
 
   If the three templates were already changed (step 9), change them back too.
