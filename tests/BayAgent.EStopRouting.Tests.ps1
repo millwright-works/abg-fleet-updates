@@ -244,6 +244,9 @@ try {
     $Global:SessionDisplayUrl = "file:///C:/bayagent-estop-test-$([Guid]::NewGuid().ToString('N'))/index.html"
     $Global:SessionDisplayProfileDir = Join-Path $tmp "edge-profile-unique"
     $Global:SessionDisplayStatePath = Join-Path $tmp "display-state.json"
+    # The agent finds its install root from where it is installed ($BaseDir) and the Session Display folders sit beside it;
+    # the lifted functions read $BaseDir, so this sandbox names one (never the live install).
+    $BaseDir = Join-Path $tmp "BayAgent"
     $Global:SessionDisplayProcId = $null
     # The agent's script-level running-session state (RF-K1, 2026-10-09): nobody playing, its file in this sandbox.
     $Global:RunningSession = $null; $Global:RunningSessionPending = $false; $RunningSessionPath = Join-Path $tmp "state\running-session.json"
