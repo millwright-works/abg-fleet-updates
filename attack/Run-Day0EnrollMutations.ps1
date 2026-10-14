@@ -107,7 +107,7 @@ $mutants = @(
     (New-D0Mutant "W5" "the secret guard is not asked of a bay that already has something on record (the re-check's survivor)" @(
         (New-D0Edit '    $secretCheck = Get-OwnIdentitySecretOnPc' '    $secretCheck = $(if ($stateTp) { [pscustomobject]@{ Found = ""; Unreadable = "" } } else { Get-OwnIdentitySecretOnPc })'))),
     (New-D0Mutant "G05" "a corrupt state file is not a refusal" @(
-        (New-D0Edit ('        if ($Global:CredentialStateCorrupt) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT"') ('        if ($false) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT"')))),
+        (New-D0Edit ('        if ($Global:CredentialStateCorrupt) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "AOC_OWNID_STATE_CORRUPT"') ('        if ($false) {' + $nl + '            return (New-OwnIdentityEnrollRefusal "AOC_OWNID_STATE_CORRUPT"')))),
     (New-D0Mutant "G06" "an identity switch on probation is not a refusal" @(
         (New-D0Edit '    if ($null -ne $probation) {' '    if ($false) {'))),
     (New-D0Mutant "G07" "a waiting rotation is not a refusal" @(

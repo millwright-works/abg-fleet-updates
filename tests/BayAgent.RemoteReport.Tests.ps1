@@ -205,7 +205,7 @@ Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms,System.
     $root = Join-Path $tmp "bay"
     foreach ($sub in @("logs", "secrets", "state", "releases\1.2.1", "rollback")) { New-Item -ItemType Directory -Force -Path (Join-Path $root $sub) | Out-Null }
     $shipped = [IO.File]::ReadAllText($AgentScript)
-    $needle = '$BaseDir = "C:\AllBirdies\BayAgent"'
+    $needle = '$BaseDir = Get-BayInstallRoot $PSScriptRoot'
     if (-not $shipped.Contains($needle)) { throw "could not find the BaseDir literal in $AgentScript" }
     $agentCopy = Join-Path $root "BayAgent.ps1"
     [IO.File]::WriteAllText($agentCopy, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $root)), (New-Object Text.UTF8Encoding($true)))

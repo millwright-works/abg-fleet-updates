@@ -1,18 +1,18 @@
 <# 
-ABG-Day0-Setup.ps1
+AOC-Day0-Setup.ps1
 Day 0 bootstrap for a new bay PC (AllSigned-friendly) + optional Dataverse ConfigItem registration.
 
 Run as Administrator.
 
 Example:
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ABG-Day0-Setup.ps1 `
-  -FleetRawBaseUrl "https://raw.githubusercontent.com/millwright-works/abg-fleet-updates/main/src/BayAgent" `
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\AOC-Day0-Setup.ps1 `
+  -FleetRawBaseUrl "https://raw.githubusercontent.com/millwright-works/aoc-fleet-updates/main/src/BayAgent" `
   -BayKioskUser "BayKiosk" `
   -RegisterConfigItems `
   -EnvironmentUrl "https://builds-apps-dev.crm.dynamics.com" `
   -TenantId "<tenant-guid>" `
   -ClientId "<app-client-id>" `
-  -ClientSecretDpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" `
+  -ClientSecretDpapiPath "C:\AceOfClubs\BayAgent\secrets\clientsecret.dpapi" `
   -BayId "<bay-guid>"
 
 Notes:
@@ -24,7 +24,7 @@ Notes:
 
 [CmdletBinding()]
 param(
-  [string]$AllBirdiesRoot = "C:\AllBirdies",
+  [Alias("AllBirdiesRoot")][string]$AceOfClubsRoot = "C:\AceOfClubs",
   [string]$BayKioskUser = "BayKiosk",
 
   # Raw GitHub base for downloading scripts
@@ -50,7 +50,7 @@ param(
   [string]$ConfigClientId = "",
   [string]$ConfigBayId = "",
 
-  # Place bootstrap\ABG.SetClientSecretDpapi.ps1 on this PC. Only for a bay being set up for the legacy secret
+  # Place bootstrap\AOC.SetClientSecretDpapi.ps1 on this PC. Only for a bay being set up for the legacy secret
   # credential; a certificate bay is given neither the shared secret nor the tool that seals one (A0.529).
   [switch]$PlaceSecretTool = $false,
 
@@ -191,15 +191,20 @@ function Set-AgentConfigTemplateValues {
   return [ordered]@{ text = $text; unfilled = $left }
 }
 
-function Write-AgentConfigTemplateIfMissing([string]$path, [string]$envUrl = "", [string]$tenant = "", [string]$client = "", [string]$bay = "") {
+function Write-AgentConfigTemplateIfMissing([string]$path, [string]$envUrl = "", [string]$tenant = "", [string]$client = "", [string]$bay = "", [string]$root = "") {
   if (Test-Path -LiteralPath $path) { Write-Host "agent-config.json exists; not overwriting."; return }
+
+  # The paths in the template follow the root this setup installs into (-AceOfClubsRoot), never a constant.
+  if ([string]::IsNullOrWhiteSpace($root)) { $root = $AceOfClubsRoot }
+  $rootJson = ([string]$root).TrimEnd('\').Replace('\', '\\')
+  $rootUrl  = ([string]$root).TrimEnd('\').Replace('\', '/')
 
   $template = @"
 {
   "environmentUrl": "https://<your-org>.crm.dynamics.com",
   "tenantId": "<tenant-guid>",
   "clientId": "<app-client-id>",
-  "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "clientSecretDpapiPath": "$rootJson\\BayAgent\\secrets\\clientsecret.dpapi",
   "clientCertThumbprint": "",
   "bayId": "<bay-guid>",
   "pollSeconds": 3,
@@ -209,7 +214,7 @@ function Write-AgentConfigTemplateIfMissing([string]$path, [string]$envUrl = "",
   "postSessionThanksEnabled": true,
   "knownGoodSeconds": 60,
   "logLevel": "INFO",
-  "sessionJsonPath": "C:\\AllBirdies\\SessionDisplay\\data\\session.json",
+  "sessionJsonPath": "$rootJson\\SessionDisplay\\data\\session.json",
   "launcher": {
     "path": "C:\\Uneekor\\Launcher\\UneekorLauncher.exe",
     "args": "",
@@ -221,8 +226,8 @@ function Write-AgentConfigTemplateIfMissing([string]$path, [string]$envUrl = "",
   "sessionDisplay": {
     "mode": "kiosk",
     "displayRole": "session",
-    "url": "file:///C:/AllBirdies/SessionDisplay/current/index.html",
-    "profileDir": "C:\\AllBirdies\\SessionDisplay\\edge-profile"
+    "url": "file:///$rootUrl/SessionDisplay/current/index.html",
+    "profileDir": "$rootJson\\SessionDisplay\\edge-profile"
   }
 }
 "@
@@ -257,14 +262,14 @@ function Ensure-SessionDisplayPersistentFiles([string]$dataDir) {
 }
 
 function Create-WatchdogTask([string]$watchdogPath) {
-  $tn = "\ABG Host Watchdog"
+  $tn = "\AOC Host Watchdog"
   $tr = "powershell.exe -NoProfile -File `"$watchdogPath`""
   schtasks /Create /F /TN $tn /SC MINUTE /MO 1 /RU "SYSTEM" /RL HIGHEST /TR $tr | Out-Null
   Write-Host "Created/updated scheduled task: $tn (SYSTEM, every 1 minute)"
 }
 
 function Create-AgentTask([string]$agentHostPath, [string]$kioskAccount, [string]$kioskPassword) {
-  $tn = "\ABG Bay Agent"
+  $tn = "\AOC Bay Agent"
   $tr = "powershell.exe -NoProfile -WindowStyle Minimized -File `"$agentHostPath`""
 
   if ([string]::IsNullOrWhiteSpace($kioskPassword)) {
@@ -359,8 +364,8 @@ function Upsert-ConfigItemForBay([string]$envUrl, [string]$token, [guid]$bayGuid
 # ---------------- MAIN ----------------
 
 Write-Step "Folder structure"
-$bayAgentDir   = Join-Path $AllBirdiesRoot "BayAgent"
-$sessionDir    = Join-Path $AllBirdiesRoot "SessionDisplay"
+$bayAgentDir   = Join-Path $AceOfClubsRoot "BayAgent"
+$sessionDir    = Join-Path $AceOfClubsRoot "SessionDisplay"
 
 @(
   $bayAgentDir,
@@ -388,16 +393,16 @@ $sessionDir    = Join-Path $AllBirdiesRoot "SessionDisplay"
 Ensure-SessionDisplayPersistentFiles -dataDir (Join-Path $sessionDir "data")
 
 Write-Step "Download bootstrap/tools scripts"
-$agentHostPath     = Join-Path $bayAgentDir "bootstrap\ABG.AgentHost.ps1"
-$watchdogPath      = Join-Path $bayAgentDir "bootstrap\ABG.HostWatchdog.ps1"
+$agentHostPath     = Join-Path $bayAgentDir "bootstrap\AOC.AgentHost.ps1"
+$watchdogPath      = Join-Path $bayAgentDir "bootstrap\AOC.HostWatchdog.ps1"
 $updateAgentPath   = Join-Path $bayAgentDir "tools\Update-BayAgent.ps1"
 $updateDispPath    = Join-Path $bayAgentDir "tools\Update-SessionDisplay.ps1"
 
 # NEW: Promos pack updater
 $updatePromosPath  = Join-Path $bayAgentDir "tools\Update-PromosPack.ps1"
 
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.AgentHost.ps1")         -outPath $agentHostPath
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.HostWatchdog.ps1")     -outPath $watchdogPath
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/AOC.AgentHost.ps1")         -outPath $agentHostPath
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/AOC.HostWatchdog.ps1")     -outPath $watchdogPath
 Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-BayAgent.ps1")          -outPath $updateAgentPath
 Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-SessionDisplay.ps1")   -outPath $updateDispPath
 
@@ -411,9 +416,9 @@ Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-PromosPack.ps
 # a failed enrollment is fixed, not worked around (A0.529). It is DELIBERATELY NOT SIGNED (see the note at the top of
 # that script): it is run by hand with -ExecutionPolicy Bypass, and it creates nothing until someone runs it.
 # Last of the downloads, so a fork or a pinned commit without this file cannot stop the five the bay needs.
-$setSecretPath = Join-Path $bayAgentDir "bootstrap\ABG.SetClientSecretDpapi.ps1"
+$setSecretPath = Join-Path $bayAgentDir "bootstrap\AOC.SetClientSecretDpapi.ps1"
 if ($PlaceSecretTool) {
-  Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.SetClientSecretDpapi.ps1") -outPath $setSecretPath
+  Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/AOC.SetClientSecretDpapi.ps1") -outPath $setSecretPath
 }
 
 Write-Step "Create/trust code-signing certificate"
@@ -439,7 +444,7 @@ Write-Host "All bootstrap/tools scripts signed and valid."
 Write-Step "Write agent-config.json template (if missing)"
 if ($WriteAgentConfigTemplate) {
   $cfgPath = Join-Path $bayAgentDir "agent-config.json"
-  Write-AgentConfigTemplateIfMissing -path $cfgPath -envUrl $ConfigEnvironmentUrl -tenant $ConfigTenantId -client $ConfigClientId -bay $ConfigBayId
+  Write-AgentConfigTemplateIfMissing -path $cfgPath -envUrl $ConfigEnvironmentUrl -tenant $ConfigTenantId -client $ConfigClientId -bay $ConfigBayId -root $AceOfClubsRoot
 }
 
 Write-Step "Scheduled tasks"
@@ -479,7 +484,7 @@ Write-Step "BayKiosk signing smoke test instructions"
 Write-Host "Log in as $kioskAccount and run:"
 Write-Host '  $tp = "' + $cert.Thumbprint + '"'
 Write-Host '  $cert = Get-ChildItem "Cert:\LocalMachine\My\$tp"'
-Write-Host '  $test = "C:\AllBirdies\BayAgent\state\sign-test.ps1"'
+Write-Host '  $test = "C:\AceOfClubs\BayAgent\state\sign-test.ps1"'
 Write-Host '  "Write-Output ''sign test ok''" | Set-Content -Path $test -Encoding UTF8'
 Write-Host '  Set-AuthenticodeSignature -FilePath $test -Certificate $cert -TimeStampServer http://timestamp.digicert.com | Out-Null'
 Write-Host '  Get-AuthenticodeSignature $test | Format-List Status, StatusMessage'

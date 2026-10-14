@@ -2,7 +2,7 @@
 Setup-BayPC.ps1
 Bay PC provisioning wrapper for new bay PCs.
 
-Wraps ABG-Day0-Setup.ps1 with pre-flight checks, kiosk user creation,
+Wraps AOC-Day0-Setup.ps1 with pre-flight checks, kiosk user creation,
 auto-login, Edge kiosk mode, Windows lockdown, and verification.
 
 Run as Administrator on the target bay PC.
@@ -15,7 +15,7 @@ Notes:
   - Idempotent: safe to run multiple times on the same PC
   - Day0 is called with the src/BayAgent/ prefix for GitHub raw URLs
   - The default credential is a certificate the bay mints itself (-Credential Certificate). Only the legacy
-    -Credential Secret path uses ABG.SetClientSecretDpapi.ps1, which Day0 places in bootstrap\ for that case
+    -Credential Secret path uses AOC.SetClientSecretDpapi.ps1, which Day0 places in bootstrap\ for that case
     and for no other: a certificate bay is never given the shared secret or that tool.
   - -EnvironmentUrl, -TenantId, -ClientId and -BayId reach agent-config.json only when they are passed. Their
     defaults are never written into a bay's configuration.
@@ -34,7 +34,8 @@ param(
   [Parameter(Mandatory=$true)]
   [int]$BayNumber,
 
-  [string]$AllBirdiesRoot = "C:\AllBirdies",
+  # A fresh setup lands at the new root by default (A0.634). -AllBirdiesRoot, the old name of this parameter, still binds.
+  [Alias("AllBirdiesRoot")][string]$AceOfClubsRoot = "C:\AceOfClubs",
 
   # Day0 control
   [switch]$SkipDay0,
@@ -42,12 +43,14 @@ param(
   [switch]$SkipLockdown,
   [switch]$SkipReboot,
 
-  # Day0 pass-through. Both addresses name the repository's CURRENT owner. They used to name the previous owner and
-  # worked only through GitHub's redirect for a moved repository (measured 2026-10-11: both still answer 200), which
-  # stops the day anyone creates a repository of the old name. The Day0 address was a literal in Phase 3; it is a
-  # parameter now so a fork or a pinned commit can be named without editing the script.
-  [string]$FleetRawBaseUrl = "https://raw.githubusercontent.com/millwright-works/abg-fleet-updates/main/src/BayAgent",
-  [string]$Day0Url = "https://raw.githubusercontent.com/millwright-works/abg-fleet-updates/main/tools/ABG-Day0-Setup.ps1",
+  # Day0 pass-through. Both addresses name the repository's CURRENT owner AND its CURRENT name (aoc-fleet-updates, A0.634).
+  # They used to name the previous owner and worked only through GitHub's redirect for a moved repository (measured
+  # 2026-10-11: both still answer 200), which stops the day anyone creates a repository of the old name. GitHub documents
+  # redirects only for git remotes and the web address, not for raw.githubusercontent.com, so these addresses never rely on
+  # one: they work only once the repository is renamed (FLEET-REL renames it in the same sitting as the release). The Day0
+  # address was a literal in Phase 3; it is a parameter now so a fork or a pinned commit can be named without editing the script.
+  [string]$FleetRawBaseUrl = "https://raw.githubusercontent.com/millwright-works/aoc-fleet-updates/main/src/BayAgent",
+  [string]$Day0Url = "https://raw.githubusercontent.com/millwright-works/aoc-fleet-updates/main/tools/AOC-Day0-Setup.ps1",
   [string]$BayKioskUser = "BayKiosk",
 
   # REMOTE DESKTOP IS OFF UNLESS ASKED FOR (A0.216: the designed lockdown has Remote Desktop off). Phase 5C used to
@@ -57,7 +60,7 @@ param(
   [switch]$EnableRemoteDesktop,
 
   # WHICH CREDENTIAL THIS BAY WILL AUTHENTICATE WITH, AND IT IS A CHOICE, NOT A REMINDER.
-  # Phase 6 used to print "You must run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret"
+  # Phase 6 used to print "You must run AOC.SetClientSecretDpapi.ps1 to create the DPAPI secret"
   # unconditionally. On a bay being provisioned for the certificate credential that is the opposite of
   # what should happen: a DPAPI file makes Test-HasUsableSecret true, so BayAgent.ps1 -EnrollCert leaves
   # the new certificate PENDING instead of ACTIVE -- it cannot activate, because activation needs a
@@ -200,7 +203,7 @@ function Set-MachineScriptPolicy {
 
 function Test-ScriptPolicyRunsTasks {
   # Can the two scheduled tasks start under this machine script policy? Both run
-  # "powershell.exe -NoProfile -File <script>" with no policy switch (ABG.AgentHost.ps1's header: deliberate), and
+  # "powershell.exe -NoProfile -File <script>" with no policy switch (AOC.AgentHost.ps1's header: deliberate), and
   # Day0 signs those scripts. A fresh Windows has the machine policy Undefined, which acts as Restricted: such a
   # task is refused ("running scripts is disabled on this system", measured 2026-10-11).
   param([string]$MachinePolicy)
@@ -342,7 +345,7 @@ function Get-BayAppIdPlan {
 
 function Get-Day0NextSteps {
   # The "Next Steps" list as a function, so what it tells an operator can be tested. It used to say
-  # "1. Run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret" whenever the file was missing, in BOTH credential
+  # "1. Run AOC.SetClientSecretDpapi.ps1 to create the DPAPI secret" whenever the file was missing, in BOTH credential
   # modes, directly under a Phase 6 that says DO NOT create one. And it never said that the agent itself is not on a
   # blank PC yet: Day0 lays down the host, the watchdog and the updaters, and BayAgent.ps1 arrives only with the first
   # run of Update-BayAgent.ps1.
@@ -352,7 +355,7 @@ function Get-Day0NextSteps {
     [bool]$NameOk = $true,
     [string]$ExpectedName = "",
     [bool]$AgentInstalled = $false,
-    [string]$Root = "C:\AllBirdies",
+    [string]$Root = "C:\AceOfClubs",
     [string]$BayKioskUser = "BayKiosk",
     # What follows -EnrollClientId on the printed line: this bay's own app id, or the words to replace with it.
     [string]$EnrollAppId = "<this bay's own app id>"
@@ -375,7 +378,7 @@ function Get-Day0NextSteps {
       "After the public certificate is registered on the bay's own app, run the same line again. It must end 'RESULT: READY'."
     )
   } elseif (-not $DpapiExists) {
-    $steps += "Run ABG.SetClientSecretDpapi.ps1 to create the DPAPI secret (see Phase 6 output above)"
+    $steps += "Run AOC.SetClientSecretDpapi.ps1 to create the DPAPI secret (see Phase 6 output above)"
   }
   $steps += @(
     "Configure display arrangement:",
@@ -504,13 +507,13 @@ if (-not $SkipKioskSetup) {
 # PHASE 3: CALL DAY0
 # ==================================================================
 if (-not $SkipDay0) {
-  Write-Step "Phase 3: Running ABG-Day0-Setup.ps1"
+  Write-Step "Phase 3: Running AOC-Day0-Setup.ps1"
 
   # Day0 is in the tools\ folder at the repo root (sibling to src\)
   # When running on a new PC, download it first
-  $day0Dir = Join-Path $AllBirdiesRoot "BayAgent\staging"
+  $day0Dir = Join-Path $AceOfClubsRoot "BayAgent\staging"
   if (-not (Test-Path $day0Dir)) { New-Item -ItemType Directory -Path $day0Dir -Force | Out-Null }
-  $day0Path = Join-Path $day0Dir "ABG-Day0-Setup.ps1"
+  $day0Path = Join-Path $day0Dir "AOC-Day0-Setup.ps1"
 
   # Download Day0 from GitHub (it lives at tools/ in the repo root, not under src/BayAgent/)
   Write-Host "  Downloading Day0 from: $Day0Url"
@@ -518,14 +521,14 @@ if (-not $SkipDay0) {
   Invoke-WebRequest -Uri $Day0Url -OutFile $day0Path -UseBasicParsing
 
   if (-not (Test-Path $day0Path)) {
-    Write-Error "Failed to download ABG-Day0-Setup.ps1"
+    Write-Error "Failed to download AOC-Day0-Setup.ps1"
     exit 1
   }
 
   # Build Day0 arguments
   $day0Args = @{
     FleetRawBaseUrl       = $FleetRawBaseUrl
-    AllBirdiesRoot        = $AllBirdiesRoot
+    AceOfClubsRoot        = $AceOfClubsRoot
     BayKioskUser          = $BayKioskUser
     CreateWatchdogTask    = $true
     CreateAgentTask       = $true
@@ -567,7 +570,7 @@ if (-not $SkipDay0) {
     $day0Args["EnvironmentUrl"] = $EnvironmentUrl
     $day0Args["TenantId"] = $TenantId
     $day0Args["ClientId"] = $ClientId
-    $day0Args["ClientSecretDpapiPath"] = (Join-Path $AllBirdiesRoot "BayAgent\secrets\clientsecret.dpapi")
+    $day0Args["ClientSecretDpapiPath"] = (Join-Path $AceOfClubsRoot "BayAgent\secrets\clientsecret.dpapi")
     $day0Args["BayId"] = $BayId
   }
 
@@ -598,7 +601,7 @@ if (-not $SkipKioskSetup) {
   Write-Step "Phase 4: Edge Policies for SessionDisplay"
 
   # Ensure Edge profile directory exists for SessionDisplay
-  $edgeProfileDir = Join-Path $AllBirdiesRoot "SessionDisplay\edge-profile"
+  $edgeProfileDir = Join-Path $AceOfClubsRoot "SessionDisplay\edge-profile"
   if (-not (Test-Path $edgeProfileDir)) { New-Item -ItemType Directory -Path $edgeProfileDir -Force | Out-Null }
 
   # Remove legacy Startup shortcut if present (BA-20: shell wrapper now handles launch)
@@ -636,7 +639,7 @@ if (-not $SkipLockdown) {
   # ------------------------------------------------------------------
   # 5A: SHELL REPLACEMENT
   # ------------------------------------------------------------------
-  # Replace Explorer with ABG.LauncherShell.ps1 for BayKiosk user -- but ONLY once the file has been
+  # Replace Explorer with AOC.LauncherShell.ps1 for BayKiosk user -- but ONLY once the file has been
   # checked to actually be there. AG-47: this used to write the registry first and check second, which
   # is backwards; see Get-ShellActivationPlan above for what changed and why. As of this fix, nothing in
   # the current fleet package or Day0 places this file on a bay, so on every bay today this will fall
@@ -651,7 +654,7 @@ if (-not $SkipLockdown) {
   # ------------------------------------------------------------------
   Write-Host "  Configuring custom shell replacement..."
 
-  $shellWrapperPath = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.LauncherShell.ps1"
+  $shellWrapperPath = Join-Path $AceOfClubsRoot "BayAgent\bootstrap\AOC.LauncherShell.ps1"
   $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
   $shellCommand = "$psExe -NoProfile -WindowStyle Hidden -File `"$shellWrapperPath`""
 
@@ -845,7 +848,7 @@ function Get-Day0CredentialGuidance {
       lines = @(
         "This bay will authenticate with a CERTIFICATE it mints itself, as ITS OWN app (each bay has its own identity).",
         "DO NOT create a DPAPI secret on this machine, and do not copy one here.",
-        "  The enrollment below refuses a PC that holds a client secret (ABG_OWNID_SECRET_PRESENT) and makes nothing.",
+        "  The enrollment below refuses a PC that holds a client secret (AOC_OWNID_SECRET_PRESENT) and makes nothing.",
         "",
         "FIRST install the agent package (tools\Update-BayAgent.ps1, see Next Steps): -EnrollCert is part of",
         "  BayAgent.ps1, and a blank PC does not have BayAgent.ps1 until the first install has run.",
@@ -878,7 +881,7 @@ function Get-Day0CredentialGuidance {
       "  cannot be revoked for one bay. Prefer -Credential Certificate unless you have a reason.",
       "",
       "Run this command as Administrator:",
-      "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1`" ``",
+      "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$Root\BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1`" ``",
       "    -OutPath `"$DpapiPath`" ``",
       "    -AgentAccount `".\$BayKioskUser`"",
       "",
@@ -889,8 +892,8 @@ function Get-Day0CredentialGuidance {
 
 Write-Step "Phase 6: Credential Setup ($Credential)"
 
-$dpapiPath = Join-Path $AllBirdiesRoot "BayAgent\secrets\clientsecret.dpapi"
-$guidance = Get-Day0CredentialGuidance -Mode $Credential -DpapiPath $dpapiPath -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser `
+$dpapiPath = Join-Path $AceOfClubsRoot "BayAgent\secrets\clientsecret.dpapi"
+$guidance = Get-Day0CredentialGuidance -Mode $Credential -DpapiPath $dpapiPath -Root $AceOfClubsRoot -BayKioskUser $BayKioskUser `
   -EnrollAppId ([string]$bayAppPlan.enrollId) -Note ([string]$bayAppPlan.note)
 
 if ($guidance.dpapiRequired) {
@@ -934,20 +937,20 @@ $checks += [PSCustomObject]@{
 
 # Folder structure
 $requiredFolders = @(
-  (Join-Path $AllBirdiesRoot "BayAgent"),
-  (Join-Path $AllBirdiesRoot "BayAgent\bootstrap"),
-  (Join-Path $AllBirdiesRoot "BayAgent\tools"),
-  (Join-Path $AllBirdiesRoot "BayAgent\current"),
-  (Join-Path $AllBirdiesRoot "BayAgent\secrets"),
-  (Join-Path $AllBirdiesRoot "BayAgent\logs"),
-  (Join-Path $AllBirdiesRoot "BayAgent\control"),
-  (Join-Path $AllBirdiesRoot "SessionDisplay"),
-  (Join-Path $AllBirdiesRoot "SessionDisplay\current"),
-  (Join-Path $AllBirdiesRoot "SessionDisplay\data")
+  (Join-Path $AceOfClubsRoot "BayAgent"),
+  (Join-Path $AceOfClubsRoot "BayAgent\bootstrap"),
+  (Join-Path $AceOfClubsRoot "BayAgent\tools"),
+  (Join-Path $AceOfClubsRoot "BayAgent\current"),
+  (Join-Path $AceOfClubsRoot "BayAgent\secrets"),
+  (Join-Path $AceOfClubsRoot "BayAgent\logs"),
+  (Join-Path $AceOfClubsRoot "BayAgent\control"),
+  (Join-Path $AceOfClubsRoot "SessionDisplay"),
+  (Join-Path $AceOfClubsRoot "SessionDisplay\current"),
+  (Join-Path $AceOfClubsRoot "SessionDisplay\data")
 )
 
 foreach ($folder in $requiredFolders) {
-  $shortName = $folder.Replace($AllBirdiesRoot, "")
+  $shortName = $folder.Replace($AceOfClubsRoot, "")
   $checks += [PSCustomObject]@{
     Check  = "Folder: $shortName"
     Result = if (Test-Path $folder) { "PASS" } else { "FAIL" }
@@ -956,8 +959,8 @@ foreach ($folder in $requiredFolders) {
 
 # Bootstrap scripts
 $bootstrapFiles = @(
-  (Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.AgentHost.ps1"),
-  (Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.HostWatchdog.ps1")
+  (Join-Path $AceOfClubsRoot "BayAgent\bootstrap\AOC.AgentHost.ps1"),
+  (Join-Path $AceOfClubsRoot "BayAgent\bootstrap\AOC.HostWatchdog.ps1")
 )
 foreach ($f in $bootstrapFiles) {
   $fname = Split-Path $f -Leaf
@@ -969,9 +972,9 @@ foreach ($f in $bootstrapFiles) {
 
 # Tools scripts
 $toolFiles = @(
-  (Join-Path $AllBirdiesRoot "BayAgent\tools\Update-BayAgent.ps1"),
-  (Join-Path $AllBirdiesRoot "BayAgent\tools\Update-SessionDisplay.ps1"),
-  (Join-Path $AllBirdiesRoot "BayAgent\tools\Update-PromosPack.ps1")
+  (Join-Path $AceOfClubsRoot "BayAgent\tools\Update-BayAgent.ps1"),
+  (Join-Path $AceOfClubsRoot "BayAgent\tools\Update-SessionDisplay.ps1"),
+  (Join-Path $AceOfClubsRoot "BayAgent\tools\Update-PromosPack.ps1")
 )
 foreach ($f in $toolFiles) {
   $fname = Split-Path $f -Leaf
@@ -984,20 +987,20 @@ foreach ($f in $toolFiles) {
 # agent-config.json
 $checks += [PSCustomObject]@{
   Check  = "agent-config.json present"
-  Result = if (Test-Path (Join-Path $AllBirdiesRoot "BayAgent\agent-config.json")) { "PASS" } else { "FAIL" }
+  Result = if (Test-Path (Join-Path $AceOfClubsRoot "BayAgent\agent-config.json")) { "PASS" } else { "FAIL" }
 }
 
 # SessionDisplay data files
 foreach ($df in @("session.json", "promos.json")) {
   $checks += [PSCustomObject]@{
     Check  = "Data file: $df"
-    Result = if (Test-Path (Join-Path $AllBirdiesRoot "SessionDisplay\data\$df")) { "PASS" } else { "FAIL" }
+    Result = if (Test-Path (Join-Path $AceOfClubsRoot "SessionDisplay\data\$df")) { "PASS" } else { "FAIL" }
   }
 }
 
 # The agent itself. Day0 lays down the host, the watchdog and the updaters; BayAgent.ps1 arrives with the first run of
 # Update-BayAgent.ps1. On a blank PC its absence here is the expected state, and it is a step still to do.
-$agentInstalled = Test-Path (Join-Path $AllBirdiesRoot "BayAgent\current\BayAgent.ps1")
+$agentInstalled = Test-Path (Join-Path $AceOfClubsRoot "BayAgent\current\BayAgent.ps1")
 $checks += [PSCustomObject]@{
   Check  = "Agent package installed (current\BayAgent.ps1)"
   Result = if ($agentInstalled) { "PASS" } else { "PENDING (first install: run tools\Update-BayAgent.ps1, see Next Steps)" }
@@ -1024,7 +1027,7 @@ $checks += [PSCustomObject]@{
 # Scheduled tasks: registered AND able to start under the machine script policy (see Get-ScheduledTaskCheck).
 $execPolicy = ""
 try { $execPolicy = [string](Get-ExecutionPolicy -Scope LocalMachine) } catch { $execPolicy = "" }
-foreach ($taskName in @("ABG Bay Agent", "ABG Host Watchdog")) {
+foreach ($taskName in @("AOC Bay Agent", "AOC Host Watchdog")) {
   $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   $taskCheck = Get-ScheduledTaskCheck -TaskName $taskName -Exists ([bool]$task) -State $(if ($task) { [string]$task.State } else { "" }) -MachinePolicy $execPolicy
   $checks += [PSCustomObject]@{
@@ -1069,7 +1072,7 @@ $checks += [PSCustomObject]@{
 
 # Shell wrapper script -- AG-47: this file is not deployed by Day0 or the current fleet package. Its
 # absence is the expected state today, not a pending step that some other process will complete.
-$shellWrapperCheck = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.LauncherShell.ps1"
+$shellWrapperCheck = Join-Path $AceOfClubsRoot "BayAgent\bootstrap\AOC.LauncherShell.ps1"
 $checks += [PSCustomObject]@{
   Check  = "Shell wrapper script"
   # AG-47 QA (VERDICT.txt M1): this used to read "NOT PRESENT (...)", a string that matches none of
@@ -1165,7 +1168,7 @@ Write-Step "Next Steps"
 
 $nextSteps = Get-Day0NextSteps -Mode $Credential -DpapiExists (Test-Path $dpapiPath) `
   -NameOk ($env:COMPUTERNAME -eq $expectedName) -ExpectedName $expectedName `
-  -AgentInstalled $agentInstalled -Root $AllBirdiesRoot -BayKioskUser $BayKioskUser -EnrollAppId ([string]$bayAppPlan.enrollId)
+  -AgentInstalled $agentInstalled -Root $AceOfClubsRoot -BayKioskUser $BayKioskUser -EnrollAppId ([string]$bayAppPlan.enrollId)
 
 foreach ($step in $nextSteps) {
   Write-Host "  $step" -ForegroundColor White
@@ -1180,7 +1183,7 @@ if (-not $SkipReboot) {
   $rebootChoice = Read-Host "  Reboot now? (y/N)"
   if ($rebootChoice -eq "y") {
     Write-Host "  Rebooting in 10 seconds..." -ForegroundColor Yellow
-    shutdown /r /t 10 /c "ABG Bay PC provisioning complete -- rebooting"
+    shutdown /r /t 10 /c "Ace of Clubs Bay PC provisioning complete -- rebooting"
   } else {
     Write-Host "  Skipping reboot. Remember to reboot manually." -ForegroundColor Yellow
   }

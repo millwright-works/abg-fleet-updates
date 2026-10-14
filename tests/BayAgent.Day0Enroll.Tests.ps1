@@ -10,7 +10,7 @@ HOW, AND WHY IT IS BUILT THIS WAY
   Every scenario runs the REAL TEXT of src\BayAgent\BayAgent.ps1, top to bottom, in a real child powershell.exe 5.1
   (the host a bay uses), in the argument shapes a run sheet uses:
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<bay>\current\BayAgent.ps1" -EnrollCert -EnrollClientId <guid>
-      powershell.exe -NoProfile -WindowStyle Minimized -File "<bay>\current\BayAgent.ps1" -Once      (as ABG.AgentHost.ps1 starts it)
+      powershell.exe -NoProfile -WindowStyle Minimized -File "<bay>\current\BayAgent.ps1" -Once      (as AOC.AgentHost.ps1 starts it)
   No function is lifted out of the script to be tested apart from it. An attack on a sibling branch (2026-10-11)
   planted 17 changes in a script's body and all 17 passed a suite that only tested lifted functions; this suite is
   written so a change to the script's own body is what it reads.
@@ -18,7 +18,7 @@ HOW, AND WHY IT IS BUILT THIS WAY
   The bay is MODELED:
     - the install is a sandbox folder; the script under test is a copy with ONE literal repointed ($BaseDir), and S0
       proves the copy is the shipped file in every other respect;
-    - agent-config.json is built from the template ABG-Day0-Setup.ps1 itself writes (read out of that file, so a
+    - agent-config.json is built from the template AOC-Day0-Setup.ps1 itself writes (read out of that file, so a
       changed template is what is tested), filled the way an operator fills it, in three shapes;
     - Entra and Dataverse are ONE recorder on 127.0.0.1. It answers a token request the way Entra does: an app it does
       not know is AADSTS700016; a certificate not registered on the app is AADSTS700027; a registered certificate must
@@ -32,7 +32,7 @@ THE SECRET GUARD (A0.529) AND "COULD NOT LOOK" (the re-check of 2026-10-12, RF-1
   configuration names, a plaintext key in the configuration, the sealed file at the standard place even when another path is named); that
   -EnrollForce does not pass it; that it is asked of a bay that already has an enrollment; and that a place this account
   cannot LOOK AT (a sealed file with the rights the product's own secret tool leaves: SYSTEM and Administrators only; a
-  path with an illegal character) is a refusal that names the place (ABG_OWNID_SECRET_UNREADABLE), never "nothing there".
+  path with an illegal character) is a refusal that names the place (AOC_OWNID_SECRET_UNREADABLE), never "nothing there".
   The unreadable file is built with icacls, not a mocked throw. This suite must be started so the child has a Cert: drive
   (call powershell.exe directly; a Start-Process child of pwsh 7 inherits pwsh's module path and has none): the
   certificate helpers fail loudly instead of reading an unreadable store as "no certificates".
@@ -65,7 +65,7 @@ try { Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue } cat
 if ([string]::IsNullOrWhiteSpace($AgentScript)) { $AgentScript = Join-Path $PSScriptRoot "..\src\BayAgent\BayAgent.ps1" }
 $AgentScript = (Resolve-Path $AgentScript).Path
 $ManifestSrc = (Resolve-Path (Join-Path $PSScriptRoot "..\src\BayAgent\manifest.json")).Path
-$Day0Script  = (Resolve-Path (Join-Path $PSScriptRoot "..\tools\ABG-Day0-Setup.ps1")).Path
+$Day0Script  = (Resolve-Path (Join-Path $PSScriptRoot "..\tools\AOC-Day0-Setup.ps1")).Path
 
 # ---------------------------------------------------------------- harness
 $script:Pass = 0; $script:Fail = 0; $script:Failures = @()
@@ -262,7 +262,7 @@ function Register-D0Certificate([string]$AppId, [string]$CerPath) {
 }
 
 # ---------------------------------------------------------------- the modeled blank bay
-# agent-config.json as ABG-Day0-Setup.ps1 writes it: the template is READ OUT OF THAT SCRIPT.
+# agent-config.json as AOC-Day0-Setup.ps1 writes it: the template is READ OUT OF THAT SCRIPT.
 $day0Text = [IO.File]::ReadAllText($Day0Script)
 $tm = [regex]::Match($day0Text, '(?s)\$template = @"\r?\n(\{.*?\})\r?\n"@')
 if (-not $tm.Success) { throw "could not find the agent-config.json template in $Day0Script" }
@@ -293,7 +293,7 @@ function New-D0Bay {
     foreach ($d in @("", "current", "logs", "secrets")) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null }
 
     $shipped = [IO.File]::ReadAllText($AgentScript)
-    $needle  = '$BaseDir = "C:\AllBirdies\BayAgent"'
+    $needle  = '$BaseDir = Get-BayInstallRoot $PSScriptRoot'
     if (-not $shipped.Contains($needle)) { throw "could not find the BaseDir literal in $AgentScript" }
     $agentCopy = Join-Path $root "current\BayAgent.ps1"
     [IO.File]::WriteAllText($agentCopy, $shipped.Replace($needle, ('$BaseDir = "{0}"' -f $root)), (New-Object Text.UTF8Encoding($false)))
@@ -425,7 +425,7 @@ function Get-D0Capabilities([object[]]$Requests) {
 }
 
 # ---------------------------------------------------------------- a secret file this account cannot look at (RF-1)
-# The rights are the ones the product's OWN tool writes (src\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1, lines 57 to
+# The rights are the ones the product's OWN tool writes (src\BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1, lines 57 to
 # 70, run with no -AgentAccount, which is its default): inheritance removed from the folder and the file, SYSTEM and
 # Administrators granted, nobody else. The enrolling account (BayKiosk on a bay; this suite's account here) is in neither
 # list, so a plain existence test of the file THROWS "Access is denied" under $ErrorActionPreference = "Stop". Nothing
@@ -542,9 +542,9 @@ try {
     $b2 = New-D0Bay -Name "refusals"
     $typedMarker = "ZZ-typed-by-mistake-" + [guid]::NewGuid().ToString("N")
     $refusals = @(
-        @{ label = "not a GUID";      arguments = ("-EnrollCert -EnrollClientId " + $typedMarker); reason = "ABG_OWNID_CLIENT_ID_NOT_A_GUID" },
-        @{ label = "all-zero GUID";   arguments = "-EnrollCert -EnrollClientId 00000000-0000-0000-0000-000000000000"; reason = "ABG_OWNID_CLIENT_ID_NOT_A_GUID" },
-        @{ label = "a short id";      arguments = "-EnrollCert -EnrollClientId 12345"; reason = "ABG_OWNID_CLIENT_ID_NOT_A_GUID" }
+        @{ label = "not a GUID";      arguments = ("-EnrollCert -EnrollClientId " + $typedMarker); reason = "AOC_OWNID_CLIENT_ID_NOT_A_GUID" },
+        @{ label = "all-zero GUID";   arguments = "-EnrollCert -EnrollClientId 00000000-0000-0000-0000-000000000000"; reason = "AOC_OWNID_CLIENT_ID_NOT_A_GUID" },
+        @{ label = "a short id";      arguments = "-EnrollCert -EnrollClientId 12345"; reason = "AOC_OWNID_CLIENT_ID_NOT_A_GUID" }
     )
     $allRefusalText = ""
     foreach ($case in $refusals) {
@@ -561,7 +561,7 @@ try {
         Assert-True (@(Get-D0RequestsSince $mark).Count -eq 0) "[$($case.label)] nothing was sent anywhere"
     }
     # Every refusal's console text and log, not only the last one's: the value typed by mistake is in the FIRST case.
-    Assert-True ($allRefusalText.Contains("ABG_OWNID_CLIENT_ID_NOT_A_GUID") -and -not $allRefusalText.Contains($typedMarker)) "a refused value is never echoed: nothing any of these refusals printed or logged carries what was typed"
+    Assert-True ($allRefusalText.Contains("AOC_OWNID_CLIENT_ID_NOT_A_GUID") -and -not $allRefusalText.Contains($typedMarker)) "a refused value is never echoed: nothing any of these refusals printed or logged carries what was typed"
     Assert-True ($allRefusalText -match "What was typed is 52 characters long") "...the refusal says how long the value was instead"
     $allS2Log = ""
     foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $b2.Root "logs") -Filter "*.log" -ErrorAction SilentlyContinue)) { $allS2Log += [IO.File]::ReadAllText($f.FullName) }
@@ -588,7 +588,7 @@ try {
     $before = Get-D0InstallFingerprint $b2c.Root
     $r = Invoke-D0Agent -Bay $b2c -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 placeholder bayId"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CONFIG_NOT_FILLED_IN") "[bayId not filled in] refused with ABG_OWNID_CONFIG_NOT_FILLED_IN (exit $($r.ExitCode))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_CONFIG_NOT_FILLED_IN") "[bayId not filled in] refused with AOC_OWNID_CONFIG_NOT_FILLED_IN (exit $($r.ExitCode))"
     Assert-True ($r.StdOut -match "bayId") "[bayId not filled in] ...naming the field"
     Assert-True ((Get-D0InstallFingerprint $b2c.Root) -eq $before) "[bayId not filled in] nothing was changed"
     Assert-True (((Get-D0PlaceholderCerts) -join ",") -eq ($placeholderCertsAtStart -join ",")) "[bayId not filled in] no certificate was made for a placeholder"
@@ -601,7 +601,7 @@ try {
         $before = Get-D0InstallFingerprint $unfilledCase.bay.Root; $mark = Get-D0Mark; $certsBeforeCase = @(Get-D0RunCerts).Count
         $r = Invoke-D0Agent -Bay $unfilledCase.bay -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
         Show-D0Run $r ("S2 " + $unfilledCase.label)
-        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CONFIG_NOT_FILLED_IN") "[$($unfilledCase.label)] refused with ABG_OWNID_CONFIG_NOT_FILLED_IN (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_CONFIG_NOT_FILLED_IN") "[$($unfilledCase.label)] refused with AOC_OWNID_CONFIG_NOT_FILLED_IN (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
         Assert-True ($r.StdOut -match ("does not hold this bay's values yet \(" + $unfilledCase.field + "\)")) "[$($unfilledCase.label)] ...naming exactly that field"
         Assert-True ((Get-D0InstallFingerprint $unfilledCase.bay.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0 -and @(Get-D0RunCerts).Count -eq $certsBeforeCase) "[$($unfilledCase.label)] nothing was changed, no key was made, nothing was sent"
     }
@@ -614,14 +614,14 @@ try {
     $before = Get-D0InstallFingerprint $b2s.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $b2s -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 sealed secret present"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[sealed secret present] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT") "[sealed secret present] refused with AOC_OWNID_SECRET_PRESENT (exit $($r.ExitCode))"
     Assert-True ((Get-D0InstallFingerprint $b2s.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[sealed secret present] nothing was changed, nothing was sent (the secret was not used)"
     Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[sealed secret present] the secret's text is not on the console or in the log"
     $b2p = New-D0Bay -Name "refusal-plaintext" -PlaintextSecret $secretMarker
     $before = Get-D0InstallFingerprint $b2p.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $b2p -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 plaintext secret present"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[plaintext secret present] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT") "[plaintext secret present] refused with AOC_OWNID_SECRET_PRESENT (exit $($r.ExitCode))"
     Assert-True ((Get-D0InstallFingerprint $b2p.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[plaintext secret present] nothing was changed, nothing was sent"
     Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[plaintext secret present] the secret's text is not on the console or in the log"
 
@@ -631,14 +631,14 @@ try {
     $before = Get-D0InstallFingerprint $b2x.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $b2x -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 plaintext secret beside a secret-file path"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[a clientSecret in the configuration beside a secret-file path, no file] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT") "[a clientSecret in the configuration beside a secret-file path, no file] refused with AOC_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ((Get-D0InstallFingerprint $b2x.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0 -and -not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[...beside a secret-file path] nothing was changed, nothing was sent, the secret's text is nowhere"
     $b2y = New-D0Bay -Name "refusal-sealed-unnamed" -Shape "own"
     [IO.File]::WriteAllBytes((Join-Path $b2y.Root "secrets\clientsecret.dpapi"), $sealed)
     $before = Get-D0InstallFingerprint $b2y.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $b2y -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 sealed secret file the configuration does not name"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[a sealed secret file at the standard place, named by no configuration key] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT") "[a sealed secret file at the standard place, named by no configuration key] refused with AOC_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ((Get-D0InstallFingerprint $b2y.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[...named by no configuration key] nothing was changed, nothing was sent"
 
     # ...and the third place: a sealed file the configuration DOES name, somewhere other than the standard place.
@@ -648,7 +648,7 @@ try {
     $before = Get-D0InstallFingerprint $b2z.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $b2z -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 sealed secret file at a path of the configuration's own choosing"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT" -and $r.StdOut -match "the sealed secret file the configuration names") "[a sealed secret file at a path only the configuration names] refused with ABG_OWNID_SECRET_PRESENT, naming it (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT" -and $r.StdOut -match "the sealed secret file the configuration names") "[a sealed secret file at a path only the configuration names] refused with AOC_OWNID_SECRET_PRESENT, naming it (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ((Get-D0InstallFingerprint $b2z.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[...at a path only the configuration names] nothing was changed, nothing was sent"
 
     # ...and the standard place when the configuration names ANOTHER path (a planted "read the standard place only when no
@@ -659,7 +659,7 @@ try {
     $before = Get-D0InstallFingerprint $b2w.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $b2w -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S2 sealed secret at the standard place, the configuration names another path"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT" -and $r.StdOut.Contains("a sealed secret file at " + (Join-Path $b2w.Root "secrets\clientsecret.dpapi"))) "[the standard place, another path named] refused with ABG_OWNID_SECRET_PRESENT, naming the standard place (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT" -and $r.StdOut.Contains("a sealed secret file at " + (Join-Path $b2w.Root "secrets\clientsecret.dpapi"))) "[the standard place, another path named] refused with AOC_OWNID_SECRET_PRESENT, naming the standard place (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ((Get-D0InstallFingerprint $b2w.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[the standard place, another path named] nothing was changed, nothing was sent"
 
     # -EnrollForce does not pass the secret guard (a planted "force passes it" survived the re-check: the scenarios above
@@ -674,7 +674,7 @@ try {
         $before = Get-D0InstallFingerprint $fc.bay.Root; $mark = Get-D0Mark; $certsBeforeF = @(Get-D0RunCerts).Count
         $r = Invoke-D0Agent -Bay $fc.bay -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
         Show-D0Run $r ("S2 -EnrollForce, " + $fc.label)
-        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[$($fc.label), with -EnrollForce] refused with ABG_OWNID_SECRET_PRESENT: -EnrollForce does not pass the secret guard (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT") "[$($fc.label), with -EnrollForce] refused with AOC_OWNID_SECRET_PRESENT: -EnrollForce does not pass the secret guard (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
         Assert-True ((Get-D0InstallFingerprint $fc.bay.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0 -and @(Get-D0RunCerts).Count -eq $certsBeforeF) "[$($fc.label), with -EnrollForce] nothing was changed, no key was made, nothing was sent"
     }
 
@@ -715,7 +715,7 @@ try {
                 Assert-True (-not $r.TimedOut -and $r.ExitCode -eq 2) "[$tag] exit code 2 (got $($r.ExitCode))"
                 $resU = @(Get-D0ResultLines $r.StdOut)
                 Assert-True ($resU.Count -eq 1 -and $resU[0] -eq "RESULT: REFUSED") "[$tag] exactly one RESULT line, and it is REFUSED (got: $($resU -join ' | '))"
-                Assert-True ((Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_UNREADABLE") "[$tag] reason code ABG_OWNID_SECRET_UNREADABLE (got $(Get-D0ReportField $r.StdOut 'Reason code'))"
+                Assert-True ((Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_UNREADABLE") "[$tag] reason code AOC_OWNID_SECRET_UNREADABLE (got $(Get-D0ReportField $r.StdOut 'Reason code'))"
                 Assert-True ($r.StdOut.Contains($uc.place)) "[$tag] the refusal names the place that could not be looked at ('$($uc.place)')"
                 Assert-True ($r.StdOut -match "nothing was made" -and $r.StdOut -match "Nothing was changed on this PC") "[$tag] it says nothing was made"
                 Assert-True (@(Get-D0RunCerts).Count -eq $certsBeforeU) "[$tag] no key was made"
@@ -755,7 +755,7 @@ try {
             $before = Get-D0InstallFingerprint $lb.Root; $mark = Get-D0Mark
             $r = Invoke-D0Agent -Bay $lb -Arguments (($SheetEnroll -f $D0OwnApp) + $extra) -Sheet
             Show-D0Run $r ("S2e " + $tag)
-            Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_SECRET_PRESENT") "[$tag] refused with ABG_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+            Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_SECRET_PRESENT") "[$tag] refused with AOC_OWNID_SECRET_PRESENT (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
             Assert-True ((Get-D0InstallFingerprint $lb.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[$tag] nothing was changed and nothing was sent (not even a sign-in check)"
             Assert-True (-not (($r.StdOut + $r.Log + $r.StdErr).Contains($secretMarker))) "[$tag] the secret's text is not on the console or in the log"
         }
@@ -764,11 +764,11 @@ try {
     # A PC that already holds something is not a new bay: each of these is refused, with or without -EnrollForce, and
     # the state file is left byte for byte as it was.
     $notBlank = @(
-        @{ label = "state file corrupt";            reason = "ABG_OWNID_STATE_CORRUPT";          state = '{ "activeThumbprint": "A1B2' ; thumbCfg = "" },
-        @{ label = "state value unreadable";        reason = "ABG_OWNID_STATE_NOT_UNDERSTOOD";   state = '{ "activeThumbprint": "not-a-thumbprint" }'; thumbCfg = "" },
-        @{ label = "a rotation is waiting";         reason = "ABG_OWNID_ROTATION_IN_PROGRESS";   state = ('{ "pendingThumbprint": "' + $D0FakeThumb + '" }'); thumbCfg = "" },
-        @{ label = "an identity switch on probation"; reason = "ABG_OWNID_SWITCH_IN_PROGRESS";   state = ('{ "activeThumbprint": "' + $D0FakeThumb + '", "activeClientId": "' + $D0OtherApp + '", "identityProbation": { "clientId": "' + $D0OtherApp + '", "sinceUtc": "2026-10-11T00:00:00Z", "previousThumbprint": null, "previousClientId": null } }'); thumbCfg = "" },
-        @{ label = "a certificate named in the configuration"; reason = "ABG_OWNID_CONFIGURED_CERTIFICATE"; state = ""; thumbCfg = $D0FakeThumb }
+        @{ label = "state file corrupt";            reason = "AOC_OWNID_STATE_CORRUPT";          state = '{ "activeThumbprint": "A1B2' ; thumbCfg = "" },
+        @{ label = "state value unreadable";        reason = "AOC_OWNID_STATE_NOT_UNDERSTOOD";   state = '{ "activeThumbprint": "not-a-thumbprint" }'; thumbCfg = "" },
+        @{ label = "a rotation is waiting";         reason = "AOC_OWNID_ROTATION_IN_PROGRESS";   state = ('{ "pendingThumbprint": "' + $D0FakeThumb + '" }'); thumbCfg = "" },
+        @{ label = "an identity switch on probation"; reason = "AOC_OWNID_SWITCH_IN_PROGRESS";   state = ('{ "activeThumbprint": "' + $D0FakeThumb + '", "activeClientId": "' + $D0OtherApp + '", "identityProbation": { "clientId": "' + $D0OtherApp + '", "sinceUtc": "2026-10-11T00:00:00Z", "previousThumbprint": null, "previousClientId": null } }'); thumbCfg = "" },
+        @{ label = "a certificate named in the configuration"; reason = "AOC_OWNID_CONFIGURED_CERTIFICATE"; state = ""; thumbCfg = $D0FakeThumb }
     )
     $nbIndex = 0
     foreach ($case in $notBlank) {
@@ -906,11 +906,11 @@ try {
         $before = Get-D0InstallFingerprint $bay.Root
         foreach ($attempt in @(@{ id = $D0OtherApp; label = "another app" }, @{ id = $D0OwnApp; label = "the same app" })) {
             $r = Invoke-D0Agent -Bay $bay -Arguments (($SheetEnroll -f $attempt.id) + " -EnrollForce") -Sheet
-            Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_IDENTITY_WORKS") "[$shape] -EnrollForce for $($attempt.label): refused, ABG_OWNID_IDENTITY_WORKS (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+            Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_IDENTITY_WORKS") "[$shape] -EnrollForce for $($attempt.label): refused, AOC_OWNID_IDENTITY_WORKS (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
             Assert-True ((Get-D0InstallFingerprint $bay.Root) -eq $before) "[$shape] ...and nothing was changed"
         }
         $r = Invoke-D0Agent -Bay $bay -Arguments ($SheetEnroll -f $D0OtherApp) -Sheet
-        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_ALREADY_ENROLLED" -and (Get-D0InstallFingerprint $bay.Root) -eq $before) "[$shape] another app without -EnrollForce: refused, ABG_OWNID_ALREADY_ENROLLED, nothing changed"
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_ALREADY_ENROLLED" -and (Get-D0InstallFingerprint $bay.Root) -eq $before) "[$shape] another app without -EnrollForce: refused, AOC_OWNID_ALREADY_ENROLLED, nothing changed"
     }
 
     # ============================================================ S10 a mistyped app id is found, and corrected
@@ -929,7 +929,7 @@ try {
     Assert-True (@(Get-D0RequestsSince $mark | Where-Object { $_.hasSecret }).Count -eq 0) "...and it tried no secret"
     $before = Get-D0InstallFingerprint $bw.Root
     $r = Invoke-D0Agent -Bay $bw -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_ALREADY_ENROLLED") "the right id without -EnrollForce is refused: ABG_OWNID_ALREADY_ENROLLED"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_ALREADY_ENROLLED") "the right id without -EnrollForce is refused: AOC_OWNID_ALREADY_ENROLLED"
     Assert-True ($r.StdOut -match "-EnrollForce" -and $r.StdOut.Contains($tp1)) "...and the refusal names the certificate on record and -EnrollForce"
     Assert-True ((Get-D0InstallFingerprint $bw.Root) -eq $before) "...nothing was changed"
     # -EnrollForce discards only on Entra's own word that the enrollment cannot work as it is. Not on silence (503, a
@@ -940,7 +940,7 @@ try {
         $r = Invoke-D0Agent -Bay $bw -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
         $sync["TokenMode"] = "entra"
         Show-D0Run $r ("S10 force, token endpoint answers: " + $mode)
-        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_CANNOT_TELL") "when the answer is '$mode', -EnrollForce is refused: ABG_OWNID_CANNOT_TELL (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+        Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_CANNOT_TELL") "when the answer is '$mode', -EnrollForce is refused: AOC_OWNID_CANNOT_TELL (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
         Assert-True ((Get-D0InstallFingerprint $bw.Root) -eq $before) "...nothing was changed"
     }
     $sync["TokenMode"] = "proxy403"
@@ -1058,7 +1058,7 @@ try {
     $before = Get-D0InstallFingerprint $ba.Root
     $r = Invoke-D0Agent -Bay $ba -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
     Show-D0Run $r "S12 same id, key not here"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_ALREADY_ENROLLED" -and $r.StdOut -match "not in a store this Windows account") "the same command is refused and says the certificate is not in a store this account can read"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_ALREADY_ENROLLED" -and $r.StdOut -match "not in a store this Windows account") "the same command is refused and says the certificate is not in a store this account can read"
     Assert-True ((Get-D0InstallFingerprint $ba.Root) -eq $before) "...nothing was changed"
     $r = Invoke-D0Agent -Bay $ba -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
     Show-D0Run $r "S12 force"
@@ -1082,7 +1082,7 @@ try {
     $before = Get-D0InstallFingerprint $bh.Root; $mark = Get-D0Mark
     $r = Invoke-D0Agent -Bay $bh -Arguments (($SheetEnroll -f $D0OwnApp) + " -EnrollForce") -Sheet
     Show-D0Run $r "S12b force from another account"
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_BAY_HAS_RUN") "refused: ABG_OWNID_BAY_HAS_RUN (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_BAY_HAS_RUN") "refused: AOC_OWNID_BAY_HAS_RUN (exit $($r.ExitCode), $(Get-D0ReportField $r.StdOut 'Reason code'))"
     Assert-True ($r.StdOut -match "enrolled by BAY1KIOSK\\SomeoneElse" -and $r.StdOut -match "Run this signed in as the account the agent runs as") "...naming the account that enrolled and what to do"
     Assert-True ((Get-D0InstallFingerprint $bh.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "...nothing was changed and nothing was sent"
     # The account that enrolled, whose own store no longer holds the key: the key is truly gone, so it may enroll again.
@@ -1124,7 +1124,7 @@ try {
     $credPlain = Get-D0Prop (Get-D0Capabilities (Get-D0RequestsSince $mark)) "credential"
     Assert-True ($r.ExitCode -eq 0 -and $null -ne $credPlain -and (Get-D0Prop (Get-D0Prop $credPlain "identity") "ownIdentity") -eq $false) "control: a bay enrolled WITHOUT -EnrollClientId reports ownIdentity false, even when agent-config.json names its own app"
     $r = Invoke-D0Agent -Bay $bp -Arguments ($SheetEnroll -f $D0OwnApp) -Sheet
-    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "ABG_OWNID_ALREADY_ENROLLED") "...and -EnrollClientId on that bay is refused without -EnrollForce (it holds an enrollment)"
+    Assert-True ($r.ExitCode -eq 2 -and (Get-D0ReportField $r.StdOut "Reason code") -eq "AOC_OWNID_ALREADY_ENROLLED") "...and -EnrollClientId on that bay is refused without -EnrollForce (it holds an enrollment)"
 
     # ============================================================ S14 the argument order a person might type
     Section "S14 argument order and the optional enrollment switches"

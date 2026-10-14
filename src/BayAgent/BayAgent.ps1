@@ -1,5 +1,5 @@
 ﻿<#
-ABG Bay Agent (Production Baseline v2 - includes periodic heartbeat)
+Ace of Clubs Bay Agent (Production Baseline v2 - includes periodic heartbeat)
 - Step 1 foundation: Entra client-credentials auth, Dataverse polling, optimistic lock, execute, report
 - Adds: automatic Bay heartbeat update every HeartbeatSeconds (default 60) even when no commands exist
 - Extend by adding new command handlers in Execute-Command()
@@ -9,10 +9,10 @@ ABG Bay Agent (Production Baseline v2 - includes periodic heartbeat)
 
 Run examples:
   # One-time auth + poll iteration then exit:
-  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\BayAgent.ps1" -Once
+  powershell.exe -NoProfile -File "C:\AceOfClubs\BayAgent\BayAgent.ps1" -Once
 
   # Run continuously:
-  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\BayAgent.ps1"
+  powershell.exe -NoProfile -File "C:\AceOfClubs\BayAgent\BayAgent.ps1"
 
 Optional switches:
   -TokenOnly   Acquire token then exit (auth test; the log line names WHICH credential minted it)
@@ -65,7 +65,25 @@ $ErrorActionPreference = "Stop"
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # ---------------- Paths ----------------
-$BaseDir = "C:\AllBirdies\BayAgent"
+# THE INSTALL ROOT IS WHERE THIS SCRIPT IS INSTALLED, NOT A CONSTANT (the rename, A0.634/A0.636): a bay still at
+# C:\AllBirdies\BayAgent and a bay at C:\AceOfClubs\BayAgent run this same file. The script sits in <root>\current\
+# (a junction), <root>\releases\<version>\, or directly in <root>. Get-BayInstallRoot is copied byte for byte into each
+# script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies and the layouts it answers for).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+$BaseDir = Get-BayInstallRoot $PSScriptRoot
 $CfgPath = Join-Path $BaseDir "agent-config.json"
 $LogDir  = Join-Path $BaseDir "logs"
 
@@ -133,7 +151,14 @@ trap {
     # its FATAL into the LIVE install's log directory.
     $abgPath = Get-Variable -Name LogFile -ValueOnly -ErrorAction SilentlyContinue
     if (-not $abgPath) {
-        $abgPath = "C:\AllBirdies\BayAgent\logs\BayAgent-{0}.log" -f (Get-Date).ToString("yyyyMMdd")
+        # The same install-root rule as Get-BayInstallRoot, written out (a trap may call no function of this file).
+        # If the script folder cannot be told, $abgPath stays empty and the write below fails inside its own try.
+        try {
+            $abgRoot = [string]$PSScriptRoot
+            if ((Split-Path -Leaf $abgRoot) -in @("current", "rollback")) { $abgRoot = Split-Path -Parent $abgRoot }
+            elseif ((Split-Path -Leaf (Split-Path -Parent $abgRoot)) -eq "releases") { $abgRoot = Split-Path -Parent (Split-Path -Parent $abgRoot) }
+            $abgPath = Join-Path $abgRoot ("logs\BayAgent-{0}.log" -f (Get-Date).ToString("yyyyMMdd"))
+        } catch { $abgPath = $null }
     }
 
     $abgOut = @("$abgTs [ERROR] FATAL (pid=$PID): $abgMsg")
@@ -493,9 +518,9 @@ $Global:EmergencyStopReason = $null
 
 
 $Global:SessionDisplayUrl = $null
-$Global:SessionDisplayStatePath = "C:\AllBirdies\SessionDisplay\data\session-display.state.json"
+$Global:SessionDisplayStatePath = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\data\session-display.state.json")
 
-$Global:SessionDisplayProfileDir = "C:\AllBirdies\SessionDisplay\edge-profile"
+$Global:SessionDisplayProfileDir = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\edge-profile")
 $Global:SessionDisplayTag = "--user-data-dir=$Global:SessionDisplayProfileDir"
 # ---------------- Token cache ----------------
 $Global:AccessToken = $null
@@ -2474,7 +2499,7 @@ function Get-SessionJsonPath {
     try {
         if ($cfg.PSObject.Properties.Name -contains "sessionJsonPath") { $p = $cfg.sessionJsonPath }
     } catch {}
-    if ([string]::IsNullOrWhiteSpace([string]$p)) { $p = "C:\AllBirdies\SessionDisplay\data\session.json" }
+    if ([string]::IsNullOrWhiteSpace([string]$p)) { $p = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\data\session.json") }
     return $p
 }
 
@@ -3169,7 +3194,7 @@ function Get-ManagedWindowReport {
         $srole = Get-PropValue $sdCfg "displayRole" $null
         if ([string]::IsNullOrWhiteSpace([string]$srole)) { $srole = "session" }
         $pdir = Get-PropValue $sdCfg "profileDir" $Global:SessionDisplayProfileDir
-        if ([string]::IsNullOrWhiteSpace([string]$pdir)) { $pdir = "C:\AllBirdies\SessionDisplay\edge-profile" }
+        if ([string]::IsNullOrWhiteSpace([string]$pdir)) { $pdir = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\edge-profile") }
         $spids = @(Get-SessionDisplayEdgePids ([string]$pdir))
         $out += (Get-ManagedWindowEntry "sessionDisplay" ([string]$srole) ([int[]]@($spids)) "msedge")
     } catch { $out += [ordered]@{ name = "sessionDisplay"; error = $_.Exception.Message } }
@@ -3805,10 +3830,10 @@ function Start-SessionDisplay($payloadObj) {
     if ([string]::IsNullOrWhiteSpace([string]$edgePath)) { $edgePath = Get-DefaultEdgePath }
 
     $url = Get-PropValue $sdPayload "url" (Get-PropValue $sdCfg "url" $null)
-    if ([string]::IsNullOrWhiteSpace([string]$url)) { $url = "file:///C:/AllBirdies/SessionDisplay/index.html" }
+    if ([string]::IsNullOrWhiteSpace([string]$url)) { $url = ("file:///" + ((Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\index.html") -replace '\\', '/')) }
 
     $profileDir = Get-PropValue $sdPayload "profileDir" (Get-PropValue $sdCfg "profileDir" $Global:SessionDisplayProfileDir)
-    if ([string]::IsNullOrWhiteSpace([string]$profileDir)) { $profileDir = "C:\AllBirdies\SessionDisplay\edge-profile" }
+    if ([string]::IsNullOrWhiteSpace([string]$profileDir)) { $profileDir = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\edge-profile") }
 
     # Desired display role for signage
     $role = Get-PropValue $sdPayload "displayRole" (Get-PropValue $sdCfg "displayRole" $null)
@@ -3920,6 +3945,38 @@ function Start-SessionDisplay($payloadObj) {
 
 
 
+# THE BAY'S OWN COMMAND CHECK: is this -File value a script under THIS install's root?
+# It matches the plugin's GuardBayCommandPlugin.IsUnderAgentBaseDir (portal, rename branch) rule for rule, and like it
+# REFUSES what Windows could read two ways rather than normalizing it: only printable ASCII; none of / * ? " < > | ~ % $
+# ` ^ & (a second separator, wildcards, quote and redirect characters, 8.3 short names, variable and environment
+# expansion); a colon only as the drive's own (index 1; a later one names an alternate data stream, "a.txt:evil.ps1");
+# the root followed by a backslash (so BayAgentX is not under BayAgent); no "..", and every segment after the root
+# non-empty (a doubled separator), not ".", and not ending in "." or a space (Windows drops those before it looks);
+# and the name ends in .ps1. The one difference by design: the plugin accepts two roots (the old and the new folder),
+# this accepts only the root the agent is installed in.
+function Test-ScriptPathUnderRoot([string]$Path, [string]$Root) {
+    if ([string]::IsNullOrEmpty($Path) -or [string]::IsNullOrEmpty($Root)) { return $false }
+    $rootSlash = $Root.TrimEnd('\') + '\'
+    $refused = '/*?"<>|~%$`^&'
+    for ($i = 0; $i -lt $Path.Length; $i++) {
+        $c = $Path[$i]
+        if ([int]$c -lt 33 -or [int]$c -gt 126) { return $false }
+        if ($refused.IndexOf($c) -ge 0) { return $false }
+        if ($c -eq ':' -and $i -ne 1) { return $false }
+    }
+    if (-not $Path.StartsWith($rootSlash, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not $Path.EndsWith(".ps1", [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($Path.IndexOf("..", [StringComparison]::Ordinal) -ge 0) { return $false }
+    $rest = $Path.Substring($rootSlash.Length)
+    if ($rest.Length -eq 0) { return $false }
+    foreach ($seg in $rest.Split('\')) {
+        if ($seg.Length -eq 0 -or $seg -eq "." -or $seg -eq "..") { return $false }
+        $last = $seg[$seg.Length - 1]
+        if ($last -eq '.' -or $last -eq ' ') { return $false }
+    }
+    return $true
+}
+
 function Start-GenericProcess($payloadObj) {
     if ($null -eq $payloadObj) { throw "StartProcess payload must be valid JSON." }
 
@@ -3946,23 +4003,33 @@ function Start-GenericProcess($payloadObj) {
             }
         }
 
-        # If launching PowerShell, require -File <script> under C:\AllBirdies\BayAgent and block -Command.
+        # If launching PowerShell, require -File <script> under THIS install's root ($BaseDir, wherever it is installed:
+        # C:\AceOfClubs\BayAgent or, until a bay is moved, C:\AllBirdies\BayAgent) and block -Command.
         $leaf = ([IO.Path]::GetFileName([string]$path)).ToLowerInvariant()
         if ($leaf -in @("powershell.exe","pwsh.exe")) {
             if ($al -match "\s-(command|c)\s+") { throw "StartProcess launching PowerShell cannot use -Command/-c. Use -File <script>." }
 
-            $m = [regex]::Match($argsText, '(?i)\s-file\s+("([^"]+)"|(\S+))')
-            if (-not $m.Success) { throw "StartProcess launching PowerShell must use -File <script> (no inline commands)." }
+            # powershell.exe takes -f, -fi and -fil for -File, and the FIRST one wins: "-fi evil.ps1 -File ok.ps1" ran evil.ps1
+            # past a check that only looked at "-File". Refuse the short forms, and a "-File" glued to a colon or more text.
+            if ([regex]::IsMatch(" " + $argsText, '(?i)\s-f(i(l)?)?(\s|$)') -or [regex]::IsMatch(" " + $argsText, '(?i)\s-file[^\s]')) {
+                throw "StartProcess PowerShell must spell the switch -File, followed by a space (no -f, -fi, -fil, -File:)."
+            }
 
-            $scriptPath = $m.Groups[2].Value
-            if ([string]::IsNullOrWhiteSpace($scriptPath)) { $scriptPath = $m.Groups[3].Value }
-            $scriptPath = $scriptPath.Trim()
-
-            if ([string]::IsNullOrWhiteSpace($scriptPath)) { throw "StartProcess PowerShell args must include a script path after -File." }
+            # EVERY -File must name a script under this root (the plugin validates every occurrence the same way).
+            $fileMatches = @([regex]::Matches(" " + $argsText, '(?i)\s-file\s+("([^"]+)"|(\S+))'))
+            if ($fileMatches.Count -eq 0) { throw "StartProcess launching PowerShell must use -File <script> (no inline commands)." }
 
             $allowedBase = $BaseDir
-            if (-not ($scriptPath.ToLowerInvariant().StartsWith($allowedBase.ToLowerInvariant()))) {
-                throw "StartProcess PowerShell scripts must be under $allowedBase. Got: $scriptPath"
+            foreach ($m in $fileMatches) {
+                $scriptPath = $m.Groups[2].Value
+                if ([string]::IsNullOrWhiteSpace($scriptPath)) { $scriptPath = $m.Groups[3].Value }
+                $scriptPath = $scriptPath.Trim()
+
+                if ([string]::IsNullOrWhiteSpace($scriptPath)) { throw "StartProcess PowerShell args must include a script path after -File." }
+
+                if (-not (Test-ScriptPathUnderRoot $scriptPath $allowedBase)) {
+                    throw "StartProcess PowerShell scripts must be a .ps1 under $allowedBase (plain ASCII name, no traversal, no empty or dotted segments, no stream or wildcard or variable characters). Got: $scriptPath"
+                }
             }
         }
     }
@@ -4088,8 +4155,8 @@ function Stop-SessionDisplay {
         }
     } catch { }
 
-    if ([string]::IsNullOrWhiteSpace([string]$url)) { $url = "file:///C:/AllBirdies/SessionDisplay/index.html" }
-    if ([string]::IsNullOrWhiteSpace([string]$profileDir)) { $profileDir = "C:\AllBirdies\SessionDisplay\edge-profile" }
+    if ([string]::IsNullOrWhiteSpace([string]$url)) { $url = ("file:///" + ((Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\index.html") -replace '\\', '/')) }
+    if ([string]::IsNullOrWhiteSpace([string]$profileDir)) { $profileDir = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\edge-profile") }
 
     $pids = New-Object System.Collections.Generic.HashSet[int]
 
@@ -4561,7 +4628,7 @@ function Invoke-CredentialRetire($payloadObj) {
                 Write-Log "Credential retired: DPAPI secret file removed; certificate-only from now on" "INFO"
             } catch {
                 $secretRes.error = $_.Exception.Message
-                $secretRes.reason = "ABG_CRED_DPAPI_REMOVE_FAILED"
+                $secretRes.reason = "AOC_CRED_DPAPI_REMOVE_FAILED"
                 $result.ok = $false
             }
         } else {
@@ -4580,7 +4647,7 @@ function Invoke-CredentialRetire($payloadObj) {
         # fix this itself. What it CAN do is refuse to call it done.
         if ($script:Secret) {
             $secretRes.plaintextSecretStillInConfig = $true
-            $secretRes.reason = "ABG_CRED_PLAINTEXT_SECRET_REMAINS"
+            $secretRes.reason = "AOC_CRED_PLAINTEXT_SECRET_REMAINS"
             $secretRes.note = "agent-config.json still carries a plaintext clientSecret and it still mints tokens. The agent never rewrites its own config: delete the clientSecret key by hand and restart, THEN re-run retire. Do not delete the app's secrets in Entra until this reports ok."
             $result.ok = $false
             Write-Log "retire secret: a plaintext clientSecret is STILL in agent-config.json; the secret is NOT retired. Reporting failure so the Entra deletion is not taken on a false success." "ERROR"
@@ -4756,7 +4823,7 @@ function Get-OwnIdentitySecretOnPc {
     #
     # FAILS CLOSED (BayAgent 1.6.1 re-check, RF-1). An error while LOOKING is not "nothing there". Under
     # $ErrorActionPreference = "Stop", Test-Path THROWS "Access is denied" for a file this account may not look at
-    # (the rights ABG.SetClientSecretDpapi.ps1 leaves by default: SYSTEM and Administrators only) and ArgumentException
+    # (the rights AOC.SetClientSecretDpapi.ps1 leaves by default: SYSTEM and Administrators only) and ArgumentException
     # for a path with illegal characters. Every read below that throws is recorded in Unreadable, naming the place,
     # and the caller refuses before any key is made. No catch in this function may leave $found and $unreadable alone.
     $found = @()
@@ -4805,7 +4872,7 @@ function Invoke-OwnIdentityEnroll {
     # The value typed is never echoed: it is not a secret, but a person can paste the wrong thing after a parameter.
     $own = ConvertTo-AgentGuid $OwnClientId
     if (-not $own) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CLIENT_ID_NOT_A_GUID" ("-EnrollClientId must be this bay's own app id: a GUID, 36 characters, like 00000000-0000-0000-0000-000000000000. What was typed is {0} characters long and is not one." -f ([string]$OwnClientId).Length))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_CLIENT_ID_NOT_A_GUID" ("-EnrollClientId must be this bay's own app id: a GUID, 36 characters, like 00000000-0000-0000-0000-000000000000. What was typed is {0} characters long and is not one." -f ([string]$OwnClientId).Length))
     }
 
     # The configuration must already describe THIS bay: the certificate's subject carries bayId, and the sign-in goes
@@ -4815,14 +4882,14 @@ function Invoke-OwnIdentityEnroll {
     if ([string]::IsNullOrWhiteSpace([string]$TenantId) -or ([string]$TenantId -match '[<>\s]')) { $unfilled += "tenantId" }
     if ([string]$OrgUrl -notmatch '^https?://[A-Za-z0-9.-]+(:\d+)?$') { $unfilled += "environmentUrl" }
     if ($unfilled.Count -gt 0) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CONFIG_NOT_FILLED_IN" ("agent-config.json does not hold this bay's values yet ({0}). Fill them in first; the certificate is made for the bay the configuration names." -f ($unfilled -join ", ")))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_CONFIG_NOT_FILLED_IN" ("agent-config.json does not hold this bay's values yet ({0}). Fill them in first; the certificate is made for the bay the configuration names." -f ($unfilled -join ", ")))
     }
 
     $st = $null; $stateTp = $null; $stateClient = $null; $enrolledOwn = $null; $pendingTp = $null; $probation = $null
     try {
         $st = Read-CredentialState
         if ($Global:CredentialStateCorrupt) {
-            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_CORRUPT" "state\credential.json is present but cannot be read, so what this bay already holds cannot be told. Recover it from credential.json.bak (or delete it deliberately if this bay has never run), then run this again.")
+            return (New-OwnIdentityEnrollRefusal "AOC_OWNID_STATE_CORRUPT" "state\credential.json is present but cannot be read, so what this bay already holds cannot be told. Recover it from credential.json.bak (or delete it deliberately if this bay has never run), then run this again.")
         }
         $stateTp     = Normalize-Thumbprint ([string](Get-PropValue $st "activeThumbprint" ""))
         $stateClient = ConvertTo-AgentGuid ([string](Get-PropValue $st "activeClientId" ""))
@@ -4830,7 +4897,7 @@ function Invoke-OwnIdentityEnroll {
         $pendingTp   = Get-PendingCertThumbprint
         $probation   = Get-IdentityProbation
     } catch {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_STATE_NOT_UNDERSTOOD" ("state\credential.json holds a value this agent cannot read ({0}), so what this bay already holds cannot be told." -f $_.Exception.Message))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_STATE_NOT_UNDERSTOOD" ("state\credential.json holds a value this agent cannot read ({0}), so what this bay already holds cannot be told." -f $_.Exception.Message))
     }
 
     # A0.529: a bay enrolled this way never holds a client secret. One on the machine means this is not that bay.
@@ -4838,19 +4905,19 @@ function Invoke-OwnIdentityEnroll {
     # A place this account could not look at is a refusal too (it fails closed): "could not look" is not "nothing there".
     $secretCheck = Get-OwnIdentitySecretOnPc
     if ($secretCheck.Found) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_PRESENT" ("This PC holds a client secret ({0}). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all." -f $secretCheck.Found))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_SECRET_PRESENT" ("This PC holds a client secret ({0}). -EnrollClientId is for a bay that has never held one. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate), which can go back; a new bay must not be given the secret at all." -f $secretCheck.Found))
     }
     if ($secretCheck.Unreadable) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SECRET_UNREADABLE" ("Whether this PC holds a client secret could not be told: this Windows account ({0}) could not look at: {1}. A secret that cannot be looked at may still be there, so this bay is not known to be new, and nothing was made. If this bay is new, an administrator checks that place and removes the secret file from it, then this is run again. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate)." -f $account, $secretCheck.Unreadable))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_SECRET_UNREADABLE" ("Whether this PC holds a client secret could not be told: this Windows account ({0}) could not look at: {1}. A secret that cannot be looked at may still be there, so this bay is not known to be new, and nothing was made. If this bay is new, an administrator checks that place and removes the secret file from it, then this is run again. A bay that runs on a secret moves to its own identity by the remote ladder (CredentialRotate)." -f $account, $secretCheck.Unreadable))
     }
     if ($null -ne $probation) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_SWITCH_IN_PROGRESS" "An identity switch is on probation on this bay. Confirm or revert it (CredentialRotate) first.")
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_SWITCH_IN_PROGRESS" "An identity switch is on probation on this bay. Confirm or revert it (CredentialRotate) first.")
     }
     if ($pendingTp) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_ROTATION_IN_PROGRESS" ("A certificate is waiting to be activated on this bay ({0}): a rotation is in progress, so this is not a new bay." -f $pendingTp))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_ROTATION_IN_PROGRESS" ("A certificate is waiting to be activated on this bay ({0}): a rotation is in progress, so this is not a new bay." -f $pendingTp))
     }
     if (-not $stateTp -and $CertThumbprintCfg) {
-        return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CONFIGURED_CERTIFICATE" ("agent-config.json names a certificate (clientCertThumbprint {0}), so this bay already has a credential that this agent did not enroll." -f $CertThumbprintCfg))
+        return (New-OwnIdentityEnrollRefusal "AOC_OWNID_CONFIGURED_CERTIFICATE" ("agent-config.json names a certificate (clientCertThumbprint {0}), so this bay already has a credential that this agent did not enroll." -f $CertThumbprintCfg))
     }
 
     $discard = $null
@@ -4876,16 +4943,16 @@ function Invoke-OwnIdentityEnroll {
         $onRecord = ("certificate {0}, signing in as {1}" -f $stateTp, $(if ($recordedClient) { "app $recordedClient" } else { "no app (agent-config.json clientId is not filled in)" }))
         if (-not $certHere) { $onRecord += ("; that certificate is not in a store this Windows account ({0}) can read" -f $account) }
         if (-not $force) {
-            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_ALREADY_ENROLLED" ("This bay already has an enrollment on record: {0}. If that enrollment is a mistake and the bay has never signed in with it, run the same command with -EnrollForce to discard it and enroll again." -f $onRecord))
+            return (New-OwnIdentityEnrollRefusal "AOC_OWNID_ALREADY_ENROLLED" ("This bay already has an enrollment on record: {0}. If that enrollment is a mistake and the bay has never signed in with it, run the same command with -EnrollForce to discard it and enroll again." -f $onRecord))
         }
 
         # -EnrollForce: an enrollment is discarded only when it does not work. A working identity has a bay behind it.
         $proof = Get-OwnIdentitySignInProof
         if ($proof.outcome -eq "works") {
-            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_IDENTITY_WORKS" ("This bay just signed in with the enrollment on record ({0}). An identity that works is never replaced from the console; it changes only by the remote ladder (CredentialRotate), which proves the new one first." -f $onRecord))
+            return (New-OwnIdentityEnrollRefusal "AOC_OWNID_IDENTITY_WORKS" ("This bay just signed in with the enrollment on record ({0}). An identity that works is never replaced from the console; it changes only by the remote ladder (CredentialRotate), which proves the new one first." -f $onRecord))
         }
         if ($proof.outcome -eq "unknown" -or ($proof.outcome -eq "refused" -and -not $proof.unusable)) {
-            return (New-OwnIdentityEnrollRefusal "ABG_OWNID_CANNOT_TELL" ("Whether the enrollment on record is unusable could not be told ({0}). It is discarded only when Entra itself says the app does not exist (AADSTS700016) or does not hold this certificate (AADSTS700027). Check the network and this PC's clock, and run this again." -f $proof.detail))
+            return (New-OwnIdentityEnrollRefusal "AOC_OWNID_CANNOT_TELL" ("Whether the enrollment on record is unusable could not be told ({0}). It is discarded only when Entra itself says the app does not exist (AADSTS700016) or does not hold this certificate (AADSTS700027). Check the network and this PC's clock, and run this again." -f $proof.detail))
         }
         if ($proof.outcome -eq "absent") {
             # The certificate on record cannot be used from THIS Windows account, so whether the identity works cannot
@@ -4897,7 +4964,7 @@ function Invoke-OwnIdentityEnroll {
             $sameAccount = (-not [string]::IsNullOrWhiteSpace($enrolledBy)) -and ($enrolledBy -ieq $account)
             $hasRun = Test-Path -LiteralPath (Join-Path $BaseDir "state\agent-alive.json")
             if ($hasRun -and -not $sameAccount) {
-                return (New-OwnIdentityEnrollRefusal "ABG_OWNID_BAY_HAS_RUN" ("This bay has run before, and the enrollment on record ({0}) cannot be checked from this Windows account ({1}){2}. Whether the bay's identity works cannot be told from here, so it is not discarded. Run this signed in as the account the agent runs as." -f $onRecord, $account, $(if ($enrolledBy) { "; it was enrolled by $enrolledBy" } else { "" })))
+                return (New-OwnIdentityEnrollRefusal "AOC_OWNID_BAY_HAS_RUN" ("This bay has run before, and the enrollment on record ({0}) cannot be checked from this Windows account ({1}){2}. Whether the bay's identity works cannot be told from here, so it is not discarded. Run this signed in as the account the agent runs as." -f $onRecord, $account, $(if ($enrolledBy) { "; it was enrolled by $enrolledBy" } else { "" })))
             }
         }
         $discard = [ordered]@{ thumbprint = $stateTp; clientId = $recordedClient; why = $proof.outcome; code = $proof.code; removedFrom = @() }
@@ -5914,7 +5981,7 @@ try {
 }
 
 # ---------------- A0.363: the bay kiosk shell, companion stage (SHIPPED DORMANT in 1.4.0) ----------------
-# Design: C:\aoc-wt\reports\kiosk-shell-design-2026-10-06.md. The shell itself is kiosk\ABG.KioskShell.ps1 in the package.
+# Design: C:\aoc-wt\reports\kiosk-shell-design-2026-10-06.md. The shell itself is kiosk\AOC.KioskShell.ps1 in the package.
 #
 # WHAT THIS SECTION DOES IN EVERY MODE (dormant included)
 #   1. Writes state\kiosk-intent.json, the launcher signal the shell reads, one of three values:
@@ -5930,7 +5997,7 @@ try {
 #      facts, the shell's own heartbeat, the intent, and BayKiosk's Winlogon Shell values READ (never written) from HKCU
 #      and HKLM, so the open bench question "which shell does BayKiosk actually have" is answered remotely.
 # WHAT IT DOES ONLY WHEN current\kiosk\kiosk-policy.json SAYS "companion" (no shipped release says so yet)
-#   3. Verifies releases\<this version>\kiosk\ABG.KioskShell.ps1 (inside this version's release folder, at least the
+#   3. Verifies releases\<this version>\kiosk\AOC.KioskShell.ps1 (inside this version's release folder, at least the
 #      policy's minimum size, parses, Authenticode Valid AND timestamped AND signed by the same certificate as this
 #      agent's own script) and starts it beside Explorer when it is not alive; at most 6 starts an hour.
 #   4. Stops a HUNG shell (heartbeat older than 3 minutes) by the process id in its heartbeat, only after that process's
@@ -5942,7 +6009,7 @@ try {
 # WHAT IT NEVER DOES: write the registry, or take a mode from the platform (the mode is the package's policy file and
 # the on-site kill switch control\kiosk.off only).
 
-$KioskShellRelPath          = "kiosk\ABG.KioskShell.ps1"
+$KioskShellRelPath          = "kiosk\AOC.KioskShell.ps1"
 $KioskPolicyPath            = Join-Path $BaseDir "current\kiosk\kiosk-policy.json"
 $KioskKillSwitchPath        = Join-Path $BaseDir "control\kiosk.off"
 $KioskIntentPath            = Join-Path $BaseDir "state\kiosk-intent.json"
@@ -5975,14 +6042,14 @@ $KioskShellMaxStartsPerHour = 6
 $KioskDeferWaitSeconds      = 10
 
 # THE AUTHORITY FOR THE KIOSK MODE IS THIS LINE OF SIGNED CODE, not the policy file (security review, 2026-10-08).
-# Everything under C:\AllBirdies\BayAgent is writable by the bay account, and in companion mode a member at the desktop
+# Everything under C:\AceOfClubs\BayAgent is writable by the bay account, and in companion mode a member at the desktop
 # can reach it too. So the policy file may only turn the kiosk OFF (toward today's desktop, like the kill switch); it can
 # never turn it on. "On" needs this constant, which ships in the signed, hash-pinned package (the bay signs it on arrival
 # and an edit breaks the signature under AllSigned), AND the policy file to agree. The build refuses a package in which
 # this constant, the shell's twin ($KioskShellReleaseMode) and kiosk-policy.json disagree.
 $KioskReleaseMode           = "explorer"
 
-# Shared with kiosk\ABG.KioskShell.ps1, byte for byte (tests\BayAgent.Kiosk.Tests.ps1 K-PARITY pins it): the agent
+# Shared with kiosk\AOC.KioskShell.ps1, byte for byte (tests\BayAgent.Kiosk.Tests.ps1 K-PARITY pins it): the agent
 # and the shell must decide the mode and the intent the same way.
 function Get-KioskProp($obj, [string]$name, $default = $null) {
     # An array value is returned AS an array (the comma): PowerShell unrolls a one-element array on return, which made
@@ -6152,7 +6219,7 @@ function Test-KioskShellCommandLine([string]$CommandLine) {
     # release folders (any version: after an update the old shell keeps running until it is replaced).
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
     $root = [regex]::Escape((Join-Path $BaseDir "releases").TrimEnd('\') + '\')
-    return ($CommandLine -match ('(?i)' + $root + '[^\\"]+\\kiosk\\ABG\.KioskShell\.ps1'))
+    return ($CommandLine -match ('(?i)' + $root + '[^\\"]+\\kiosk\\AOC\.KioskShell\.ps1'))
 }
 
 function Get-KioskProcessCommandLine([int]$ProcessId) {
@@ -7216,7 +7283,7 @@ function Get-KioskCapability {
         $localSj = $null
         $lr = Read-KioskJsonFile -Path $CfgPath -MaxBytes 262144
         if ($lr.Ok) { $localSj = Get-KioskProp $lr.Obj "sessionJsonPath" $null }
-        if ($localSj -isnot [string] -or [string]::IsNullOrWhiteSpace($localSj)) { $localSj = "C:\AllBirdies\SessionDisplay\data\session.json" }
+        if ($localSj -isnot [string] -or [string]::IsNullOrWhiteSpace($localSj)) { $localSj = (Join-Path (Split-Path -Parent $BaseDir) "SessionDisplay\data\session.json") }
         $k["sessionJsonPathSharedWithShell"] = ([IO.Path]::GetFullPath([string](Get-SessionJsonPath)) -ieq [IO.Path]::GetFullPath($localSj))
     } catch { $k["sessionJsonPathSharedWithShell"] = $null }
     return $k
@@ -7240,7 +7307,7 @@ function Get-KioskHealthSummary {
 # WHAT THIS SECTION DOES, AND ONLY WHEN agent-config.json SAYS selfHeal.enabled = true (OFF BY DEFAULT)
 #   1. Watchdog. Every few seconds it reads whether each CONFIGURED golf program is responding. A program that has
 #      been unresponsive for 30 seconds or more, outside its launch grace, and not visibly loading, is closed BY ITS
-#      PROCESS ID so the kiosk shell (ABG.LauncherShell.ps1) reopens it. At most 2 restarts per 15 minutes, counted
+#      PROCESS ID so the kiosk shell (AOC.LauncherShell.ps1) reopens it. At most 2 restarts per 15 minutes, counted
 #      in a file so an agent restart does not reset the count. It touches no other process.
 #   2. Health self-reports into the EXISTING diagnostic pipe (build_diagnosticlog -> the platform's
 #      EquipDiagIngestRollup port): golf program running and responding, screen count, audio output present.

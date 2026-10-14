@@ -23,7 +23,7 @@ WHAT IT PRODUCES
       tools/Update-PromosPack.ps1
       tools/Publish-Current.ps1
       tools/Watch-BayAgentUpdate.ps1     (1.3.1: the update rollback guard)
-      kiosk/ABG.KioskShell.ps1           (1.4.0, A0.363: the kiosk shell; signed on arrival like every .ps1)
+      kiosk/AOC.KioskShell.ps1           (1.4.0, A0.363: the kiosk shell; signed on arrival like every .ps1)
       kiosk/kiosk-policy.json            (1.4.0: the ONLY kiosk mode switch; "explorer" = dormant)
 
 SIGNING -- READ THIS BEFORE ADDING A SIGNING STEP HERE
@@ -83,14 +83,14 @@ $Entries = @(
     @{ Zip = "tools/Update-PromosPack.ps1";     Src = "tools\Update-PromosPack.ps1" },
     @{ Zip = "tools/Publish-Current.ps1";       Src = "tools\Publish-Current.ps1" },
     @{ Zip = "tools/Watch-BayAgentUpdate.ps1";  Src = "tools\Watch-BayAgentUpdate.ps1" },
-    @{ Zip = "kiosk/ABG.KioskShell.ps1";        Src = "kiosk\ABG.KioskShell.ps1" },
+    @{ Zip = "kiosk/AOC.KioskShell.ps1";        Src = "kiosk\AOC.KioskShell.ps1" },
     @{ Zip = "kiosk/kiosk-policy.json";         Src = "kiosk\kiosk-policy.json" }
 )
 
 # 1.4.0 (A0.363): every release from now on ships the kiosk shell AND its policy. The policy is the ONLY switch for the
 # kiosk mode, so a package without it would be read on the bay as "no kiosk" (explorer): safe, but a silent change of
 # mode that no release row says. Refuse to build one.
-$RequiredKioskEntries = @("kiosk/ABG.KioskShell.ps1", "kiosk/kiosk-policy.json")
+$RequiredKioskEntries = @("kiosk/AOC.KioskShell.ps1", "kiosk/kiosk-policy.json")
 # Modes this release's code implements. "shell" (replace Explorer) is designed but NOT built; a package asking for it
 # would be read as explorer by the agent, so the build refuses it rather than ship a policy that does not do what it says.
 $BuildableKioskModes = @("explorer", "companion")
@@ -142,11 +142,11 @@ if ($manifestLen -in @(65, 68)) { Fail ("manifest.json is {0} bytes, the length 
 Write-Host ("  OK  manifest.json is {0} bytes (differs from the 65/68 of every earlier manifest)" -f $manifestLen)
 
 # ---------------------------------------------------------------- gate 1d: the kiosk shell's own version agrees (1.4.0)
-$shellText = [IO.File]::ReadAllText((Join-Path $srcBay "kiosk\ABG.KioskShell.ps1"))
+$shellText = [IO.File]::ReadAllText((Join-Path $srcBay "kiosk\AOC.KioskShell.ps1"))
 $sv = [regex]::Matches($shellText, '(?m)^\$KioskShellCodeVersion = "([^"]+)"\r?$')
-if ($sv.Count -ne 1) { Fail ("ABG.KioskShell.ps1 must carry exactly one line `$KioskShellCodeVersion = `"<version>`" (found {0})" -f $sv.Count) }
-if ($sv[0].Groups[1].Value -ne $Version) { Fail ("ABG.KioskShell.ps1 says `$KioskShellCodeVersion = '{0}' but -Version is '{1}'" -f $sv[0].Groups[1].Value, $Version) }
-Write-Host ("  OK  ABG.KioskShell.ps1 KioskShellCodeVersion = {0}" -f $Version)
+if ($sv.Count -ne 1) { Fail ("AOC.KioskShell.ps1 must carry exactly one line `$KioskShellCodeVersion = `"<version>`" (found {0})" -f $sv.Count) }
+if ($sv[0].Groups[1].Value -ne $Version) { Fail ("AOC.KioskShell.ps1 says `$KioskShellCodeVersion = '{0}' but -Version is '{1}'" -f $sv[0].Groups[1].Value, $Version) }
+Write-Host ("  OK  AOC.KioskShell.ps1 KioskShellCodeVersion = {0}" -f $Version)
 
 # ---------------------------------------------------------------- gate 1e: the kiosk policy is exactly a policy this code runs
 # The agent reads anything else as "explorer" (the safe answer), which would make the package say one thing and do
@@ -159,7 +159,7 @@ $pSchema = $policy.PSObject.Properties["schema"]; $pMode = $policy.PSObject.Prop
 if ($null -eq $pSchema -or -not ($pSchema.Value -is [int] -or $pSchema.Value -is [long]) -or [int64]$pSchema.Value -ne 1) { Fail "kiosk-policy.json schema must be the integer 1" }
 if ($null -eq $pMode -or $pMode.Value -isnot [string] -or $pMode.Value -cnotin $BuildableKioskModes) { Fail ("kiosk-policy.json mode must be one of: {0} (shell mode is not built)" -f ($BuildableKioskModes -join ", ")) }
 if ($null -eq $pMin -or -not ($pMin.Value -is [int] -or $pMin.Value -is [long]) -or [int64]$pMin.Value -lt 1024 -or [int64]$pMin.Value -gt 1048576) { Fail "kiosk-policy.json minShellBytes must be an integer from 1024 to 1048576" }
-$shellLen = (Get-Item -LiteralPath (Join-Path $srcBay "kiosk\ABG.KioskShell.ps1")).Length
+$shellLen = (Get-Item -LiteralPath (Join-Path $srcBay "kiosk\AOC.KioskShell.ps1")).Length
 if ([int64]$pMin.Value -gt $shellLen) { Fail ("kiosk-policy.json minShellBytes {0} is larger than the shell itself ({1} bytes); the bay would refuse it" -f $pMin.Value, $shellLen) }
 Write-Host ("  OK  kiosk-policy.json mode = {0}, minShellBytes = {1} (shell {2} bytes)" -f $pMode.Value, $pMin.Value, $shellLen)
 
@@ -169,9 +169,9 @@ Write-Host ("  OK  kiosk-policy.json mode = {0}, minShellBytes = {1} (shell {2} 
 $amode = [regex]::Matches($agentText, '(?m)^\$KioskReleaseMode\s+= "([^"]+)"\r?$')
 $smode = [regex]::Matches($shellText, '(?m)^\$KioskShellReleaseMode = "([^"]+)"\r?$')
 if ($amode.Count -ne 1) { Fail ("BayAgent.ps1 must carry exactly one line `$KioskReleaseMode = `"<mode>`" (found {0})" -f $amode.Count) }
-if ($smode.Count -ne 1) { Fail ("ABG.KioskShell.ps1 must carry exactly one line `$KioskShellReleaseMode = `"<mode>`" (found {0})" -f $smode.Count) }
+if ($smode.Count -ne 1) { Fail ("AOC.KioskShell.ps1 must carry exactly one line `$KioskShellReleaseMode = `"<mode>`" (found {0})" -f $smode.Count) }
 if ($amode[0].Groups[1].Value -cne $pMode.Value -or $smode[0].Groups[1].Value -cne $pMode.Value) {
-    Fail ("the kiosk mode disagrees: kiosk-policy.json '{0}', BayAgent.ps1 `$KioskReleaseMode '{1}', ABG.KioskShell.ps1 `$KioskShellReleaseMode '{2}'" -f $pMode.Value, $amode[0].Groups[1].Value, $smode[0].Groups[1].Value)
+    Fail ("the kiosk mode disagrees: kiosk-policy.json '{0}', BayAgent.ps1 `$KioskReleaseMode '{1}', AOC.KioskShell.ps1 `$KioskShellReleaseMode '{2}'" -f $pMode.Value, $amode[0].Groups[1].Value, $smode[0].Groups[1].Value)
 }
 Write-Host ("  OK  the signed code carries the same kiosk mode ({0}) as the policy" -f $pMode.Value)
 

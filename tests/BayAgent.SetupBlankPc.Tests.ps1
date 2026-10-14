@@ -1,7 +1,7 @@
 <#
 BayAgent.SetupBlankPc.Tests.ps1
 
-What Setup-BayPC.ps1 and ABG-Day0-Setup.ps1 tell and do to a BLANK PC, pinned without touching the machine.
+What Setup-BayPC.ps1 and AOC-Day0-Setup.ps1 tell and do to a BLANK PC, pinned without touching the machine.
 
 WHY THIS SUITE EXISTS (PC swap preparation, 2026-10-11). No record shows Setup-BayPC.ps1 run start to finish on a blank
 PC; its one recorded run changed a working bay. Reading it against the rulings found five things a first blank-PC run
@@ -9,11 +9,11 @@ would have hit:
   1. Phase 5C turned Remote Desktop ON on every run and Phase 7 scored "enabled" as PASS. The designed lockdown has it
      off (A0.216).
   2. On the default certificate credential, Phase 7 said "DPAPI secret exists: PENDING (run SetClientSecretDpapi)" and
-     Next Steps said "1. Run ABG.SetClientSecretDpapi.ps1", directly under a Phase 6 that says DO NOT create one. A
+     Next Steps said "1. Run AOC.SetClientSecretDpapi.ps1", directly under a Phase 6 that says DO NOT create one. A
      secret file makes the Day-0 certificate enroll as waiting instead of active, and it then cannot activate.
   3. Phase 6 printed the enroll command with a path that never exists (BayAgent\BayAgent.ps1); the agent is installed
      to BayAgent\current\, and only by the first run of Update-BayAgent.ps1, which nothing mentioned.
-  4. The secret-credential tool the script points at (bootstrap\ABG.SetClientSecretDpapi.ps1) was put on a bay by
+  4. The secret-credential tool the script points at (bootstrap\AOC.SetClientSecretDpapi.ps1) was put on a bay by
      nothing: Day0 did not download it and the release package does not ship it. So the fallback did not exist either.
   5. Automatic sign-in was written with the computer's CURRENT name after Phase 1d had just renamed it, and both
      download addresses named the repository's previous owner (working only through a redirect).
@@ -48,9 +48,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$RootName = if ([string]::IsNullOrWhiteSpace($env:AOC_TEST_ROOT_NAME)) { "AceOfClubs" } else { $env:AOC_TEST_ROOT_NAME }   # run the suite twice: AceOfClubs (default) and AllBirdies (a bay not yet moved)
 
 if ([string]::IsNullOrWhiteSpace($SetupScript)) { $SetupScript = Join-Path $PSScriptRoot "..\src\BayAgent\tools\Setup-BayPC.ps1" }
-if ([string]::IsNullOrWhiteSpace($Day0Script))  { $Day0Script  = Join-Path $PSScriptRoot "..\tools\ABG-Day0-Setup.ps1" }
+if ([string]::IsNullOrWhiteSpace($Day0Script))  { $Day0Script  = Join-Path $PSScriptRoot "..\tools\AOC-Day0-Setup.ps1" }
 $SetupScript = (Resolve-Path $SetupScript).Path
 $Day0Script  = (Resolve-Path $Day0Script).Path
 
@@ -88,7 +89,7 @@ function Get-BlankPcStringLiterals($Ast) {
 
 $BaseDir = Join-Path $env:TEMP ("bayagent-blankpctest-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $BaseDir | Out-Null
-$planned = 118  # assertions scored as failures when a function this suite needs is missing (a pre-fix script)
+$planned = 120  # assertions scored as failures when a function this suite needs is missing (a pre-fix script)
 
 try {
     Section "AST: both scripts parse, and the decisions are functions"
@@ -97,14 +98,14 @@ try {
     Assert-True (@($err).Count -eq 0) "Setup-BayPC.ps1 parses cleanly"
     $tok2 = $null; $err2 = $null
     $day0Ast = [System.Management.Automation.Language.Parser]::ParseFile($Day0Script, [ref]$tok2, [ref]$err2)
-    Assert-True (@($err2).Count -eq 0) "ABG-Day0-Setup.ps1 parses cleanly"
+    Assert-True (@($err2).Count -eq 0) "AOC-Day0-Setup.ps1 parses cleanly"
 
     $needSetup = @("Get-RemoteDesktopPlan", "Get-RemoteDesktopCheck", "Get-CredentialFileCheck", "Get-Day0NextSteps", "Get-Day0CredentialGuidance",
         "Get-RegistryValueOrNull", "Set-MachineScriptPolicy", "Test-ScriptPolicyRunsTasks", "Get-ScriptPolicyCheck", "Get-ScheduledTaskCheck", "Get-LockdownRowResult")
     $needDay0 = @("Set-AgentConfigTemplateValues", "Write-AgentConfigTemplateIfMissing", "Ensure-Dir")
     $missing = @()
     foreach ($f in $needSetup) { if ($null -eq (Get-BlankPcFunctionText $setupAst $f)) { $missing += "Setup-BayPC.ps1: $f" } }
-    foreach ($f in $needDay0)  { if ($null -eq (Get-BlankPcFunctionText $day0Ast $f))  { $missing += "ABG-Day0-Setup.ps1: $f" } }
+    foreach ($f in $needDay0)  { if ($null -eq (Get-BlankPcFunctionText $day0Ast $f))  { $missing += "AOC-Day0-Setup.ps1: $f" } }
     Assert-True ($missing.Count -eq 0) ("every decision this suite checks is a function (missing: " + $(if ($missing.Count) { $missing -join "; " } else { "none" }) + ")")
 
     if ($missing.Count -gt 0) {
@@ -264,10 +265,10 @@ try {
         Assert-True ((Get-ScriptPolicyCheck -MachinePolicy "AllSigned").Result -eq "PASS") "policy AllSigned: PASS"
         foreach ($pol in @("Undefined", "Restricted", "")) { Assert-True ((Get-ScriptPolicyCheck -MachinePolicy $pol).Result -match "^FAIL") "policy '$pol': FAIL (it used to read WARN, a text in no summary bucket)" }
         Assert-True ((Test-ScriptPolicyRunsTasks -MachinePolicy "AllSigned") -and -not (Test-ScriptPolicyRunsTasks -MachinePolicy "Undefined") -and -not (Test-ScriptPolicyRunsTasks -MachinePolicy "Restricted") -and -not (Test-ScriptPolicyRunsTasks -MachinePolicy "")) "the tasks can start under AllSigned; not under Undefined, Restricted or an unreadable policy"
-        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Bay Agent" -Exists $true -State "Ready" -MachinePolicy "AllSigned").Result -eq "PASS (Ready)") "a registered task under AllSigned: PASS"
-        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Bay Agent" -Exists $true -State "Ready" -MachinePolicy "Undefined").Result -match "^FAIL \(registered, but") "a registered task the policy will not start: FAIL, saying why (it used to read PASS)"
-        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Bay Agent" -Exists $false -MachinePolicy "AllSigned").Result -eq "FAIL") "a task that is not registered: FAIL"
-        Assert-True ((Get-ScheduledTaskCheck -TaskName "ABG Host Watchdog" -Exists $true -State "Ready" -MachinePolicy "AllSigned").Check -eq "Scheduled task: ABG Host Watchdog") "the row keeps its name"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "AOC Bay Agent" -Exists $true -State "Ready" -MachinePolicy "AllSigned").Result -eq "PASS (Ready)") "a registered task under AllSigned: PASS"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "AOC Bay Agent" -Exists $true -State "Ready" -MachinePolicy "Undefined").Result -match "^FAIL \(registered, but") "a registered task the policy will not start: FAIL, saying why (it used to read PASS)"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "AOC Bay Agent" -Exists $false -MachinePolicy "AllSigned").Result -eq "FAIL") "a task that is not registered: FAIL"
+        Assert-True ((Get-ScheduledTaskCheck -TaskName "AOC Host Watchdog" -Exists $true -State "Ready" -MachinePolicy "AllSigned").Check -eq "Scheduled task: AOC Host Watchdog") "the row keeps its name"
         Assert-True ((Get-LockdownRowResult -Ok $true -LockdownSkipped $false) -eq "PASS" -and (Get-LockdownRowResult -Ok $true -LockdownSkipped $true) -eq "PASS") "a lockdown row that holds: PASS, skipped or not"
         Assert-True ((Get-LockdownRowResult -Ok $false -LockdownSkipped $true) -match "^PENDING") "not set, and the lockdown was skipped on purpose: PENDING"
         Assert-True ((Get-LockdownRowResult -Ok $false -LockdownSkipped $false) -eq "FAIL") "not set after a lockdown run: FAIL"
@@ -276,14 +277,14 @@ try {
         Assert-True (@(Get-BlankPcStringLiterals $setupAst | Where-Object { $_ -match '^WARN\b' }).Count -eq 0) "no string the code can print as a result starts with WARN any more"
 
         Section "Next Steps: the order a blank PC needs, and no secret on a certificate bay"
-        $s = @(Get-Day0NextSteps -Mode "Certificate" -DpapiExists $false -NameOk $true -ExpectedName "BAY9KIOSK" -AgentInstalled $false -Root "C:\AllBirdies" -BayKioskUser "BayKiosk")
+        $s = @(Get-Day0NextSteps -Mode "Certificate" -DpapiExists $false -NameOk $true -ExpectedName "BAY9KIOSK" -AgentInstalled $false -Root "C:\$RootName" -BayKioskUser "BayKiosk")
         $joined = $s -join "`n"
         Assert-True ($joined -notmatch "SetClientSecretDpapi") "certificate bay: Next Steps never names SetClientSecretDpapi"
         Assert-True ($joined -match "(?i)do not create a DPAPI secret") "...and says not to create one"
         $iInstall = -1; $iEnroll = -1
         for ($i = 0; $i -lt $s.Count; $i++) { if ($iInstall -lt 0 -and $s[$i] -match "Update-BayAgent\.ps1") { $iInstall = $i }; if ($iEnroll -lt 0 -and $s[$i] -match "-EnrollCert") { $iEnroll = $i } }
         Assert-True ($iInstall -ge 0) "blank PC (agent not installed): the first install with Update-BayAgent.ps1 is a step"
-        Assert-True ($iEnroll -ge 0 -and $s[$iEnroll].Contains('"C:\AllBirdies\BayAgent\current\BayAgent.ps1" -EnrollCert')) "the enroll step runs BayAgent.ps1 from BayAgent\current\ (where the install puts it)"
+        Assert-True ($iEnroll -ge 0 -and $s[$iEnroll].Contains(('"C:\{0}\BayAgent\current\BayAgent.ps1" -EnrollCert' -f $RootName))) "the enroll step runs BayAgent.ps1 from BayAgent\current\ (where the install puts it)"
         Assert-True ($iInstall -ge 0 -and $iEnroll -gt $iInstall) "the install step comes BEFORE the enroll step"
         Assert-True ($joined -notmatch '\\BayAgent\\BayAgent\.ps1') "no step names the path BayAgent\BayAgent.ps1 (nothing is ever installed there)"
         $nums = @($s | Where-Object { $_ -match '^\d+\. ' } | ForEach-Object { [int]($_ -replace '^(\d+)\..*$', '$1') })
@@ -300,19 +301,19 @@ try {
         Assert-True (($s4 -join "`n") -notmatch "SetClientSecretDpapi") "secret bay with the file: no step to create it"
         $stepCalls = @(Get-BlankPcCommands $setupAst "Get-Day0NextSteps")
         Assert-True ($stepCalls.Count -eq 1 -and "$((Get-BlankPcParamValueAst $stepCalls[0] 'Mode').Extent.Text)" -eq '$Credential') "the script builds Next Steps once, with -Mode `$Credential"
-        Assert-True ($setupText -notmatch '\$nextSteps\s*\+=\s*"1\. Run ABG\.SetClientSecretDpapi') "the old hard-coded step 1 is gone"
+        Assert-True ($setupText -notmatch '\$nextSteps\s*\+=\s*"1\. Run AOC\.SetClientSecretDpapi') "the old hard-coded step 1 is gone"
 
         Section "Phase 6 guidance: a command that can run on a blank PC"
-        $g = Get-Day0CredentialGuidance -Mode "Certificate" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
+        $g = Get-Day0CredentialGuidance -Mode "Certificate" -DpapiPath "C:\$RootName\BayAgent\secrets\clientsecret.dpapi" -Root "C:\$RootName" -BayKioskUser "BayKiosk"
         $gl = $g.lines -join "`n"
-        Assert-True ($gl.Contains('"C:\AllBirdies\BayAgent\current\BayAgent.ps1" -EnrollCert')) "certificate guidance runs current\BayAgent.ps1 -EnrollCert"
+        Assert-True ($gl.Contains(('"C:\{0}\BayAgent\current\BayAgent.ps1" -EnrollCert' -f $RootName))) "certificate guidance runs current\BayAgent.ps1 -EnrollCert"
         Assert-True ($gl -notmatch '\\BayAgent\\BayAgent\.ps1') "...and never the path that does not exist"
         Assert-True ($gl -match "(?i)first install the agent package" -and $gl -match "Update-BayAgent\.ps1") "...and says the agent package is installed first"
         Assert-True ($gl -match "BayKiosk") "...and says which account runs it (the key is made in that account's store)"
         Assert-True ($gl -notmatch "SetClientSecretDpapi" -and $gl -match "(?i)do not create") "...and still forbids the secret (T28's rule kept)"
         Assert-True ($gl -match "IF ENROLLMENT FAILS, STOP HERE" -and $gl -match "(?i)do not switch this bay to the shared client secret") "...and says a failed enrollment is a stop, not a reason to fall back to the shared secret (A0.529)"
-        $gs = Get-Day0CredentialGuidance -Mode "Secret" -DpapiPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -Root "C:\AllBirdies" -BayKioskUser "BayKiosk"
-        Assert-True (($gs.lines -join "`n").Contains('"C:\AllBirdies\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1"')) "secret guidance still runs the tool from bootstrap\ (where Day0 now puts it)"
+        $gs = Get-Day0CredentialGuidance -Mode "Secret" -DpapiPath "C:\$RootName\BayAgent\secrets\clientsecret.dpapi" -Root "C:\$RootName" -BayKioskUser "BayKiosk"
+        Assert-True (($gs.lines -join "`n").Contains(('"C:\{0}\BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1"' -f $RootName))) "secret guidance still runs the tool from bootstrap\ (where Day0 now puts it)"
 
         # ------------------------------------------------------------------------------------------ names and addresses
         Section "Automatic sign-in uses the name the PC will have, and the addresses name the current owner"
@@ -322,10 +323,10 @@ try {
         Assert-True ($domSets.Count -eq 1 -and $domVal -is [System.Management.Automation.Language.VariableExpressionAst] -and $domVal.VariablePath.UserPath -eq "expectedName") "DefaultDomainName is written from `$expectedName (the name after the rename), not `$env:COMPUTERNAME"
         foreach ($pn in @("FleetRawBaseUrl", "Day0Url")) {
             $pp = @($setupAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $pn })
-            Assert-True ($pp.Count -eq 1 -and "$($pp[0].DefaultValue.Value)" -match '^https://raw\.githubusercontent\.com/millwright-works/abg-fleet-updates/main/') "-$pn defaults to the repository's current owner"
+            Assert-True ($pp.Count -eq 1 -and "$($pp[0].DefaultValue.Value)" -match '^https://raw\.githubusercontent\.com/millwright-works/aoc-fleet-updates/main/') "-$pn defaults to the repository's current owner"
         }
         $day0Param = @($setupAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "Day0Url" })
-        Assert-True ($day0Param.Count -eq 1 -and "$($day0Param[0].DefaultValue.Value)" -match '/tools/ABG-Day0-Setup\.ps1$') "-Day0Url points at tools/ABG-Day0-Setup.ps1"
+        Assert-True ($day0Param.Count -eq 1 -and "$($day0Param[0].DefaultValue.Value)" -match '/tools/AOC-Day0-Setup\.ps1$') "-Day0Url points at tools/AOC-Day0-Setup.ps1"
         $iwr = @(Get-BlankPcCommands $setupAst "Invoke-WebRequest")
         $iwrUri = $null
         if ($iwr.Count -eq 1) { $iwrUri = Get-BlankPcParamValueAst $iwr[0] "Uri" }
@@ -357,14 +358,16 @@ try {
         Section "Day0: the config template takes real values, and refuses a value that is not one"
         $tenant = "11111111-2222-3333-4444-555555555555"; $client = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"; $bay = "99999999-8888-7777-6666-555555555555"
         $p1 = Join-Path $BaseDir "full\agent-config.json"
-        Write-AgentConfigTemplateIfMissing -path $p1 -envUrl "https://example-org.crm.dynamics.com/" -tenant $tenant -client $client -bay $bay 6>$null
+        Write-AgentConfigTemplateIfMissing -path $p1 -envUrl "https://example-org.crm.dynamics.com/" -tenant $tenant -client $client -bay $bay -root "C:\$RootName" 6>$null
         $j1 = Get-Content -LiteralPath $p1 -Raw | ConvertFrom-Json
         Assert-True ($j1.environmentUrl -eq "https://example-org.crm.dynamics.com" -and $j1.tenantId -eq $tenant -and $j1.clientId -eq $client -and $j1.bayId -eq $bay) "four good values: the file parses as JSON and holds exactly those values"
         Assert-True ((Get-Content -LiteralPath $p1 -Raw) -notmatch "<[a-z-]+>") "...and no <placeholder> is left"
-        Assert-True ($j1.clientSecretDpapiPath -eq "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" -and "$($j1.clientCertThumbprint)" -eq "") "...and the credential fields are as shipped (the path is named, no thumbprint): the shape a Day-0 enroll activates on"
+        Assert-True ($j1.clientSecretDpapiPath -eq "C:\$RootName\BayAgent\secrets\clientsecret.dpapi" -and "$($j1.clientCertThumbprint)" -eq "") "...and the credential fields are as shipped (the path is named, no thumbprint): the shape a Day-0 enroll activates on"
+        Assert-True ($j1.sessionJsonPath -eq "C:\$RootName\SessionDisplay\data\session.json" -and $j1.sessionDisplay.profileDir -eq "C:\$RootName\SessionDisplay\edge-profile" -and $j1.sessionDisplay.url -eq "file:///C:/$RootName/SessionDisplay/current/index.html") "...and every other path in the template follows the root the setup installs into (C:\$RootName), none is a constant"
+        Assert-True ((Get-Content -LiteralPath $p1 -Raw) -notmatch "(?i)AllBirdies" -or $RootName -eq "AllBirdies") "...and the new root's template names the old folder nowhere"
 
         $p2 = Join-Path $BaseDir "none\agent-config.json"
-        Write-AgentConfigTemplateIfMissing -path $p2 6>$null
+        Write-AgentConfigTemplateIfMissing -path $p2 -root "C:\$RootName" 6>$null
         $t2 = Get-Content -LiteralPath $p2 -Raw
         Assert-True ($t2.Contains("<your-org>") -and $t2.Contains("<tenant-guid>") -and $t2.Contains("<app-client-id>") -and $t2.Contains("<bay-guid>")) "no values given: all four placeholders stay (the old behavior)"
 
@@ -387,8 +390,8 @@ try {
         }
 
         Section "Day0: the secret-credential tool goes only where it is asked for, unsigned, and is run by nobody"
-        $dl = @(Get-BlankPcCommands $day0Ast "Download-File" | Where-Object { $_.Extent.Text -match '/bootstrap/ABG\.SetClientSecretDpapi\.ps1' })
-        Assert-True ($dl.Count -eq 1) "Day0 downloads bootstrap/ABG.SetClientSecretDpapi.ps1 in exactly one place"
+        $dl = @(Get-BlankPcCommands $day0Ast "Download-File" | Where-Object { $_.Extent.Text -match '/bootstrap/AOC\.SetClientSecretDpapi\.ps1' })
+        Assert-True ($dl.Count -eq 1) "Day0 downloads bootstrap/AOC.SetClientSecretDpapi.ps1 in exactly one place"
         $dlGuarded = $false
         if ($dl.Count -eq 1) { $p = $dl[0].Parent; while ($p) { if ($p -is [System.Management.Automation.Language.IfStatementAst] -and $p.Clauses[0].Item1.Extent.Text -match '^\s*\$PlaceSecretTool\s*$') { $dlGuarded = $true }; $p = $p.Parent } }
         Assert-True $dlGuarded "...and only under if (`$PlaceSecretTool): a certificate bay does not get the tool (A0.529)"
@@ -397,13 +400,13 @@ try {
         $outVar = $null
         if ($dl.Count -eq 1) { $o = Get-BlankPcParamValueAst $dl[0] "outPath"; if ($o -is [System.Management.Automation.Language.VariableExpressionAst]) { $outVar = $o.VariablePath.UserPath } }
         $outAssign = @($day0Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object { $outVar -and $_.Left.Extent.Text -eq ('$' + $outVar) })
-        Assert-True ($outVar -and $outAssign.Count -eq 1 -and $outAssign[0].Right.Extent.Text -match 'bootstrap\\ABG\.SetClientSecretDpapi\.ps1') "...to BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1, the path Setup-BayPC.ps1 prints"
+        Assert-True ($outVar -and $outAssign.Count -eq 1 -and $outAssign[0].Right.Extent.Text -match 'bootstrap\\AOC\.SetClientSecretDpapi\.ps1') "...to BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1, the path Setup-BayPC.ps1 prints"
         $signed = @(Get-BlankPcCommands $day0Ast "Sign-File" | Where-Object { $outVar -and $_.Extent.Text -match ('\$' + [regex]::Escape($outVar) + '\b') })
         Assert-True ($signed.Count -eq 0) "...and it is NOT in the signing list (deliberately unsigned, ruled 2026-08-03 in that script's own header)"
         $runs = @($day0Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | Where-Object { $_.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -and $outVar -and $_.Extent.Text -match ('\$' + [regex]::Escape($outVar) + '\b') })
         Assert-True ($runs.Count -eq 0) "...and Day0 never RUNS it (downloading it creates no secret)"
-        Assert-True (Test-Path (Join-Path (Split-Path -Parent $Day0Script) "..\src\BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1")) "the file exists in the repository at src/BayAgent/bootstrap, so the address resolves at this commit"
-        $five = @("/bootstrap/ABG.AgentHost.ps1", "/bootstrap/ABG.HostWatchdog.ps1", "/tools/Update-BayAgent.ps1", "/tools/Update-SessionDisplay.ps1", "/tools/Update-PromosPack.ps1")
+        Assert-True (Test-Path (Join-Path (Split-Path -Parent $Day0Script) "..\src\BayAgent\bootstrap\AOC.SetClientSecretDpapi.ps1")) "the file exists in the repository at src/BayAgent/bootstrap, so the address resolves at this commit"
+        $five = @("/bootstrap/AOC.AgentHost.ps1", "/bootstrap/AOC.HostWatchdog.ps1", "/tools/Update-BayAgent.ps1", "/tools/Update-SessionDisplay.ps1", "/tools/Update-PromosPack.ps1")
         $allDl = @(Get-BlankPcCommands $day0Ast "Download-File" | ForEach-Object { $_.Extent.Text })
         Assert-True (@($five | Where-Object { $f = $_; @($allDl | Where-Object { $_.Contains($f) }).Count -eq 1 }).Count -eq 5 -and $allDl.Count -eq 6) "the five downloads that were there are still there, once each; six in all"
     }

@@ -1,15 +1,15 @@
 <#
-ABG.ReleaseFinalize.ps1 (v2.1 - Count fix)
+AOC.ReleaseFinalize.ps1 (v2.1 - Count fix)
 Step 7 - Release discipline helper for All Birdies BayAgent.
 
 What it does:
-1) Creates/updates a release folder under:   C:\AllBirdies\BayAgent\releases\<Version>\
+1) Creates/updates a release folder under:   C:\AceOfClubs\BayAgent\releases\<Version>\
 2) Optionally copies files from a staging folder into the release folder
 3) Writes/updates manifest.json (version + releasedUtc)
 4) Signs all *.ps1 in the release folder with the specified Code Signing certificate,
    RFC 3161 timestamped so the signature outlives the certificate's own expiry
 5) Verifies signatures are Valid AND timestamped
-6) Switches C:\AllBirdies\BayAgent\current junction to the new release folder
+6) Switches C:\AceOfClubs\BayAgent\current junction to the new release folder
 7) Optionally restarts AgentHost/BayAgent via scheduled tasks (preferred)
 
 IMPORTANT (AllSigned):
@@ -18,15 +18,15 @@ IMPORTANT (AllSigned):
 
 Usage examples (run in elevated PowerShell):
   # 1) Save script to disk, unblock, sign, then run:
-  Unblock-File C:\AllBirdies\BayAgent\bootstrap\ABG.ReleaseFinalize.ps1
+  Unblock-File C:\AceOfClubs\BayAgent\bootstrap\AOC.ReleaseFinalize.ps1
   $cert = Get-Item Cert:\CurrentUser\My\<thumbprint>
-  Set-AuthenticodeSignature C:\AllBirdies\BayAgent\bootstrap\ABG.ReleaseFinalize.ps1 -Certificate $cert -TimeStampServer http://timestamp.digicert.com
+  Set-AuthenticodeSignature C:\AceOfClubs\BayAgent\bootstrap\AOC.ReleaseFinalize.ps1 -Certificate $cert -TimeStampServer http://timestamp.digicert.com
 
   # 2) Finalize a release folder you already prepared:
-  .\ABG.ReleaseFinalize.ps1 -Version "1.4.3-step7.1" -CertThumbprint "<thumbprint>" -Restart
+  .\AOC.ReleaseFinalize.ps1 -Version "1.4.3-step7.1" -CertThumbprint "<thumbprint>" -Restart
 
   # 3) Finalize from a staging folder (copies into releases\<Version>\):
-  .\ABG.ReleaseFinalize.ps1 -Version "1.4.3-step7.1" -CertThumbprint "<thumbprint>" -SourceDir "C:\AllBirdies\BayAgent\staging" -Restart -HealthCheck
+  .\AOC.ReleaseFinalize.ps1 -Version "1.4.3-step7.1" -CertThumbprint "<thumbprint>" -SourceDir "C:\AceOfClubs\BayAgent\staging" -Restart -HealthCheck
 
 Notes:
 - By default, this script assumes a single file: BayAgent.ps1 in the release folder, but will sign any *.ps1 present.
@@ -41,7 +41,7 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$CertThumbprint,
 
-    [string]$BaseDir = "C:\AllBirdies\BayAgent",
+    [string]$BaseDir = "",   # empty = the root this script is installed in (Get-BayInstallRoot)
 
     # Optional: if provided, copies contents of SourceDir into the release folder before signing.
     [string]$SourceDir = "",
@@ -62,6 +62,25 @@ param(
     # if DigiCert's responder endpoint moves or a different CA is used.
     [string]$TimeStampServer = "http://timestamp.digicert.com"
 )
+
+
+# The install root is where this script is installed, not a constant (the rename, A0.634/A0.636). Get-BayInstallRoot
+# is copied byte for byte into every script that needs it (tests\BayAgent.InstallRoot.Tests.ps1 pins the copies).
+function Get-BayInstallRoot([string]$ScriptDir) {
+    if ([string]::IsNullOrWhiteSpace($ScriptDir)) { throw "Cannot tell where this script is installed (no script folder)." }
+    $d = $ScriptDir.TrimEnd('\')
+    for ($i = 0; $i -lt 4; $i++) {
+        $leaf = Split-Path -Leaf $d
+        $parent = Split-Path -Parent $d
+        if ([string]::IsNullOrEmpty($parent)) { break }
+        if ($leaf -in @("tools", "bootstrap", "kiosk")) { $d = $parent; continue }
+        if ($leaf -in @("current", "rollback")) { $d = $parent; break }
+        if ((Split-Path -Leaf $parent) -eq "releases") { $d = Split-Path -Parent $parent; break }
+        break
+    }
+    return $d
+}
+if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = Get-BayInstallRoot $PSScriptRoot }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -203,8 +222,8 @@ function Switch-CurrentJunction([string]$baseDir, [string]$releaseDir) {
 
 function Restart-AgentViaTasks {
     param(
-        [string]$HostTask = "\ABG Bay Agent",
-        [string]$WatchdogTask = "\ABG Host Watchdog"
+        [string]$HostTask = "\AOC Bay Agent",
+        [string]$WatchdogTask = "\AOC Host Watchdog"
     )
 
     if (-not (Test-IsAdmin)) {

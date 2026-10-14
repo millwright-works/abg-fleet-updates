@@ -1,5 +1,5 @@
 <#
-ABG.RotateClientSecretDpapiAndTest.ps1
+AOC.RotateClientSecretDpapiAndTest.ps1
 - Prompts for an Entra App client secret VALUE (SecureString)
 - Writes/overwrites a DPAPI(LocalMachine) encrypted secret file
 - Optionally applies ACL hardening
@@ -8,11 +8,11 @@ ABG.RotateClientSecretDpapiAndTest.ps1
 Run this in an *elevated* PowerShell (Run as Administrator) if you want ACL hardening and to overwrite locked-down files.
 
 Example:
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ABG.RotateClientSecretDpapiAndTest.ps1 `
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\AOC.RotateClientSecretDpapiAndTest.ps1 `
     -TenantId "cc551e6a-be6a-42d2-add4-231f5891a179" `
     -ClientId "0e77dbf6-499d-434c-acfc-b276bc439c38" `
     -OrgUrl "https://builds-apps-dev.crm.dynamics.com" `
-    -OutPath "C:\AllBirdies\BayAgent\secrets\clientsecret.dpapi" `
+    -OutPath "C:\AceOfClubs\BayAgent\secrets\clientsecret.dpapi" `
     -AgentAccount "BAY1KIOSK\BayKiosk"
 
 #>
@@ -25,7 +25,7 @@ Example:
 # Requiring a valid Authenticode signature to run the tool that recovers from a
 # code-signing problem (expired cert, broken trust chain, etc.) is a chicken-and-egg
 # lockout: exactly the failure this script may need to be run to fix. Same reasoning
-# applies to ABG.SetClientSecretDpapi.ps1, and matches ABG-Day0-Setup.ps1's existing
+# applies to AOC.SetClientSecretDpapi.ps1, and matches AOC-Day0-Setup.ps1's existing
 # signing list, which excludes both of these scripts too.
 
 param(

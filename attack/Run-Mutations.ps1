@@ -129,7 +129,7 @@ $Muts += @(
      To='  # MUTANT MU1: a failed update leaves the previous run''s marker in place' }
   @{ Id="MU2"; File="src\BayAgent\tools\Update-BayAgent.ps1"; Target="7 log follows -BaseDir"
      From='if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $BaseDir "logs\Update-BayAgent.log" }'
-     To='if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = "C:\AllBirdies\BayAgent\logs\Update-BayAgent.log" }   # MUTANT MU2: log ignores -BaseDir again' }
+     To='if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = "C:\AceOfClubs\BayAgent\logs\Update-BayAgent.log" }   # MUTANT MU2: log ignores -BaseDir again' }
   @{ Id="MU3"; File="src\BayAgent\tools\Update-BayAgent.ps1"; Target="7 the failure reaches the log"
      From='  Write-Log ("UPDATE FAILED: " + $msg)'
      To='  # MUTANT MU3: the failure is not logged (the original silent-throw defect)' }
