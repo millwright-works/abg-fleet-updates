@@ -545,6 +545,17 @@ function Remove-Scratch {
 try {
   # =================================================================================================================
   Section "A. the tool's functions"
+  # A function that returns its array behind a leading comma comes back as ONE item inside @(...) (Windows PowerShell
+  # 5.1 and 7 alike). The tool wraps calls in @(...), so such a function may not be called that way. Found on this
+  # tool's first run (the configuration check could not run at all); checked here on the text, not remembered.
+  $commaFns = @($toolAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object {
+      @($_.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and $null -ne $n.Pipeline -and $n.Pipeline.Extent.Text -match '^\s*,' }, $true)).Count -gt 0 } | ForEach-Object { $_.Name })
+  $wrapped = @()
+  foreach ($fn in $commaFns) {
+    $calls = @($toolAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $fn }, $true))
+    foreach ($c in $calls) { $p = $c.Parent; while ($null -ne $p -and -not ($p -is [System.Management.Automation.Language.StatementBlockAst]) -and -not ($p -is [System.Management.Automation.Language.NamedBlockAst])) { $p = $p.Parent }; if ($null -ne $p -and $p.Parent -is [System.Management.Automation.Language.ArrayExpressionAst]) { $wrapped += ("{0} (line {1})" -f $fn, $c.Extent.StartLineNumber) } }
+  }
+  Assert-True ($wrapped.Count -eq 0) ("no function that returns behind a leading comma is called inside @(...) (" + ($wrapped -join ", ") + "; comma-returning functions: " + ($commaFns -join ",") + ")")
   $o = "C:\AllBirdies"; $n = "C:\AceOfClubs"
   $cases = @(
     @('-File "C:\AllBirdies\BayAgent\bootstrap\ABG.AgentHost.ps1"', '-File "C:\AceOfClubs\BayAgent\bootstrap\AOC.AgentHost.ps1"', "a task's -File, with the bootstrap file name mapped"),
