@@ -44,6 +44,8 @@ settings while it is signed in, and signs it out itself during the move).
 **2. Copy the tool** from the stick to `C:\BayMove` (the folder must not be inside `C:\AllBirdies` or
 `C:\AceOfClubs`): `C:\BayMove\Move-BayInstall.ps1` and `C:\BayMove\bootstrap\AOC.*.ps1`.
 
+Then make `C:\BayMove` administrator-only, in the administrator window: `icacls C:\BayMove /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F"`, and check with `icacls C:\BayMove` that only those two are listed. The tool signs the files in `-BootstrapSource` with the bay's certificate and refuses a folder that standard users can write (and a folder above it that they can delete from or change); `C:\` gives Authenticated Users Modify on every new folder under it, so without this step Plan says `REFUSED: -BootstrapSource is not admin-only`. The same judgment is made of the new root, the journal folder, and every folder above them (a junction anywhere on a path is refused): Plan prints any such finding with the folder named, so it is safe to run first.
+
 **3. Open Windows PowerShell as administrator** and run Plan (it changes nothing):
 
 ```

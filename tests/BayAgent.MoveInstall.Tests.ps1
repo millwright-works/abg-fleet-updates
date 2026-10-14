@@ -210,6 +210,21 @@ if ($Child) {
   function global:Read-Host {
     [CmdletBinding()] param([Parameter(Position = 0)][string]$Prompt, [switch]$AsSecureString)
     HRec ("PROMPT  " + $Prompt)
+    # Security tests: what a standard user could do between the plan and the move, done at the prompt the person answers.
+    if ($global:BmH.Inject.ContainsKey("swap-new-open")) {
+      $swapDir = [string]$global:BmH.Inject["swap-new-open"]; [void]$global:BmH.Inject.Remove("swap-new-open")
+      HScratch $swapDir
+      [void][IO.Directory]::CreateDirectory($swapDir)
+      $swapAcl = Get-Acl -LiteralPath $swapDir
+      $swapAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")))
+      Microsoft.PowerShell.Security\Set-Acl -LiteralPath $swapDir -AclObject $swapAcl
+    }
+    if ($global:BmH.Inject.ContainsKey("swap-src-link")) {
+      $swapParts = ([string]$global:BmH.Inject["swap-src-link"]).Split('|'); [void]$global:BmH.Inject.Remove("swap-src-link")
+      HScratch $swapParts[0]; HScratch $swapParts[1]
+      [IO.Directory]::Move($swapParts[0], $swapParts[1])
+      Microsoft.PowerShell.Management\New-Item -ItemType Junction -Path $swapParts[0] -Value $swapParts[1] | Out-Null
+    }
     $a = $(if ($global:BmH.Answers.Count -gt 0) { [string]$global:BmH.Answers.Dequeue() } else { "" })
     if ($AsSecureString) {
       $v = $(if ($a -eq "pw:good") { $global:BmH.Marker } elseif ($a -eq "pw:wrong") { "not-" + $global:BmH.Marker } else { "" })
@@ -227,7 +242,7 @@ if ($Child) {
     "Get-CimInstance", "Stop-Process", "Start-Sleep", "Get-AuthenticodeSignature", "Set-AuthenticodeSignature", "Get-ChildItem", "Invoke-WebRequest",
     "Read-Host", "Set-Acl", "New-Item")
   $readOnly = @("Write-Host", "Join-Path", "ConvertFrom-Json", "ConvertTo-Json", "Sort-Object", "Where-Object", "ForEach-Object", "Out-Null", "Get-Date",
-    "New-Object", "Get-Item", "Get-Location", "Get-Acl", "Set-StrictMode")
+    "New-Object", "Get-Item", "Get-Location", "Get-Acl", "Set-StrictMode", "Add-Type")
 
   $res = [ordered]@{ census = "ok"; harnessError = ""; runs = @() }
   try {
@@ -371,6 +386,14 @@ $AgentVersion = "1.7.0"
 $OldFixtures = Join-Path $RepoRoot "tests\fixtures\old-bay"
 $TasksMadeHere = @()
 
+function New-AdminOnlyDir([string]$Path) {
+  # A folder born admin-only (SYSTEM, Administrators and this account, not inheriting): what the tool now requires of the
+  # folder the new bootstrap files are read from.
+  $sec = New-Object System.Security.AccessControl.DirectorySecurity
+  $sec.SetAccessRuleProtection($true, $false)
+  foreach ($who in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators", $Me)) { $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($who, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))) }
+  [void][IO.Directory]::CreateDirectory($Path, $sec)
+}
 function Get-Dacl([string]$p) { if ([IO.Directory]::Exists($p)) { return (Get-BmDaclSddl $p) }; return "(absent)" }
 function ConvertTo-JsonPath([string]$p) { return $p.Replace('\', '\\') }
 
@@ -444,7 +467,7 @@ function Set-FakeInstall {
   [IO.File]::WriteAllText((Join-Path $sd "edge-profile\Local State"), '{}')
   # the release's new bootstrap files: the repository's own AOC.* scripts (root-derived, what the release ships), without
   # any signature block (the tool signs them on the bay)
-  [void][IO.Directory]::CreateDirectory($NewBoot); [void][IO.Directory]::CreateDirectory($Web)
+  New-AdminOnlyDir $NewBoot; [void][IO.Directory]::CreateDirectory($Web)
   foreach ($b in @("AgentHost", "HostWatchdog", "LauncherShell")) {
     $t = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\AOC.$b.ps1"))
     $t = ($t -split '# SIG # Begin signature block')[0]
@@ -821,6 +844,202 @@ try {
     $writes = @($x.log | Where-Object { $_ -notmatch '^(PROMPT|SIGN|DOWNLOAD)' })
     Assert-True ($x.exit -eq 1 -and (Get-Console $x) -match $rc.expect -and $writes.Count -eq 0 -and $s1.oldTree -eq $s0.oldTree -and $s1.cfgSha -eq $s0.cfgSha) ("{0}: refused with its reason, nothing on the bay changed (exit {1}; machine calls: {2})" -f $rc.why, $x.exit, ($writes -join " ; "))
   }
+
+  # =================================================================================================================
+  Section "B6. security review 2: links, a swap between the plan and the move, the same judgment at every entry point"
+  # Real folders, real access rules, real junctions. Findings: (1) a check on a path that is used later (a junction put
+  # in the path, a folder made or swapped between the plan and the move), (2) one entry point judging what a sibling does
+  # not (Plan, Back, -Journal, -BootstrapSource, the files inside the journal), (3) an admin-only test that misses a grant.
+  $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $script:BmExtraTrusted = @($meSid)
+  function Edit-Acl([string]$Path, [scriptblock]$Mod) {
+    # Only the access section is read and written (Set-Acl asks for the audit privilege on a folder made with explicit rules).
+    $isDir = [IO.Directory]::Exists($Path)
+    $i = $(if ($isDir) { New-Object IO.DirectoryInfo($Path) } else { New-Object IO.FileInfo($Path) })
+    $a = $i.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+    & $Mod $a
+    $i.SetAccessControl($a)
+  }
+  function Add-UsersModify([string]$Dir) {
+    Edit-Acl $Dir { param($a) $a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow"))) }
+  }
+  function New-TestJunction([string]$Link, [string]$Target) { Microsoft.PowerShell.Management\New-Item -ItemType Junction -Path $Link -Value $Target | Out-Null }
+
+  # -- B6a. the judgment itself, on real folders (Get-BmFolderProblems reads the owner and rules from an open handle)
+  $aclRoot = Join-Path $S "acl"; [void][IO.Directory]::CreateDirectory($aclRoot)
+  $aclN = 0
+  function New-AclCase([string]$Label, [scriptblock]$Grant) {
+    $script:aclN++
+    $d = Join-Path $aclRoot ("c" + $script:aclN)
+    New-AdminOnlyDir $d
+    Edit-Acl $d $Grant
+    return $d
+  }
+  function New-Rule($Who, $Rights, [string]$Inherit = "ContainerInherit,ObjectInherit", [string]$Prop = "None", [string]$Type = "Allow") {
+    $id = $(if ($Who -is [Security.Principal.SecurityIdentifier]) { $Who } else { New-Object Security.Principal.NTAccount($Who) })
+    return (New-Object System.Security.AccessControl.FileSystemAccessRule($id, $Rights, $Inherit, $Prop, $Type))
+  }
+  $cases = @(
+    @{ n = "Authenticated Users may modify"; g = { param($a) $a.AddAccessRule((New-Rule "NT AUTHORITY\Authenticated Users" "Modify")) }; full = $true; ren = $true },
+    @{ n = "Everyone may write"; g = { param($a) $a.AddAccessRule((New-Rule "Everyone" "Write")) }; full = $true; ren = $false },
+    @{ n = "a user group (INTERACTIVE) has full control"; g = { param($a) $a.AddAccessRule((New-Rule "NT AUTHORITY\INTERACTIVE" "FullControl")) }; full = $true; ren = $true },
+    @{ n = "Users may only write attributes"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "WriteAttributes")) }; full = $true; ren = $false },
+    @{ n = "Users may delete it"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "Delete")) }; full = $true; ren = $true },
+    @{ n = "Users may delete a child"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "DeleteSubdirectoriesAndFiles")) }; full = $true; ren = $true },
+    @{ n = "Users may change the rules"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "ChangePermissions")) }; full = $true; ren = $true },
+    @{ n = "Users may take ownership"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "TakeOwnership")) }; full = $true; ren = $true },
+    @{ n = "Users may only add a subfolder, this folder only (what C:\ gives every user)"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "AppendData" "None")) }; full = $true; ren = $false },
+    @{ n = "Users may only read and run"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "ReadAndExecute")) }; full = $false; ren = $false },
+    @{ n = "Users get Modify that only passes down to children (inherit-only), where the journal's files will live"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "Modify" "ContainerInherit,ObjectInherit" "InheritOnly")) }; full = $true; ren = $false },
+    @{ n = "CREATOR OWNER Modify (Windows keeps it as an inherit-only rule plus a rule for the owner, a trusted account here)"; g = { param($a) $a.AddAccessRule((New-Rule (New-Object Security.Principal.SecurityIdentifier("S-1-3-0")) "Modify")) }; full = $false; ren = $false },
+    @{ n = "CREATOR OWNER full control, inherit-only (the stock rule on a ProgramData folder: harmless)"; g = { param($a) $a.AddAccessRule((New-Rule (New-Object Security.Principal.SecurityIdentifier("S-1-3-0")) "FullControl" "ContainerInherit,ObjectInherit" "InheritOnly")) }; full = $false; ren = $false },
+    @{ n = "Users get Modify and a deny for Write (a deny does not excuse the allow)"; g = { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "Modify")); $a.AddAccessRule((New-Rule "BUILTIN\Users" "Write" "ContainerInherit,ObjectInherit" "None" "Deny")) }; full = $true; ren = $true }
+  )
+  foreach ($c in $cases) {
+    $d = New-AclCase $c.n $c.g
+    $pf = @(Get-BmFolderProblems $d $aclRoot "Full" "Full")
+    $pr = @(Get-BmFolderProblems $d $aclRoot "Rename" "Rename")
+    Assert-True (($pf.Count -gt 0) -eq $c.full -and ($pr.Count -gt 0) -eq $c.ren) ("judged on the rights, not names - {0}: as the folder to use {1}, as a folder above {2} (found {3} / {4})" -f $c.n, $(if ($c.full) { "REFUSED" } else { "accepted" }), $(if ($c.ren) { "REFUSED" } else { "accepted" }), $pf.Count, $pr.Count)
+  }
+  # an owner who is not an administrator, and no access list at all (a security descriptor built from text: this process cannot make a folder owned by someone else)
+  $sdOwner = New-Object Security.AccessControl.RawSecurityDescriptor("O:BUG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)")
+  Assert-True (@(Get-BmSdProblems $sdOwner "Full") -match 'owned by S-1-5-32-545' -and @(Get-BmSdProblems $sdOwner "Rename") -match 'owned by S-1-5-32-545' -and @(Get-BmSdProblems $sdOwner "Owner") -match 'owned by S-1-5-32-545') "a folder owned by BUILTIN\Users is refused whatever its rules, as the folder to use and as a folder above it"
+  $sdOk = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)")
+  Assert-True (@(Get-BmSdProblems $sdOk "Full").Count -eq 0 -and @(Get-BmSdProblems $sdOk "Rename").Count -eq 0) "control: owned by Administrators with SYSTEM and Administrators only is accepted"
+  $sdNull = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAG:BA")
+  Assert-True (@(Get-BmSdProblems $sdNull "Full").Count -gt 0) "a folder with no access list at all (everyone may do anything) is refused"
+  $sdCallback = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAG:BAD:(XA;;FA;;;WD;(Member_of {SID(BU)}))")
+  Assert-True (@(Get-BmSdProblems $sdCallback "Full").Count -gt 0) "a conditional allow rule for Everyone is refused (judged as an allow)"
+  $sdObject = New-Object Security.AccessControl.RawSecurityDescriptor("O:BAG:BAD:(OA;;CR;ab721a53-1e2f-11d0-9819-00aa0040529b;;WD)")
+  Assert-True (@(Get-BmSdProblems $sdObject "Full").Count -gt 0) "an access rule of a kind this tool cannot judge (an object rule) is refused, not skipped"
+  # a folder that is itself admin-only, below one that is not: whoever can delete a child of the folder above can swap it
+  $ancW = Join-Path $aclRoot "ancW"; New-AdminOnlyDir $ancW
+  Edit-Acl $ancW { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "DeleteSubdirectoriesAndFiles")) }
+  $leafW = Join-Path $ancW "leaf"; New-AdminOnlyDir $leafW
+  Assert-True (@(Get-BmFolderProblems $leafW $aclRoot "Full" "Rename").Count -gt 0) "an admin-only folder below a folder where Users can delete a child is refused (they could swap it for a junction)"
+  $ancA = Join-Path $aclRoot "ancA"; New-AdminOnlyDir $ancA
+  Edit-Acl $ancA { param($a) $a.AddAccessRule((New-Rule "BUILTIN\Users" "AppendData" "None")) }
+  $leafA = Join-Path $ancA "leaf"; New-AdminOnlyDir $leafA
+  Assert-True (@(Get-BmFolderProblems $leafA $aclRoot "Full" "Rename").Count -eq 0) "control: an admin-only folder below one where Users may only add a subfolder (as on C:\) is accepted"
+  # links: the folder itself, and a folder above it
+  $realA = Join-Path $aclRoot "real"; New-AdminOnlyDir $realA; New-AdminOnlyDir (Join-Path $realA "inner")
+  $lnkTop = Join-Path $aclRoot "lnk"; New-TestJunction $lnkTop $realA
+  $pTop = @(Get-BmFolderProblems $lnkTop $aclRoot "Full" "Full")
+  $pMid = @(Get-BmFolderProblems (Join-Path $lnkTop "inner") $aclRoot "Full" "Full")
+  Assert-True (($pTop -join " ") -match 'is a link' -and ($pMid -join " ") -match 'is a link') ("a junction as the folder, or anywhere above it, is refused even when it points at an admin-only folder (found: " + $pTop.Count + " / " + $pMid.Count + ")")
+  Assert-True (@(Get-BmFolderProblems $realA $aclRoot "Full" "Full").Count -eq 0) "control: the same folder reached without the junction is accepted"
+  [IO.File]::WriteAllText((Join-Path $realA "inner\f.txt"), "x")
+  $rb = $null; try { $rb = Read-BmTrustedBytes (Join-Path $lnkTop "inner\f.txt") $true } catch { $rb = "THREW " + $_.Exception.Message }
+  Assert-True ([string]$rb -match 'THREW .*(link|alias)') ("a file read through a junction in its path is refused (" + [string]$rb + ")")
+  $rb2 = $null; try { $rb2 = Read-BmTrustedBytes (Join-Path $realA "inner\f.txt") $true } catch { $rb2 = "THREW " + $_.Exception.Message }
+  Assert-True ($rb2 -is [byte[]] -and $rb2.Length -eq 1) "control: the same file read directly returns its bytes"
+  Edit-Acl (Join-Path $realA "inner\f.txt") { param($a) $a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Write", "Allow"))) }
+  $rb3 = $null; try { $rb3 = Read-BmTrustedBytes (Join-Path $realA "inner\f.txt") $true } catch { $rb3 = "THREW " + $_.Exception.Message }
+  Assert-True ([string]$rb3 -match 'THREW .*cannot be trusted') ("a file with its own rule that lets Users write is not read, though its folder is admin-only (" + [string]$rb3 + ")")
+
+  # the same folder reached through a drive letter that stands for it (subst) is an alias, not the path it was named by
+  $letter = $null
+  foreach ($l in @("Z", "Y", "X", "W", "V", "U")) { if (-not [IO.Directory]::Exists($l + ":\")) { $letter = $l; break } }
+  if ($null -ne $letter) {
+    $aliasDir = Join-Path $aclRoot "alias-target"; New-AdminOnlyDir $aliasDir
+    & subst.exe ($letter + ":") $aliasDir | Out-Null
+    try {
+      $viaDrive = @(Get-BmFolderProblems ($letter + ":\") ($letter + ":\") "Full" "Full")
+      $viaDrive2 = @(Get-BmFolderProblems $aliasDir $aclRoot "Full" "Full")
+      Assert-True ((@(Get-BmFolderProblems ($letter + ":\") $null "Link" "Link") -join " ") -match 'link or an alias' -and $viaDrive2.Count -eq 0) "a folder named through a drive letter that stands for it is refused as an alias of another path; named by its own path it is accepted"
+    } finally { & subst.exe ($letter + ":") /d | Out-Null }
+  } else { Write-Host "  INFO  no free drive letter: the alias check was NOT exercised by this run" -ForegroundColor Yellow }
+
+  # -- B6b. entry points that must say what Move says, and a path that changes under the tool
+  function New-SecCase([string]$Name, [hashtable]$Extra, [string]$Mode, [scriptblock]$Setup) {
+    Remove-Scratch; [void][IO.Directory]::CreateDirectory($S); Set-FakeInstall
+    if ($null -ne $Setup) { & $Setup }
+    $s0 = Get-Snapshot
+    $run = [ordered]@{ title = $Name; args = (Get-MoveArgs $Mode $Extra); answers = $(if ($Mode -eq "Plan") { @() } else { @("MOVE", "pw:good") }) }
+    $rr = Invoke-Harness ("sec-" + $Name) @($run) (New-Model -AgentLogon 1)
+    return @{ x = (Get-Run $rr 0); s0 = $s0; s1 = (Get-Snapshot) }
+  }
+  function Test-SecRefused($R, [string]$Why, [string]$Expect) {
+    $x = $R.x
+    $writes = @($x.log | Where-Object { $_ -notmatch '^(PROMPT|SIGN|DOWNLOAD)' })
+    Assert-True ($x.exit -eq 1 -and (Get-Console $x) -match $Expect -and $writes.Count -eq 0 -and $R.s1.oldTree -eq $R.s0.oldTree -and $R.s1.cfgSha -eq $R.s0.cfgSha) ("{0}: refused with its reason, nothing on the bay changed (exit {1}; machine calls: {2}; console: {3})" -f $Why, $x.exit, ($writes -join " ; "), $(if ($x.exit -ne 1 -or (Get-Console $x) -notmatch $Expect) { (Get-Console $x) -replace '\s+', ' ' } else { "" }))
+  }
+  $jreal = Join-Path $S "jreal"
+  $r = New-SecCase "journal-is-link" @{ JournalRoot = (Join-Path $S "jlink") } "Move" { New-AdminOnlyDir $jreal; New-TestJunction (Join-Path $S "jlink") $jreal }
+  Test-SecRefused $r "the journal folder is a junction to an admin-only folder" 'is a link'
+  Assert-True (@([IO.Directory]::GetFileSystemEntries($jreal)).Count -eq 0) "...and nothing was written through the junction"
+  $r = New-SecCase "journal-under-link" @{ JournalRoot = (Join-Path $S "jlm\journal") } "Move" { New-AdminOnlyDir $jreal; New-TestJunction (Join-Path $S "jlm") $jreal }
+  Test-SecRefused $r "a folder above the journal folder is a junction to an admin-only folder" 'is a link'
+  Assert-True (@([IO.Directory]::GetFileSystemEntries($jreal)).Count -eq 0) "...and nothing was made inside the folder it points to"
+  $r = New-SecCase "new-root-is-link" @{} "Move" { $nreal = Join-Path $S "nreal"; New-AdminOnlyDir $nreal; New-TestJunction $New $nreal }
+  Test-SecRefused $r "the new root is a junction to an admin-only folder" 'is a link'
+  Assert-True (@([IO.Directory]::GetFileSystemEntries((Join-Path $S "nreal"))).Count -eq 0) "...and nothing was moved through the junction"
+  $r = New-SecCase "plan-journal-open" @{} "Plan" { [void][IO.Directory]::CreateDirectory($JRoot); Add-UsersModify $JRoot }
+  Test-SecRefused $r "Plan, like Move, refuses a journal folder Users can write" 'journal folder is not admin-only'
+  $r = New-SecCase "source-open-move" @{} "Move" { Add-UsersModify $NewBoot }
+  Test-SecRefused $r "Move refuses new bootstrap files from a folder Users can write (they are signed with the bay's certificate)" 'BootstrapSource is not admin-only'
+  $r = New-SecCase "source-open-plan" @{} "Plan" { Add-UsersModify $NewBoot }
+  Test-SecRefused $r "Plan says the same about the folder the new bootstrap files come from" 'BootstrapSource is not admin-only'
+  $r = New-SecCase "source-file-open" @{} "Move" { Edit-Acl (Join-Path $NewBoot "AOC.AgentHost.ps1") { param($a) $a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "Allow"))) } }
+  Test-SecRefused $r "a new bootstrap file in the admin-only source folder has its own rule that lets Users write: it is not staged or signed" 'AOC\.AgentHost\.ps1: .*cannot be trusted'
+  $npar = Join-Path $S "np"
+  $r = New-SecCase "new-parent-open" @{ NewRoot = (Join-Path $npar "AceOfClubs") } "Plan" { [void][IO.Directory]::CreateDirectory($npar); Add-UsersModify $npar }
+  Test-SecRefused $r "the folder the new root would be made in can be written by Users" 'does not exist, and the folder it would be made in is not safe'
+  $jpar = Join-Path $S "jp"
+  $r = New-SecCase "journal-parent-open" @{ JournalRoot = (Join-Path $jpar "journal") } "Move" { [void][IO.Directory]::CreateDirectory($jpar); Add-UsersModify $jpar }
+  Test-SecRefused $r "the folder the journal folder would be made in is writable by Users" 'journal folder is not admin-only'
+  Assert-True (-not [IO.Directory]::Exists((Join-Path $jpar "journal"))) "...and the journal folder was not made there (judged before it is made, not after)"
+
+  # a swap between the plan and the move: the harness runs a step at the prompt the person answers, after the plan
+  Remove-Scratch; [void][IO.Directory]::CreateDirectory($S); Set-FakeInstall
+  $s0 = Get-Snapshot
+  $run = [ordered]@{ title = "swap-new-root"; args = (Get-MoveArgs "Move"); answers = @("MOVE", "pw:good"); inject = @{ "swap-new-open" = $New } }
+  $rr = Invoke-Harness "sec-swap-new" @($run) (New-Model -AgentLogon 1)
+  $x = Get-Run $rr 0
+  Assert-True ($x.exit -eq 2 -and (Get-Console $x) -match 'is not safe to move into any more' -and -not [IO.Directory]::Exists((Join-Path $New "BayAgent")) -and [IO.Directory]::Exists((Join-Path $Old "BayAgent"))) ("a standard user makes the new root, writable by Users, after the plan: the move refuses it and puts everything back (exit {0}; {1})" -f $x.exit, ((Get-Console $x) -replace '\s+', ' ').Substring(0, [Math]::Min(300, ((Get-Console $x) -replace '\s+', ' ').Length)))
+  Remove-Scratch; [void][IO.Directory]::CreateDirectory($S); Set-FakeInstall
+  $elsewhere = Join-Path $S "elsewhere"
+  $run = [ordered]@{ title = "swap-src"; args = (Get-MoveArgs "Move"); answers = @("MOVE", "pw:good"); inject = @{ "swap-src-link" = ((Join-Path $Old "SessionDisplay") + "|" + $elsewhere) } }
+  $rr = Invoke-Harness "sec-swap-src" @($run) (New-Model -AgentLogon 1)
+  $x = Get-Run $rr 0
+  Assert-True ($x.exit -eq 2 -and (Get-Console $x) -match 'changed since the plan' -and -not [IO.Directory]::Exists((Join-Path $New "SessionDisplay")) -and [IO.Directory]::Exists((Join-Path $Old "BayAgent")) -and (Get-BmLinkTarget (Join-Path $Old "SessionDisplay")) -ne "") ("a folder swapped for a junction after the plan is not moved, and what was already moved is put back (exit {0})" -f $x.exit)
+
+  # Back: the files inside the journal, a path through a link, a saved script that was changed
+  Remove-Scratch; [void][IO.Directory]::CreateDirectory($S); Set-FakeInstall
+  $m6 = New-Model -AgentLogon 1; $st6 = Join-Path $S "machine-b6.json"
+  $rm = Invoke-Harness "b6-move" @([ordered]@{ title = "Move"; args = (Get-MoveArgs "Move"); answers = @("MOVE", "pw:good") }) $m6 $st6
+  Assert-True ((Get-Run $rm 0).exit -eq 0) "B6 set-up: a Move completed on the modeled bay (exit $((Get-Run $rm 0).exit))"
+  $jd6 = @([IO.Directory]::GetDirectories($JRoot) | Where-Object { $_ -match '-move$' } | Sort-Object -Descending)[0]
+  $backRun = { param($title, $extra) $a = Get-MoveArgs "Back" (@{ BootstrapSource = "" } + $extra); $rrb = Invoke-Harness ("b6-" + $title) @([ordered]@{ title = $title; args = $a; answers = @("BACK", "pw:good") }) $m6 $st6; return (Get-Run $rrb 0) }
+  function Test-BackRefused($X, [string]$Why, [string]$Expect, $Before) {
+    $writes = @($X.log | Where-Object { $_ -notmatch '^(PROMPT|SIGN|DOWNLOAD)' })
+    $now = Get-Snapshot
+    Assert-True ($X.exit -eq 1 -and (Get-Console $X) -match $Expect -and $writes.Count -eq 0 -and $now.newTree -eq $Before.newTree) ("Back: {0}: refused, nothing changed (exit {1}; calls: {2}; console: {3})" -f $Why, $X.exit, ($writes -join " ; "), $(if ((Get-Console $X) -notmatch $Expect) { (Get-Console $X) -replace '\s+', ' ' } else { "" }))
+  }
+  $before6 = Get-Snapshot
+  $jf6 = Join-Path $jd6 "journal.json"
+  $usersRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "Allow")
+  Edit-Acl $jf6 { param($a) $a.AddAccessRule($usersRule) }
+  $xb = & $backRun "file-open" @{}
+  Edit-Acl $jf6 { param($a) [void]$a.RemoveAccessRuleSpecific($usersRule) }
+  Test-BackRefused $xb "journal.json itself carries a rule that lets Users write (its folder is admin-only)" 'journal file cannot be trusted' $before6
+  $tx6 = Join-Path $jd6 "task-ABG_Bay_Agent.xml"
+  Edit-Acl $tx6 { param($a) $a.AddAccessRule($usersRule) }
+  $xb = & $backRun "task-open" @{}
+  Edit-Acl $tx6 { param($a) [void]$a.RemoveAccessRuleSpecific($usersRule) }
+  Test-BackRefused $xb "a saved task definition in the journal carries a rule that lets Users write" 'saved definition for .* cannot be trusted' $before6
+  $jl = Join-Path $S "jl"; New-TestJunction $jl $JRoot
+  $xb = & $backRun "via-link" @{ Journal = (Join-Path $jl ([IO.Path]::GetFileName($jd6))) }
+  [IO.Directory]::Delete($jl, $false)
+  Test-BackRefused $xb "-Journal names the right journal through a junction" 'not in an admin-only folder' $before6
+  $kept = Join-Path $jd6 "replaced-bootstrap\ABG.AgentHost.ps1"
+  $keptBytes = [IO.File]::ReadAllBytes($kept); $keptTime = [IO.File]::GetLastWriteTimeUtc($kept)
+  [IO.File]::AppendAllText($kept, "`r`n# changed after the Move`r`n")
+  $xb = & $backRun "tampered-script" @{}
+  [IO.File]::WriteAllBytes($kept, $keptBytes); [IO.File]::SetLastWriteTimeUtc($kept, $keptTime)
+  Test-BackRefused $xb "a saved bootstrap script was changed after the Move: Back does not sign it with the bay's certificate" 'not signed by the bay''s signer' $before6
+  $xb = & $backRun "control" @{}
+  Assert-True ($xb.exit -eq 0 -and (Get-Console $xb) -match 'RESULT: MOVED to') ("control: the same Back, with the journal as the Move left it, succeeds (exit " + $xb.exit + ")")
 
   # =================================================================================================================
   Section "C. the real Task Scheduler: export, rewrite, register under the new name"
