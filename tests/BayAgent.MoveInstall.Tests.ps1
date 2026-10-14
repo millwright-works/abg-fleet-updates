@@ -809,40 +809,66 @@ try {
   }
 
   # =================================================================================================================
-  Section "D. the password with the REAL Register-ScheduledTask, -Debug and -Verbose on"
+  Section "D. the password with the REAL Register-ScheduledTask, debug and verbose output on"
+  # Windows PowerShell 5.1 turns -Debug into Inquire (a prompt), so the debug and verbose preferences are set to
+  # Continue around the call instead: every debug and verbose record is written, nothing waits for an answer.
   $fakeUser = "AocBmNoSuchUser" + $RunId
-  $fakePw = "BMTFAKEPW" + [guid]::NewGuid().ToString("N")
-  $tLeak = $uniq + " leak"
   $xmlLeak = New-ModelTaskXml -Kind "logon" -Arguments '-NoProfile -File "C:\AceOfClubs\BayAgent\bootstrap\AOC.AgentHost.ps1"' -User $fakeUser -LogonType 1
-  $tr = Join-Path $S "leak-transcript.txt"
-  $streams = Join-Path $S "leak-streams.txt"
-  $global:Error.Clear()
-  $msg = ""
-  $oldD = $DebugPreference; $oldV = $VerbosePreference
-  Start-Transcript -LiteralPath $tr | Out-Null
-  try {
-    $DebugPreference = "Continue"; $VerbosePreference = "Continue"
-    $secure = ConvertTo-SecureString $fakePw -AsPlainText -Force
-    & { try { Register-BmTask -Name $tLeak -Xml $xmlLeak -User $fakeUser -Password $secure -Debug -Verbose } catch { $script:LeakMsg = $_.Exception.Message; Write-Host ("caught: " + $_.Exception.Message) } } *>&1 | Out-String -Width 4096 | Set-Content -LiteralPath $streams
-  } finally {
-    $DebugPreference = $oldD; $VerbosePreference = $oldV
-    Stop-Transcript | Out-Null
-    try { Unregister-ScheduledTask -TaskName $tLeak -TaskPath "\" -Confirm:$false -ErrorAction Stop } catch { }
+  function Invoke-LeakProbe([string]$Tag, [scriptblock]$Body) {
+    # Runs $Body with debug and verbose on, under a transcript, all six streams captured; returns everything a reader
+    # could find afterwards: the transcript, the streams, the caught message, and every field of every $Error record.
+    $tr = Join-Path $S ("leak-" + $Tag + "-transcript.txt"); $streams = Join-Path $S ("leak-" + $Tag + "-streams.txt")
+    $global:Error.Clear(); $script:LeakMsg = ""
+    $oldD = $DebugPreference; $oldV = $VerbosePreference
+    Start-Transcript -LiteralPath $tr | Out-Null
+    try {
+      $DebugPreference = "Continue"; $VerbosePreference = "Continue"
+      & { try { & $Body } catch { $script:LeakMsg = $_.Exception.Message; Write-Host ("caught: " + $_.Exception.Message) } } *>&1 | Out-String -Width 4096 | Tee-Object -FilePath $streams | Out-Host
+    } finally { $DebugPreference = $oldD; $VerbosePreference = $oldV; Stop-Transcript | Out-Null }
+    $errText = (@($global:Error | ForEach-Object {
+          $e = $_; $x = @("$e")
+          try { $x += [string]$e.Exception.Message } catch { }
+          try { $x += [string]$e.TargetObject } catch { }
+          try { $x += [string]$e.InvocationInfo.Line } catch { }
+          try { foreach ($v in @($e.InvocationInfo.BoundParameters.Values)) { $x += [string]$v } } catch { }
+          try { $x += [string]$e.Exception.InnerException } catch { }
+          $x -join "`n" }) -join "`n")
+    return @{ Msg = [string]$script:LeakMsg; Transcript = [IO.File]::ReadAllText($tr); Streams = [IO.File]::ReadAllText($streams); Errors = $errText }
   }
-  $msg = [string]$script:LeakMsg
-  $errText = (@($global:Error | ForEach-Object {
-        $e = $_; $t = @("$e")
-        try { $t += [string]$e.Exception.Message } catch { }
-        try { $t += [string]$e.TargetObject } catch { }
-        try { $t += [string]$e.InvocationInfo.Line } catch { }
-        try { foreach ($v in @($e.InvocationInfo.BoundParameters.Values)) { $t += [string]$v } } catch { }
-        try { $t += [string]$e.Exception.InnerException } catch { }
-        $t -join "`n" }) -join "`n")
-  $all = ([IO.File]::ReadAllText($tr) + "`n" + [IO.File]::ReadAllText($streams) + "`n" + $msg + "`n" + $errText)
-  Assert-True ($msg -match "registering the task") ("the real cmdlet refused the fake account, and the tool's error says which task (" + $msg + ")")
-  Assert-True (-not $all.Contains($fakePw)) "the fake password is in none of: the six streams, the transcript, the error text, any record in `$Error"
+  function Get-LeakPlaces($Probe, [string]$Value) {
+    $where = @()
+    foreach ($k in @("Transcript", "Streams", "Msg", "Errors")) { if ([string]$Probe[$k] -and ([string]$Probe[$k]).Contains($Value)) { $where += $k } }
+    return ,$where
+  }
+  # 1. the tool's own call
+  $tLeak = $uniq + " leak"
+  $fakePw = "BMTFAKEPW" + [guid]::NewGuid().ToString("N")
+  $secure = ConvertTo-SecureString $fakePw -AsPlainText -Force
+  try { $pr = Invoke-LeakProbe "tool" { Register-BmTask -Name $tLeak -Xml $xmlLeak -User $fakeUser -Password $secure } }
+  finally { try { Unregister-ScheduledTask -TaskName $tLeak -TaskPath "\" -Confirm:$false -ErrorAction Stop } catch { } }
+  $places = Get-LeakPlaces $pr $fakePw
+  Assert-True ($pr.Msg -match "registering the task") ("the real cmdlet refused the fake account, and the tool's error says which task (" + $pr.Msg + ")")
+  Assert-True ($places.Count -eq 0) ("the fake password is in none of: the six streams, the transcript, the error text, any record in `$Error (found in: " + ($places -join ",") + ")")
   Assert-True ($null -eq (Get-ScheduledTask -TaskName $tLeak -TaskPath "\" -ErrorAction SilentlyContinue)) "...and no task was registered"
-} finally {
+  # 2. measured, not asserted: the same real cmdlet called directly, as a careless script would. On Windows PowerShell
+  # 5.1 its error record (a RemotingErrorRecord from the CIM module) carries no bound parameters and the value is in no
+  # stream; this line records where it was found, so a change in Windows shows up here.
+  $tPlant = $uniq + " plant"
+  $plantPw = "BMTPLANTPW" + [guid]::NewGuid().ToString("N")
+  try { $pp = Invoke-LeakProbe "plant" { Register-ScheduledTask -TaskName $tPlant -TaskPath "\" -Xml $xmlLeak -User $fakeUser -Password $plantPw -Force -ErrorAction Stop | Out-Null } }
+  finally { try { Unregister-ScheduledTask -TaskName $tPlant -TaskPath "\" -Confirm:$false -ErrorAction Stop } catch { } }
+  $plantPlaces = Get-LeakPlaces $pp $plantPw
+  Write-Host ("  INFO  the same cmdlet called directly: its password was found in: [" + ($plantPlaces -join ",") + "]")
+  # 3. the plants: a value thrown and written as an error record is found in the caught text and in $Error
+  $errPw = "BMTERRPW" + [guid]::NewGuid().ToString("N")
+  $pe = Invoke-LeakProbe "errors" { Write-Error -Message ("e " + $errPw) -TargetObject $errPw -ErrorAction Continue; throw ("t " + $errPw) }
+  $ep = Get-LeakPlaces $pe $errPw
+  Assert-True ($ep -contains "Msg" -and $ep -contains "Errors") ("the plant: a value in an error is found in the caught text and in the `$Error records (found in: " + ($ep -join ",") + ")")
+  # 4. a second plant in the streams themselves: a value written to the verbose and debug streams is found
+  $streamPw = "BMTSTREAMPW" + [guid]::NewGuid().ToString("N")
+  $ps2 = Invoke-LeakProbe "streams" { Write-Verbose ("v " + $streamPw); Write-Debug ("d " + $streamPw) }
+  $sp = Get-LeakPlaces $ps2 $streamPw
+  Assert-True ($sp -contains "Streams" -and $sp -contains "Transcript") ("the plant: a value written to the verbose and debug streams is found in the captured streams and the transcript (found in: " + ($sp -join ",") + ")")} finally {
   Remove-Scratch
 }
 
