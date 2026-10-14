@@ -119,6 +119,7 @@ try {
     $constants = @()
     foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "src\BayAgent") -Recurse -Filter *.ps1)) {
         if ($f.Name -eq "Setup-BayPC.ps1") { continue }   # the setup's default root is the one place a root is named
+        if ($f.Name -eq "Move-BayInstall.ps1") { continue }   # the move tool names BOTH roots by design and is not in the package (the build has a fixed entry list)
         $tk = $null; $er = $null
         $fa = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tk, [ref]$er)
         foreach ($s in @($fa.FindAll({ param($x) ($x -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or ($x -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) }, $true))) {
@@ -266,7 +267,8 @@ try {
         $fa = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$tk, [ref]$er)
         return @($fa.FindAll({ param($x) ($x -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or ($x -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) }, $true) | ForEach-Object { [string]$_.Value })
     }
-    $shipped = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "src\BayAgent") -Recurse -Filter *.ps1) + @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "tools") -Filter *.ps1)
+    # Move-BayInstall.ps1 is exempt: it names both roots and the old file and task names on purpose, and it is not in the package.
+    $shipped = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "src\BayAgent") -Recurse -Filter *.ps1 | Where-Object { $_.Name -ne "Move-BayInstall.ps1" }) + @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "tools") -Filter *.ps1)
     $allStrings = @(); foreach ($f in $shipped) { $allStrings += @(Get-CodeStrings $f.FullName | ForEach-Object { "{0}|{1}" -f $f.Name, $_ }) }
 
     $setupAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot "src\BayAgent\tools\Setup-BayPC.ps1"), [ref]$null, [ref]$null)

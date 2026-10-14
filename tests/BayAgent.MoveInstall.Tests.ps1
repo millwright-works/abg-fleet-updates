@@ -368,6 +368,7 @@ $Marker = "BMTPW" + [guid]::NewGuid().ToString("N").Substring(0, 12)
 $SecretMarker = "BMTSECRET" + [guid]::NewGuid().ToString("N").Substring(0, 12)
 $Me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $AgentVersion = "1.7.0"
+$OldFixtures = Join-Path $RepoRoot "tests\fixtures\old-bay"
 $TasksMadeHere = @()
 
 function Get-Dacl([string]$p) { if ([IO.Directory]::Exists($p)) { return (Get-BmDaclSddl $p) }; return "(absent)" }
@@ -401,8 +402,10 @@ function Set-FakeInstall {
   $acl = Get-Acl -LiteralPath $Old
   $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")))
   Set-Acl -LiteralPath $Old -AclObject $acl
-  # the real bootstrap scripts (they still name C:\AllBirdies: that is what is on a bay)
-  foreach ($b in @("ABG.AgentHost.ps1", "ABG.HostWatchdog.ps1", "ABG.LauncherShell.ps1")) { [IO.File]::Copy((Join-Path $RepoRoot "src\BayAgent\bootstrap\$b"), (Join-Path $ba "bootstrap\$b")) }
+  # the old bay's bootstrap scripts (they still name C:\AllBirdies: that is what is on a bay at the old root). They are
+  # committed under tests\fixtures\old-bay (copied from the 1.6.1 release, signature block removed), because the release
+  # under test renamed the repository's own files to AOC.*.
+  foreach ($b in @("ABG.AgentHost.ps1", "ABG.HostWatchdog.ps1", "ABG.LauncherShell.ps1")) { [IO.File]::Copy((Join-Path $OldFixtures "$b.fixture"), (Join-Path $ba "bootstrap\$b")) }
   foreach ($t in @("Update-BayAgent.ps1", "Update-SessionDisplay.ps1", "Update-PromosPack.ps1", "Watch-BayAgentUpdate.ps1")) { [IO.File]::Copy((Join-Path $RepoRoot "src\BayAgent\tools\$t"), (Join-Path $ba "tools\$t")) }
   $rel = Join-Path $ba "releases\$AgentVersion"
   [IO.File]::WriteAllText((Join-Path $rel "BayAgent.ps1"), "# stand-in for the installed agent $AgentVersion`r`n")
@@ -412,7 +415,7 @@ function Set-FakeInstall {
   Microsoft.PowerShell.Management\New-Item -ItemType Junction -Path (Join-Path $ba "current") -Value $rel | Out-Null
   [IO.File]::WriteAllText((Join-Path $ba "rollback\current\BayAgent.ps1"), "# the snapshot of the release before`r`n")
   # agent-config.json: the repository's own file, its placeholders filled, written as Day0 writes it (UTF-8 with a BOM)
-  $cfg = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\agent-config.json"))
+  $cfg = [IO.File]::ReadAllText((Join-Path $OldFixtures "agent-config.json.fixture"))   # the old bay's file: it names C:\AllBirdies
   $cfg = $cfg.Replace('C:\\AllBirdies', (ConvertTo-JsonPath $Old)).Replace('C:/AllBirdies', $Old.Replace('\', '/'))
   $cfg = $cfg.Replace('https://<your-org-placeholder>.crm.dynamics.com', 'https://builds-apps-dev.crm.dynamics.com').Replace('<tenant-guid-placeholder>', '11111111-1111-1111-1111-111111111111').Replace('<app-client-id-placeholder>', '22222222-2222-2222-2222-222222222222').Replace('<bay-guid-placeholder>', '33333333-3333-3333-3333-333333333333')
   [IO.File]::WriteAllText((Join-Path $ba "agent-config.json"), $cfg, (New-Object Text.UTF8Encoding($true)))
@@ -439,15 +442,12 @@ function Set-FakeInstall {
   [IO.File]::WriteAllText((Join-Path $sd "data\session-display.state.json"), '{}')
   [IO.File]::WriteAllText((Join-Path $sd "edge-profile\Default\Preferences"), '{"profile":{"name":"wall"}}')
   [IO.File]::WriteAllText((Join-Path $sd "edge-profile\Local State"), '{}')
-  # the release's new bootstrap files: the real scripts made root-derived (what FLEET-A ships), without their signature
+  # the release's new bootstrap files: the repository's own AOC.* scripts (root-derived, what the release ships), without
+  # any signature block (the tool signs them on the bay)
   [void][IO.Directory]::CreateDirectory($NewBoot); [void][IO.Directory]::CreateDirectory($Web)
   foreach ($b in @("AgentHost", "HostWatchdog", "LauncherShell")) {
-    $t = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\ABG.$b.ps1"))
+    $t = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\bootstrap\AOC.$b.ps1"))
     $t = ($t -split '# SIG # Begin signature block')[0]
-    $t = [regex]::Replace($t, '(?i)C:\\AllBirdies\\BayAgent', '<install root>')
-    $t = [regex]::Replace($t, '(?i)C:/AllBirdies', '<install root>')
-    $t = [regex]::Replace($t, '(?i)C:\\AllBirdies', '<root>')
-    $t = $t.Replace('"<install root>"', '(Split-Path -Parent $PSScriptRoot)')
     [IO.File]::WriteAllText((Join-Path $NewBoot "AOC.$b.ps1"), $t)
     [IO.File]::WriteAllText((Join-Path $Web "AOC.$b.ps1"), $t)
   }
@@ -578,7 +578,7 @@ try {
   }
   Assert-True ((Test-BmNamesRoot 'x "C:\AllBirdies\BayAgent" y' $o) -and -not (Test-BmNamesRoot 'C:\AllBirdiesX' $o) -and -not (Test-BmNamesRoot 'https://allbirdies.x' $o)) "Test-BmNamesRoot: a mention, not a longer name, not a web address"
 
-  $realCfg = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\BayAgent\agent-config.json"))
+  $realCfg = [IO.File]::ReadAllText((Join-Path $OldFixtures "agent-config.json.fixture"))   # the old bay's own file (it names the old root)
   $cc = Convert-BmConfigText -Text $realCfg -From $o -To $n -NameMap $BmBootstrapNameMap
   $changed = @($cc.Changes | ForEach-Object { $_.Path }) -join ","
   Assert-True ($changed -eq ".clientSecretDpapiPath,.sessionJsonPath,.sessionDisplay.url,.sessionDisplay.profileDir,.kiosk.shell") ("the repository's agent-config.json: exactly the five values that name the root change (" + $changed + ")")

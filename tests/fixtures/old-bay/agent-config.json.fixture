@@ -1,0 +1,56 @@
+{
+  "environmentUrl": "https://<your-org-placeholder>.crm.dynamics.com",
+  "tenantId": "<tenant-guid-placeholder>",
+  "clientId": "<app-client-id-placeholder>",
+  "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "clientCertThumbprint": "",
+  "bayId": "<bay-guid-placeholder>",
+  "pollSeconds": 3,
+  "heartbeatSeconds": 60,
+  "heartbeatEnabled": true,
+  "postSessionThanksSeconds": 120,
+  "postSessionThanksEnabled": true,
+  "knownGoodSeconds": 60,
+  "logLevel": "DEBUG",
+  "sessionJsonPath": "C:\\AllBirdies\\SessionDisplay\\data\\session.json",
+  "launcher": {
+    "path": "C:\\Uneekor\\Launcher\\UneekorLauncher.exe",
+    "args": "",
+    "processName": "UneekorLauncher",
+    "displayRole": "control",
+    "startOnPrep": false,
+    "startOnStart": true
+  },
+  "sessionDisplay": {
+    "mode": "kiosk",
+    "displayRole": "session",
+    "url": "file:///C:/AllBirdies/SessionDisplay/current/index.html",
+    "profileDir": "C:\\AllBirdies\\SessionDisplay\\edge-profile"
+  },
+  "displayRouting": {
+    "enabled": true,
+    "roles": {
+      "control": {
+        "selector": "DISPLAY1",
+        "comment": "43-inch touchscreen -- Uneekor Launcher and game windows"
+      },
+      "play": {
+        "selector": "DISPLAY2",
+        "comment": "Projector -- gameplay projection, game windows can move here"
+      },
+      "session": {
+        "selector": "DISPLAY3",
+        "comment": "43-inch monitor -- SessionDisplay, locked, always visible"
+      }
+    }
+  },
+  "kiosk": {
+    "shell": "C:\\AllBirdies\\BayAgent\\bootstrap\\ABG.LauncherShell.ps1",
+    "allowedProcesses": ["UneekorLauncher"],
+    "comment": "allowedProcesses: populate with child exe names after Uneekor installation"
+  },
+  "facility": {
+    "enabled": false,
+    "simulated": true
+  }
+}

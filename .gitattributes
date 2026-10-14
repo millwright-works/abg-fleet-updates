@@ -28,3 +28,6 @@ src/BayAgent/*.json text eol=crlf
 
 # The kiosk policy inside the package (1.4.0, A0.363): the same reason, and the build's CRLF gate now covers .json.
 src/BayAgent/kiosk/*.json text eol=crlf
+
+# The old bay's files used by the move suite (tests/fixtures/old-bay): byte-exact, no line-ending conversion.
+tests/fixtures/old-bay/* -text
