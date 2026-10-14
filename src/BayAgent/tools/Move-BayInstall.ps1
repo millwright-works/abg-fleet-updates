@@ -125,35 +125,202 @@ function Get-BmFullPath([string]$Path) {
 # that writes, appends, deletes, changes permissions or takes ownership (a rule that only inherits to children is skipped).
 $BmTrustedSids = @("S-1-5-32-544", "S-1-5-18", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
 $script:BmExtraTrusted = @(@($JournalExtraTrustedSid) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-function Get-BmUntrustedWriters([string]$Path) {
+# What counts as "a way to change what is there". Judged on the access rule's rights, for ANY principal that is not
+# trusted (no list of names: a group, Everyone, Authenticated Users, a user, a rule that came down from a parent).
+#   Full   - the folder or file itself and what it will hold: write, append, create, delete, delete a child, write
+#            attributes or extended attributes, change the rules, take ownership, and the generic write/all bits
+#   Rename - a folder ABOVE one we use: whoever can delete it, delete a child of it, change its rules or take it can swap
+#            what is below it for a junction or a copy; being able to ADD a new child (C:\ lets any user) cannot
+$BmMaskFull = 0x10000000 -bor 0x40000000 -bor 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288
+$BmMaskRename = 0x10000000 -bor 0x40000000 -bor 64 -bor 65536 -bor 262144 -bor 524288
+# Win32 calls, so ONE handle is opened per folder or file and the link test, the real path, the owner and the access rules
+# are all read from that same handle (not from the path again). The handle is opened without following a link.
+$BmNativeSource = @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class BmNative {
+  [StructLayout(LayoutKind.Sequential)]
+  struct InfoBlock { public uint Attributes; public uint C1, C2, A1, A2, W1, W2, Serial, SizeHi, SizeLo, Links, IdxHi, IdxLo; }
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool GetFileInformationByHandle(SafeFileHandle h, out InfoBlock info);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder buf, uint len, uint flags);
+  [DllImport("advapi32.dll", SetLastError = true)]
+  static extern uint GetSecurityInfo(SafeFileHandle h, int type, uint info, IntPtr o, IntPtr g, IntPtr d, IntPtr s, out IntPtr sd);
+  [DllImport("advapi32.dll")]
+  static extern uint GetSecurityDescriptorLength(IntPtr sd);
+  [DllImport("kernel32.dll")]
+  static extern IntPtr LocalFree(IntPtr p);
+  public static SafeFileHandle Open(string path, bool directory) {
+    // READ_CONTROL | FILE_READ_ATTRIBUTES (| GENERIC_READ for a file); BACKUP_SEMANTICS | OPEN_REPARSE_POINT: a link is opened itself
+    uint access = 0x20000u | 0x80u | (directory ? 0u : 0x80000000u);
+    uint share = directory ? 7u : 1u;
+    SafeFileHandle h = CreateFileW(path, access, share, IntPtr.Zero, 3u, 0x02000000u | 0x00200000u, IntPtr.Zero);
+    if (h.IsInvalid) { throw new IOException("cannot open " + path + " (Win32 error " + Marshal.GetLastWin32Error() + ")"); }
+    return h;
+  }
+  public static uint Attributes(SafeFileHandle h) {
+    InfoBlock i;
+    if (!GetFileInformationByHandle(h, out i)) { throw new IOException("cannot read the attributes (Win32 error " + Marshal.GetLastWin32Error() + ")"); }
+    return i.Attributes;
+  }
+  public static string FinalPath(SafeFileHandle h) {
+    StringBuilder b = new StringBuilder(1024);
+    uint n = GetFinalPathNameByHandleW(h, b, (uint)b.Capacity, 0u);
+    if (n >= b.Capacity) { b = new StringBuilder((int)n + 2); n = GetFinalPathNameByHandleW(h, b, (uint)b.Capacity, 0u); }
+    if (n == 0) { throw new IOException("cannot read the real path (Win32 error " + Marshal.GetLastWin32Error() + ")"); }
+    string s = b.ToString();
+    if (s.StartsWith("\\\\?\\UNC\\")) { return "\\\\" + s.Substring(8); }
+    if (s.StartsWith("\\\\?\\")) { return s.Substring(4); }
+    return s;
+  }
+  public static RawSecurityDescriptor Security(SafeFileHandle h) {
+    IntPtr sd;
+    uint rc = GetSecurityInfo(h, 1, 1u | 4u, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sd);
+    if (rc != 0) { throw new IOException("cannot read the owner and access rules (Win32 error " + rc + ")"); }
+    try {
+      byte[] bytes = new byte[GetSecurityDescriptorLength(sd)];
+      Marshal.Copy(sd, bytes, 0, bytes.Length);
+      return new RawSecurityDescriptor(bytes, 0);
+    } finally { LocalFree(sd); }
+  }
+}
+'@
+function Initialize-BmNative {
+  if (-not ('BmNative' -as [type])) { Add-Type -TypeDefinition $BmNativeSource -Language CSharp }
+}
+function Get-BmCanonPath([string]$Path) {
+  $f = [IO.Path]::GetFullPath($Path)
+  $root = [IO.Path]::GetPathRoot($f)
+  if ($f.Length -gt $root.Length) { $f = $f.TrimEnd('\') }
+  return $f
+}
+function Get-BmNearestExisting([string]$Path) {
+  # The path itself if it is a folder, else the nearest folder above it that is.
+  $p = Get-BmCanonPath $Path
+  while (-not [string]::IsNullOrEmpty($p) -and -not [IO.Directory]::Exists($p)) { $p = [IO.Path]::GetDirectoryName($p) }
+  return $p
+}
+function Get-BmSdProblems($Sd, [string]$Mode) {
+  # $Sd is a RawSecurityDescriptor read from an open handle. Mode: Full, Rename (see the masks above), or Owner (owner only).
+  # Fails closed: a deny rule does not excuse an allow rule (who is in which group is not known here), a rule of a kind that
+  # cannot be judged is a problem, and a missing access list (everyone may do anything) is a problem.
   $why = @()
-  $BmTrustedSids = @($BmTrustedSids) + @($script:BmExtraTrusted)
-  $acl = Get-Acl -LiteralPath $Path
-  $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-  if ($BmTrustedSids -notcontains $owner) { $why += "owned by $owner" }
-  $mask = 0x10000000 -bor 0x40000000 -bor 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288
-  foreach ($r in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
-    if ([string]$r.AccessControlType -ne "Allow") { continue }
-    if (([int]$r.PropagationFlags -band 2) -ne 0) { continue }
-    $sid = $r.IdentityReference.Value
-    if ($BmTrustedSids -contains $sid -or $sid -eq "S-1-3-0") { continue }
-    if (([int]$r.FileSystemRights -band $mask) -ne 0) { $why += "$sid may write" }
+  $trusted = @($BmTrustedSids) + @($script:BmExtraTrusted)
+  $owner = $null
+  if ($null -ne $Sd.Owner) { $owner = $Sd.Owner.Value }
+  if ($null -eq $owner) { $why += "has no owner" }
+  elseif ($trusted -notcontains $owner) { $why += "owned by $owner" }
+  if ($Mode -eq "Owner") { return $why }
+  $dacl = $Sd.DiscretionaryAcl
+  if ($null -eq $dacl) { $why += "has no access list, so everyone may write"; return $why }
+  $mask = $(if ($Mode -eq "Full") { $BmMaskFull } else { $BmMaskRename })
+  foreach ($ace in $dacl) {
+    if ($ace -isnot [System.Security.AccessControl.CommonAce]) { $why += ("has an access rule of kind {0}, which this tool cannot judge" -f $ace.GetType().Name); continue }
+    if ([string]$ace.AceQualifier -ne "AccessAllowed") { continue }
+    $sid = $ace.SecurityIdentifier.Value
+    if ($trusted -contains $sid) { continue }
+    $flags = [int]$ace.AceFlags
+    if (($flags -band 8) -ne 0) {
+      # inherit-only: it does not apply to this object. In Full mode it still reaches what this object will HOLD (the
+      # files made in it), so it counts, except CREATOR OWNER / CREATOR GROUP, which only name whoever made the child
+      # (and only trusted principals can make one here, or the rules above would already have failed).
+      if ($Mode -ne "Full" -or ($flags -band 3) -eq 0) { continue }
+      if ($sid -eq "S-1-3-0" -or $sid -eq "S-1-3-1") { continue }
+    }
+    if (([int]$ace.AccessMask -band $mask) -ne 0) { $why += ("{0} may change it (rights 0x{1:X})" -f $sid, ([int]$ace.AccessMask -band $mask)) }
   }
   return $why
 }
-function Get-BmUntrustedTree([string]$Path, [string]$StopAt) {
-  # The folder and each ancestor, up to (not including) $StopAt and the volume root.
+function Get-BmOneFolderProblems([string]$Path, [string]$Mode) {
+  # One folder, one handle: not a link, really at this path, and (Mode Full/Rename/Owner) owner and rules from the same handle.
+  # Mode Link judges only the first two.
+  Initialize-BmNative
+  $h = $null
+  try {
+    try { $h = [BmNative]::Open($Path, $true) } catch { return @("{0} (cannot be opened to check it: {1})" -f $Path, $_.Exception.Message) }
+    $why = @()
+    $attr = [BmNative]::Attributes($h)
+    if (($attr -band 0x400) -ne 0) { $why += "is a link (a junction or symbolic link); this tool never follows one" }
+    elseif (($attr -band 0x10) -eq 0) { $why += "is not a folder" }
+    $final = [BmNative]::FinalPath($h)
+    if ($final -ine $Path) { $why += "is reached through a link or an alias; the folder it really is: $final" }
+    if ($Mode -ne "Link") {
+      try { $why += @(Get-BmSdProblems ([BmNative]::Security($h)) $Mode) } catch { $why += ("its owner and access rules cannot be read: " + $_.Exception.Message) }
+    }
+    return @($why | ForEach-Object { "{0} ({1})" -f $Path, $_ })
+  } finally { if ($null -ne $h) { $h.Dispose() } }
+}
+function Get-BmFolderProblems([string]$Path, [string]$StopAt, [string]$LeafMode, [string]$AncestorMode) {
+  # The folder and every folder above it, up to the volume root. The folder is judged in $LeafMode; each folder above it in
+  # $AncestorMode, down to (not including) $StopAt; $StopAt and everything above it only for being a link. Folders that are
+  # not yet there are the caller's to skip (pass the nearest one that exists).
   $out = @()
-  $p = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-  $stop = $(if ([string]::IsNullOrWhiteSpace($StopAt)) { "" } else { [IO.Path]::GetFullPath($StopAt).TrimEnd('\') })
+  if ([string]::IsNullOrEmpty($Path)) { return $out }
+  $p = Get-BmCanonPath $Path
+  $stop = $(if ([string]::IsNullOrWhiteSpace($StopAt)) { "" } else { Get-BmCanonPath $StopAt })
+  if ([IO.Path]::GetPathRoot($p).StartsWith("\\")) { return @("$p (is on a network path; a bay's folders are local)") }
+  $isLeaf = $true
+  $pastStop = $false
   while (-not [string]::IsNullOrEmpty($p)) {
-    $parent = [IO.Path]::GetDirectoryName($p)
-    if ([string]::IsNullOrEmpty($parent)) { break }
-    if ($stop -ne "" -and $p -ieq $stop) { break }
-    if ([IO.Directory]::Exists($p)) { foreach ($w in @(Get-BmUntrustedWriters $p)) { $out += ("{0} ({1})" -f $p, $w) } }
-    $p = $parent
+    if ($stop -ne "" -and $p -ieq $stop) { $pastStop = $true }
+    $mode = $(if ($pastStop) { "Link" } elseif ($isLeaf) { $LeafMode } else { $AncestorMode })
+    $out += @(Get-BmOneFolderProblems $p $mode)
+    $isLeaf = $false
+    $p = [IO.Path]::GetDirectoryName($p)
   }
   return $out
+}
+function Get-BmUntrustedTree([string]$Path, [string]$StopAt) {
+  # The journal folder and each ancestor below $StopAt: all judged Full.
+  return @(Get-BmFolderProblems $Path $StopAt "Full" "Full")
+}
+function Get-BmJournalTrustStop {
+  if ([string]::IsNullOrWhiteSpace($JournalTrustStop)) { return [string]$env:ProgramData }
+  return $JournalTrustStop
+}
+function Get-BmJournalProblems([string]$Root, [string]$StopAt) {
+  # Before the journal folder is made: the nearest folder that exists (the folder itself when it is there).
+  $e = Get-BmNearestExisting $Root
+  if ([string]::IsNullOrEmpty($e)) { return @() }
+  return @(Get-BmFolderProblems $e $StopAt "Full" "Full")
+}
+function Read-BmTrustedBytes([string]$Path, [bool]$CheckAcl = $true) {
+  # The bytes of a file, read once from a handle opened once: the same handle says it is not a link, is really at this path,
+  # and (CheckAcl) is owned and writable by trusted principals only. Share mode refuses a writer while it is open.
+  Initialize-BmNative
+  $full = [IO.Path]::GetFullPath($Path)
+  $h = [BmNative]::Open($full, $false)
+  $fs = $null
+  try {
+    $attr = [BmNative]::Attributes($h)
+    if (($attr -band 0x400) -ne 0) { throw "$full is a link; this tool never follows one" }
+    if (($attr -band 0x10) -ne 0) { throw "$full is a folder, not a file" }
+    $final = [BmNative]::FinalPath($h)
+    if ($final -ine $full) { throw "$full is reached through a link or an alias ($final)" }
+    if ($CheckAcl) {
+      $w = @(Get-BmSdProblems ([BmNative]::Security($h)) "Full")
+      if ($w.Count -gt 0) { throw ("$full cannot be trusted: " + ($w -join "; ")) }
+    }
+    $fs = New-Object IO.FileStream($h, [IO.FileAccess]::Read)
+    $ms = New-Object IO.MemoryStream
+    $fs.CopyTo($ms)
+    return , $ms.ToArray()
+  } finally {
+    if ($null -ne $fs) { $fs.Dispose() }
+    $h.Dispose()
+  }
+}
+function Read-BmTrustedText([string]$Path) {
+  $b = [byte[]](Read-BmTrustedBytes $Path $true)
+  $sr = New-Object IO.StreamReader((New-Object IO.MemoryStream(, $b)), [Text.Encoding]::UTF8, $true)
+  try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
 }
 function New-BmAdminDirs([string]$Path) {
   # Creates the missing folders of $Path, each born with an admin-only, non-inheriting rule set (no window in which it
@@ -625,8 +792,16 @@ function New-BmPlan {
 
   # -- the folder the install moves INTO: if it already exists it must be admin-only (a folder a standard user made, or can
   #    write to, would let that user replace what the agent runs as it moves in)
+  #    The whole path is judged on handles opened once each: a link anywhere on it, an owner or a grant that lets a
+  #    non-admin change what is there, at the folder or above it. The same check runs again just before the move.
   if ([IO.Directory]::Exists($To)) {
-    foreach ($w in @(Get-BmUntrustedWriters $To)) { Refuse "$To already exists and is not admin-only ($w); delete it (it should be empty) or fix its owner and access rules, then run again" }
+    foreach ($w in @(Get-BmFolderProblems $To $script:BmRootStop "Full" "Rename")) { Refuse "$To already exists and is not admin-only ($w); delete it (it should be empty) or fix its owner and access rules, then run again" }
+  } else {
+    foreach ($w in @(Get-BmFolderProblems (Get-BmNearestExisting $To) $script:BmRootStop "Rename" "Rename")) { Refuse "$To does not exist, and the folder it would be made in is not safe ($w); fix its owner and access rules, then run again" }
+  }
+  # -- the folder the new bootstrap files are read from: they are signed with the bay's certificate and then run as SYSTEM
+  if ($Direction -ne "Back" -and -not [string]::IsNullOrWhiteSpace($BootstrapSource) -and [IO.Directory]::Exists($BootstrapSource)) {
+    foreach ($w in @(Get-BmFolderProblems $BootstrapSource $script:BmRootStop "Full" "Rename")) { Refuse "-BootstrapSource is not admin-only ($w); the files in it are signed with the bay's certificate, so put them in a folder only administrators can write and name that" }
   }
 
   # -- the folders
@@ -730,7 +905,7 @@ function New-BmPlan {
     if ($Direction -eq "Back" -and $null -ne $JournalIn) {
       $jf = Join-Path $JournalIn ("task-" + ($newName -replace '[^A-Za-z0-9]', '_') + ".xml")
       if (-not [IO.File]::Exists($jf)) { Refuse "the journal has no saved definition for '$newName' ($jf)" ; continue }
-      $xml = [IO.File]::ReadAllText($jf)
+      try { $xml = Read-BmTrustedText $jf } catch { Refuse ("the journal's saved definition for '$newName' cannot be trusted: " + $_.Exception.Message) ; continue }
       if ($null -eq (Get-BmTask $oldName)) { Refuse "the task '$oldName' is not registered; the move it would undo is not in place" ; continue }
     } else {
       if ($null -eq (Get-BmTask $oldName)) { Refuse "the task '$oldName' is not registered; a set-up bay has it" ; continue }
@@ -820,7 +995,10 @@ function Invoke-BmStage($P, [string]$SourceDir, [string]$BaseUrl, [string]$MustN
       if (-not [string]::IsNullOrWhiteSpace($SourceDir)) {
         $src = Join-Path $SourceDir $b.ToName
         if (-not [IO.File]::Exists($src)) { $why += "$($b.ToName): not in $SourceDir"; continue }
-        [IO.File]::Copy($src, $dst, $true)
+        # one read, from a handle that was checked: the bytes judged are the bytes staged (a Move source must be admin-only
+        # files; Back's files come from the journal and must carry the bay's own signature below)
+        [IO.File]::WriteAllBytes($dst, [byte[]](Read-BmTrustedBytes $src ($P.Direction -ne "Back")))
+        [IO.File]::SetLastWriteTimeUtc($dst, [IO.File]::GetLastWriteTimeUtc($src))   # the saved file keeps the time it had
       } elseif (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
         if ($BaseUrl -notmatch '^https://') { $why += "-BootstrapBaseUrl must be an https address"; continue }
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -829,7 +1007,9 @@ function Invoke-BmStage($P, [string]$SourceDir, [string]$BaseUrl, [string]$MustN
       } else { $why += "no -BootstrapSource or -BootstrapBaseUrl was given for the new bootstrap files"; break }
       $t = @(Test-BmScriptText $dst $MustNotName)
       if ($t.Count -gt 0) { $why += ("{0}: {1}" -f $b.ToName, ($t -join "; ")); continue }
-      if ((Test-BmSignedBy $dst $P.SignerThumbprint) -ne "") {
+      $sigNow = Test-BmSignedBy $dst $P.SignerThumbprint
+      if ($sigNow -ne "") {
+        if ($P.Direction -eq "Back") { $why += ("{0}: not signed by the bay's signer ({1}); Back puts back only files that already carry that signature and never signs one" -f $b.ToName, $sigNow); continue }
         Set-AuthenticodeSignature -FilePath $dst -Certificate $P.SigningCert -TimeStampServer $TimeStampServer | Out-Null
         $s = Test-BmSignedBy $dst $P.SignerThumbprint
         if ($s -ne "") { $why += "$($b.ToName): after signing, $s" ; continue }
@@ -972,7 +1152,8 @@ function Invoke-BmCutover($P, [string]$JDir) {
   Write-BmStep "3. move the folders"
   $before = @{}
   foreach ($f in @($P.Folders)) { $before[$f.Name] = @(Get-BmTreeManifest $f.From) }
-  if (-not [IO.Directory]::Exists($to)) {
+  $toExisted = [IO.Directory]::Exists($to)
+  if (-not $toExisted) {
     [void][IO.Directory]::CreateDirectory($to)
     if ([IO.Directory]::Exists($from)) {
       $acl = Get-Acl -LiteralPath $to
@@ -982,7 +1163,14 @@ function Invoke-BmCutover($P, [string]$JDir) {
     Add-BmUndo @{ kind = "remove-empty-dir"; path = $to; label = "$to removed (it was empty)" }
     Write-BmLine "  created $to with the access rules of $from"
   }
+  # The plan was made minutes ago (and a person typed an answer since): judge the new root again, on handles, right now.
+  # A folder that was already there must still be admin-only; one made just now must be ours (a standard user may have
+  # made it between the plan and here, and CreateDirectory does not fail on a folder that exists).
+  $toNow = @(Get-BmFolderProblems $to $script:BmRootStop $(if ($toExisted) { "Full" } else { "Owner" }) "Rename")
+  if ($toNow.Count -gt 0) { throw ("{0} is not safe to move into any more: {1}" -f $to, ($toNow -join "; ")) }
   foreach ($f in @($P.Folders)) {
+    $lnk = @(Get-BmFolderProblems $f.From $from "Link" "Link")
+    if ($lnk.Count -gt 0) { throw ("{0} changed since the plan: {1}" -f $f.From, ($lnk -join "; ")) }
     $ok = $false; $lastErr = ""
     for ($k = 0; $k -lt 5 -and -not $ok; $k++) {
       try { [IO.Directory]::Move($f.From, $f.To); $ok = $true } catch { $lastErr = $_.Exception.Message; Start-Sleep -Seconds 2 }
@@ -1166,6 +1354,8 @@ $Folders = @($Folders | ForEach-Object { ([string]$_).Split(',') } | ForEach-Obj
 if ([string]::IsNullOrWhiteSpace($JournalRoot)) { $JournalRoot = Join-Path $env:ProgramData "AceOfClubs\BayMove" }
 $OldRoot = Get-BmFullPath $OldRoot
 $NewRoot = Get-BmFullPath $NewRoot
+# Where the walk up from a root stops: nowhere on a bay (the volume root is judged too); a suite names its scratch folder.
+$script:BmRootStop = [string]$JournalTrustStop
 $script:BmKioskPw = $null
 
 Write-BmLine ("Move-BayInstall {0}  mode {1}  old root {2}  new root {3}" -f $BmToolVersion, $Mode, $OldRoot, $NewRoot) "Cyan"
@@ -1185,10 +1375,13 @@ $jIn = $null
 if ($Mode -eq "Back") {
   $jIn = $(if (-not [string]::IsNullOrWhiteSpace($Journal)) { $Journal } else { Get-BmLatestJournal $JournalRoot })
   if ($null -eq $jIn -or -not [IO.File]::Exists((Join-Path $jIn "journal.json"))) { Write-BmLine "REFUSED: no journal of a completed Move was found under $JournalRoot; name one with -Journal" "Red"; exit 1 }
-  $jTrustStop = $(if ([string]::IsNullOrWhiteSpace($JournalTrustStop)) { $env:ProgramData } else { $JournalTrustStop })
+  $jTrustStop = Get-BmJournalTrustStop
   $jUntrusted = @(Get-BmUntrustedTree $jIn $jTrustStop)
   if ($jUntrusted.Count -gt 0) { Write-BmLine ("REFUSED: the journal is not in an admin-only folder, so it cannot be trusted (it names files that are put back as scripts that run as SYSTEM): {0}" -f ($jUntrusted -join "; ")) "Red"; exit 1 }
-  $jj = [IO.File]::ReadAllText((Join-Path $jIn "journal.json")) | ConvertFrom-Json
+  # The file is read once, from a handle that was checked (not a link, an admin-only owner and rules); what is parsed is what was checked.
+  $jText = $null
+  try { $jText = Read-BmTrustedText (Join-Path $jIn "journal.json") } catch { Write-BmLine ("REFUSED: the journal file cannot be trusted: " + $_.Exception.Message) "Red"; exit 1 }
+  $jj = $jText | ConvertFrom-Json
   if ([string]$jj.mode -ne "Move" -or [string]$jj.state -ne "moved") { Write-BmLine "REFUSED: $jIn is not the journal of a completed Move" "Red"; exit 1 }
   if ((Get-BmFullPath ([string]$jj.from)) -ine $OldRoot -or (Get-BmFullPath ([string]$jj.to)) -ine $NewRoot) { Write-BmLine "REFUSED: that journal moved $($jj.from) to $($jj.to), not $OldRoot to $NewRoot" "Red"; exit 1 }
 }
@@ -1203,7 +1396,10 @@ $stageDir = $null
 if ($Mode -ne "Plan") {
   if ((Test-BmUnder $JournalRoot $OldRoot) -or (Test-BmUnder $JournalRoot $NewRoot)) { Write-BmLine "REFUSED: the journal folder may not be inside a root this tool moves" "Red"; exit 4 }
   # The journal folder is created admin-only; one that already exists must already be (see Get-BmUntrustedWriters).
-  $jTrustStop = $(if ([string]::IsNullOrWhiteSpace($JournalTrustStop)) { $env:ProgramData } else { $JournalTrustStop })
+  $jTrustStop = Get-BmJournalTrustStop
+  # Judged BEFORE anything is made (the nearest folder that exists), then again once it is made.
+  $jPre = @(Get-BmJournalProblems $JournalRoot $jTrustStop)
+  if ($jPre.Count -gt 0) { Write-BmLine ("REFUSED: the journal folder is not admin-only ({0}); nothing was changed. Delete it, fix its owner and access rules, or name another with -JournalRoot" -f ($jPre -join "; ")) "Red"; exit 1 }
   New-BmAdminDirs $JournalRoot
   $jUntrusted = @(Get-BmUntrustedTree $JournalRoot $jTrustStop)
   if ($jUntrusted.Count -gt 0) { Write-BmLine ("REFUSED: the journal folder is not admin-only ({0}); nothing was changed. Delete it, fix its owner and access rules, or name another with -JournalRoot" -f ($jUntrusted -join "; ")) "Red"; exit 1 }
@@ -1217,6 +1413,10 @@ if ($Mode -ne "Plan") {
 } else { $stageDir = Join-Path $env:TEMP "bm-plan-not-written" }
 
 $plan = New-BmPlan -Direction $(if ($Mode -eq "Back") { "Back" } else { "Move" }) -From $from -To $to -TaskMap $taskMap -FileMap $fileMap -StagedDir $stageDir -JournalIn $jIn
+if ($Mode -eq "Plan") {
+  # Plan writes nothing, but it must say what Move would say: the same journal-folder judgment.
+  foreach ($w in @(Get-BmJournalProblems $JournalRoot (Get-BmJournalTrustStop))) { $plan.Ok = $false; $plan.Refusals += ("the journal folder is not admin-only ({0}); Move would refuse" -f $w) }
+}
 Show-BmPlan $plan
 
 if ($Mode -eq "Plan") {
