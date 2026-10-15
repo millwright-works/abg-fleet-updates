@@ -138,7 +138,25 @@ function global:schtasks {
   $a = @($args | ForEach-Object { "$_" }); $tn = ''
   for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -eq '/TN' -and ($i + 1) -lt $a.Count) { $tn = $a[$i + 1] } }
   $safe = @($a | ForEach-Object { if ($_ -eq $global:Srh.Marker) { '<THE TYPED PASSWORD, ON THE COMMAND LINE>' } else { $_ } })
-  SrhRec ("SCHTASKS " + ($safe -join ' ')); $global:Srh.Tasks[$tn.TrimStart('\')] = $true; "SUCCESS (recorded only)"
+  SrhRec ("SCHTASKS " + ($safe -join ' '))
+  # A task whose name matches the model's "schtasksFailMatch" is refused the way Task Scheduler refuses: exit 1 and an
+  # ERROR line (here as the output, which is where the script under test must find the text).
+  if ($global:Srh.SchtasksFailMatch -and $tn -match $global:Srh.SchtasksFailMatch) { $global:LASTEXITCODE = 1; return "ERROR: Access is denied. (injected)" }
+  $global:LASTEXITCODE = 0; $global:Srh.Tasks[$tn.TrimStart('\')] = $true; "SUCCESS (recorded only)"
+}
+# The ScheduledTasks cmdlets Day0 uses for the agent task. Each New-* returns a tagged object; Register-ScheduledTask records
+# the whole definition on one line so a test can assert the principal, the trigger and the limits, and no password.
+function global:New-ScheduledTaskAction { [CmdletBinding()] param([string]$Execute, [string]$Argument) return [pscustomobject]@{ Kind = 'action'; Execute = $Execute; Argument = $Argument } }
+function global:New-ScheduledTaskTrigger { [CmdletBinding()] param([switch]$AtLogOn, [string]$User) return [pscustomobject]@{ Kind = 'trigger'; AtLogOn = [bool]$AtLogOn; User = $User } }
+function global:New-ScheduledTaskPrincipal { [CmdletBinding()] param([string]$UserId, [string]$LogonType, [string]$RunLevel) return [pscustomobject]@{ Kind = 'principal'; UserId = $UserId; LogonType = $LogonType; RunLevel = $RunLevel } }
+function global:New-ScheduledTaskSettingsSet {
+  [CmdletBinding()] param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [string]$MultipleInstances, $ExecutionTimeLimit)
+  return [pscustomobject]@{ Kind = 'settings'; Battery = ([bool]$AllowStartIfOnBatteries -and [bool]$DontStopIfGoingOnBatteries); MultipleInstances = $MultipleInstances; LimitSeconds = $(if ($null -eq $ExecutionTimeLimit) { 'default' } else { [string][int]$ExecutionTimeLimit.TotalSeconds }) }
+}
+function global:Register-ScheduledTask {
+  [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
+  SrhRec ("REGTASK  {0}{1} execute={2} args=[{3}] atLogOn={4} triggerUser=[{5}] principal={6} logonType={7} runLevel={8} multiple={9} limitSeconds={10} battery={11} password=none" -f $TaskPath, $TaskName, $Action.Execute, $Action.Argument, $Trigger.AtLogOn, $Trigger.User, $Principal.UserId, $Principal.LogonType, $Principal.RunLevel, $Settings.MultipleInstances, $Settings.LimitSeconds, $Settings.Battery)
+  $global:Srh.Tasks[$TaskName.TrimStart('\')] = $true
 }
 function global:Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
@@ -164,7 +182,7 @@ function global:New-LocalUser {
 function global:Add-LocalGroupMember { [CmdletBinding()] param([string]$Group, [string]$Member) SrhRec "USER     $Member added to group $Group" }
 function global:Get-CimInstance { [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName) return [pscustomobject]@{ Caption = 'Microsoft Windows 11 Pro' } }
 function global:Test-NetConnection { [CmdletBinding()] param([string]$ComputerName, [int]$Port) return [pscustomobject]@{ TcpTestSucceeded = $true } }
-function global:powercfg { SrhRec ("POWERCFG " + (@($args) -join ' ')) }
+function global:powercfg { SrhRec ("POWERCFG " + (@($args) -join ' ')); $global:LASTEXITCODE = [int]$global:Srh.PowercfgExit }
 function global:shutdown { SrhRec ("SHUTDOWN " + (@($args) -join ' ')) }
 function global:Enable-NetFirewallRule { [CmdletBinding()] param([string]$DisplayGroup) SrhRec "FIREWALL enable group '$DisplayGroup'" }
 function global:Disable-NetFirewallRule { [CmdletBinding()] param([string]$DisplayGroup) SrhRec "FIREWALL disable group '$DisplayGroup'" }
@@ -183,10 +201,11 @@ function global:Set-ExecutionPolicy {
 
 $SrhStubbed = @('Test-Path', 'Get-ItemProperty', 'Set-ItemProperty', 'New-Item', 'Set-Content', 'Remove-Item', 'Invoke-WebRequest', 'Invoke-RestMethod', 'Get-ChildItem',
   'New-SelfSignedCertificate', 'Export-Certificate', 'Import-Certificate', 'certutil', 'icacls', 'Set-AuthenticodeSignature', 'Get-AuthenticodeSignature', 'schtasks',
+  'New-ScheduledTaskAction', 'New-ScheduledTaskTrigger', 'New-ScheduledTaskPrincipal', 'New-ScheduledTaskSettingsSet', 'Register-ScheduledTask',
   'Get-ScheduledTask', 'Read-Host', 'Rename-Computer', 'Get-LocalUser', 'New-LocalUser', 'Add-LocalGroupMember', 'Get-CimInstance', 'Test-NetConnection', 'powercfg',
   'shutdown', 'Enable-NetFirewallRule', 'Disable-NetFirewallRule', 'Get-ExecutionPolicy', 'Set-ExecutionPolicy')
 $SrhReadOnly = @('Add-Type', 'ForEach-Object', 'Format-Table', 'Get-FileHash', 'Get-Item', 'Join-Path', 'New-Object', 'Out-Null', 'Out-String', 'Set-StrictMode', 'Split-Path',
-  'Where-Object', 'Write-Error', 'Write-Host', 'ConvertTo-Json', 'Sort-Object')
+  'Where-Object', 'New-TimeSpan', 'Write-Error', 'Write-Host', 'ConvertTo-Json', 'Sort-Object')
 
 $SrhResult = [ordered]@{ census = 'ok'; harnessError = ''; runs = @() }
 function Write-SrhResult { [IO.File]::WriteAllText($ResultFile, ($SrhResult | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false))) }
@@ -219,7 +238,7 @@ try {
   foreach ($run in @($plan.runs)) {
     # ---- the modeled facts this run starts from
     $model = $run.model
-    $global:Srh.PolicyThrows = $true; $global:Srh.PolicyTakes = $true; $global:Srh.TimestampOk = $true; $global:Srh.FailDownloadMatch = ''; $global:Srh.RebootAnswer = 'n'; $global:Srh.RegStuck = @()
+    $global:Srh.PolicyThrows = $true; $global:Srh.PolicyTakes = $true; $global:Srh.TimestampOk = $true; $global:Srh.FailDownloadMatch = ''; $global:Srh.RebootAnswer = 'n'; $global:Srh.RegStuck = @(); $global:Srh.SchtasksFailMatch = ''; $global:Srh.PowercfgExit = 0
     if ($null -ne $model) {
       foreach ($p in $model.PSObject.Properties) {
         switch ($p.Name) {
@@ -230,6 +249,8 @@ try {
           'rebootAnswer'      { $global:Srh.RebootAnswer = [string]$p.Value }
           'reg'               { foreach ($r in $p.Value.PSObject.Properties) { $global:Srh.Reg[$r.Name.ToLower()] = $r.Value } }
           'regRemove'         { foreach ($k in @($p.Value)) { $global:Srh.Reg.Remove(([string]$k).ToLower()) } }
+          'schtasksFailMatch' { $global:Srh.SchtasksFailMatch = [string]$p.Value }
+          'powercfgExit'      { $global:Srh.PowercfgExit = [int]$p.Value }
           'regStuck'          { $global:Srh.RegStuck = @($p.Value | ForEach-Object { ([string]$_).ToLower() }) }
           'placeAgent'        { if ([bool]$p.Value) { $ap = Join-Path $allRoot 'BayAgent\current\BayAgent.ps1'; Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ap) | Out-Null; [IO.File]::WriteAllText($ap, '# stand-in for the installed agent') } }
           'placeSecretFile'   { if ([bool]$p.Value) { $sp = Join-Path $allRoot 'BayAgent\secrets\clientsecret.dpapi'; Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sp) | Out-Null; [IO.File]::WriteAllText($sp, 'stand-in, not a secret') } }

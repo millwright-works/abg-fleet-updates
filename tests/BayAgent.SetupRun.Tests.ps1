@@ -434,6 +434,41 @@ try {
     $p2 = Get-PlanRun $pol2 0
     Assert-True ($p2.ended -eq "ran to its last line" -and $p2.policy -eq "AllSigned" -and (Test-Row $p2 "Execution policy (AllSigned)" "PASS")) "where Set-ExecutionPolicy raises no error the result is the same: AllSigned, PASS"
 
+    # =========================================================================================== Bay 1 defects, 2026-10-15
+    Section "Agent task: interactive only, no stored password, no 72-hour end (Bay 1: the stored-password task could never start)"
+    $reg1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^REGTASK  ' })
+    Assert-True ($reg1.Count -eq 1 -and $reg1[0] -match '^REGTASK  \\ABG Bay Agent ') "the agent task is registered once through Register-ScheduledTask"
+    $reg1Line = $(if ($reg1.Count -ge 1) { $reg1[0] } else { "" })
+    Assert-True ($reg1Line -match 'logonType=Interactive ' -and $reg1Line -match 'runLevel=Limited ' -and $reg1Line -match 'password=none') "...as LogonType Interactive, RunLevel Limited, no stored password"
+    Assert-True ($reg1Line -match 'atLogOn=True triggerUser=\[\]') "...with an any-user logon trigger"
+    Assert-True ($reg1Line -match 'multiple=IgnoreNew ' -and $reg1Line -match 'limitSeconds=0 ' -and $reg1Line -match 'battery=True') "...IgnoreNew, no execution time limit (0 = none, so Task Scheduler never ends the host), and not stopped on battery"
+    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*ABG Bay Agent') -eq 0) "...and the agent task is not created through schtasks /RP /IT any more"
+    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*/RP') -eq 0 -and (Get-LogCount $r1 'ON THE COMMAND LINE') -eq 0) "no schtasks line carries a password"
+    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*ABG Host Watchdog.* /RU SYSTEM') -eq 1) "the watchdog task is still created through schtasks, as SYSTEM"
+
+    Section "A schtasks refusal is not reported as 'Created' (Day0 used to Out-Null the output)"
+    $schFail = Invoke-SetupPlan "schtasks-refused" @(
+        [ordered]@{ title = "step 9, the task service refuses the watchdog registration"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ schtasksFailMatch = "Host Watchdog" } }
+    )
+    $f1 = Get-PlanRun $schFail 0
+    $ft1 = Get-RunText $f1
+    Assert-True ($ft1 -notmatch 'Created/updated scheduled task: \\ABG Host Watchdog') "the failed registration does not print 'Created/updated'"
+    Assert-True (("$($f1.ended) $ft1") -match 'Registering \\ABG Host Watchdog failed: schtasks exit 1: ERROR: Access is denied') "...it stops, naming the task, the exit code and the schtasks error text ($($f1.ended))"
+
+    Section "Power settings apply on every run, lockdown or not (a bay set up with -SkipLockdown slept after 5 idle minutes)"
+    $pw1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^POWERCFG ' })
+    Assert-True ($pw1.Count -eq 3 -and ($pw1 -contains 'POWERCFG /change monitor-timeout-ac 0') -and ($pw1 -contains 'POWERCFG /change standby-timeout-ac 0') -and ($pw1 -contains 'POWERCFG /change hibernate-timeout-ac 0')) "the -SkipLockdown first run sets monitor, standby and hibernate timeouts to 0, once each ($($pw1.Count) powercfg calls)"
+    $pwFull = Invoke-SetupPlan "power-full" @(
+        [ordered]@{ title = "step 9 with the lockdown"; computerName = "BAY1KIOSK"; args = $FullArgs }
+        [ordered]@{ title = "step 16, no Day0, no kiosk setup"; computerName = "BAY1KIOSK"; args = $Step16Args }
+    )
+    Assert-True ((Get-LogCount (Get-PlanRun $pwFull 0) '^POWERCFG ') -eq 3) "a run WITH the lockdown still sets them once each, not twice"
+    Assert-True ((Get-LogCount (Get-PlanRun $pwFull 1) '^POWERCFG ') -eq 3) "a later run (step 16) sets them again: every run applies them"
+    $pwBad = Invoke-SetupPlan "power-refused" @(
+        [ordered]@{ title = "powercfg fails"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ powercfgExit = 5 } }
+    )
+    Assert-True ((Get-RunText (Get-PlanRun $pwBad 0)) -match 'powercfg /change monitor-timeout-ac 0 failed \(exit 5\); this bay may sleep') "a failing powercfg is reported on the screen, not hidden"
+
     # =========================================================================================== the instrument can refuse
     Section "The census refuses a write through a tool nobody modeled (reg.exe)"
     $plantedDir = Join-Path $BaseDir "planted"; New-Item -ItemType Directory -Force -Path $plantedDir | Out-Null

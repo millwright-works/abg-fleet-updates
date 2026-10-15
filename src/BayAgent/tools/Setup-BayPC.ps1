@@ -595,6 +595,21 @@ if ($scriptPolicy.ok) { Write-Host "  Machine script policy: AllSigned." -Foregr
 else { Write-Host "  The machine script policy reads '$($scriptPolicy.policy)', not AllSigned; the scheduled tasks will not start. $($scriptPolicy.note)" -ForegroundColor Red }
 
 # ==================================================================
+# PHASE 3C: NEVER SLEEP (monitor, standby and hibernate timeouts off on mains power)
+# ==================================================================
+# On EVERY run, lockdown or not. These three lines used to sit inside the lockdown phase, which -SkipLockdown skips
+# until sheet step 16, so a freshly set-up bay went to sleep after 5 idle minutes (Bay 1, 2026-10-15). A bay that
+# sleeps is not a bay; this is not a lockdown choice. A failed powercfg is reported, never silent.
+Write-Step "Phase 3C: Power settings (never sleep)"
+foreach ($powerSetting in @("monitor-timeout-ac", "standby-timeout-ac", "hibernate-timeout-ac")) {
+  $global:LASTEXITCODE = 0
+  powercfg /change $powerSetting 0 | Out-Null
+  $powerRc = $LASTEXITCODE
+  if ($powerRc -eq 0) { Write-Host "  $powerSetting = 0 (never)." -ForegroundColor Green }
+  else { Write-Host "  powercfg /change $powerSetting 0 failed (exit $powerRc); this bay may sleep." -ForegroundColor Red }
+}
+
+# ==================================================================
 # PHASE 4: EDGE POLICIES (SessionDisplay launched by shell wrapper)
 # ==================================================================
 if (-not $SkipKioskSetup) {
@@ -744,16 +759,13 @@ if (-not $SkipLockdown) {
   Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR" -Name "Start" -Value 4
   Write-Host "  USB mass storage disabled." -ForegroundColor Green
 
-  # Disable screen saver, sleep, and display timeout
-  Write-Host "  Disabling sleep and screen timeout..."
-  powercfg /change monitor-timeout-ac 0
-  powercfg /change standby-timeout-ac 0
-  powercfg /change hibernate-timeout-ac 0
+  # Sleep, monitor and hibernate timeouts are set in Phase 3C, on every run (they used to sit here, so a bay set up
+  # with -SkipLockdown went to sleep after 5 idle minutes).
   # Disable lock screen on resume
   $personalizePath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
   if (-not (Test-Path $personalizePath)) { New-Item -Path $personalizePath -Force | Out-Null }
   Set-ItemProperty -Path $personalizePath -Name "NoLockScreen" -Value 1 -Type DWord
-  Write-Host "  Sleep, hibernate, and lock screen disabled." -ForegroundColor Green
+  Write-Host "  Lock screen disabled." -ForegroundColor Green
 
   # Configure Windows Update active hours
   Write-Host "  Configuring Windows Update active hours..."

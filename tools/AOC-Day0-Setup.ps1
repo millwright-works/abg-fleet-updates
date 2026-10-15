@@ -261,26 +261,49 @@ function Ensure-SessionDisplayPersistentFiles([string]$dataDir) {
   }
 }
 
+# Runs schtasks.exe and THROWS, with the text schtasks printed, when it exits non-zero. Both streams are kept (the
+# error preference is lowered for the call because Windows PowerShell 5.1 turns merged native stderr into a
+# terminating error under Stop), and the exit code is read on the very next line. A registration that failed used to
+# print "Created/updated" anyway.
+function Invoke-SchtasksChecked([string[]]$schtasksArgs, [string]$what) {
+  $savedPref = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $global:LASTEXITCODE = 0
+  try {
+    $out = schtasks @schtasksArgs 2>&1
+    $rc = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedPref
+  }
+  if ($rc -ne 0) {
+    $text = ((@($out) | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { [string]$_.Exception.Message } else { [string]$_ } } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " ").Trim()
+    throw ("{0} failed: schtasks exit {1}: {2}" -f $what, $rc, $text)
+  }
+}
+
 function Create-WatchdogTask([string]$watchdogPath) {
   $tn = "\AOC Host Watchdog"
   $tr = "powershell.exe -NoProfile -File `"$watchdogPath`""
-  schtasks /Create /F /TN $tn /SC MINUTE /MO 1 /RU "SYSTEM" /RL HIGHEST /TR $tr | Out-Null
+  Invoke-SchtasksChecked -schtasksArgs @("/Create", "/F", "/TN", $tn, "/SC", "MINUTE", "/MO", "1", "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR", $tr) -what "Registering $tn"
   Write-Host "Created/updated scheduled task: $tn (SYSTEM, every 1 minute)"
 }
 
+# The agent task is INTERACTIVE ONLY, with NO stored password (measured on Bay 1, 2026-10-15): the old registration
+# (schtasks /RU /RP /IT, a stored BayKiosk password) could never be started (0x80070490, "Element not found") by the
+# logon trigger, the watchdog or Start-ScheduledTask; this registration started at once. Same pattern as the Update
+# Guard in Update-BayAgent.ps1. Task Scheduler's own start limit is turned OFF (zero): the host is a supervisor meant to
+# run until the PC restarts, and the 72-hour default would end it (and maybe orphan the agent it supervises) while
+# the watchdog is only a safety net that brings it back up to a minute later. The battery flags keep a UPS that reports
+# itself as a battery from stopping it. $kioskPassword is accepted for older callers and ignored.
 function Create-AgentTask([string]$agentHostPath, [string]$kioskAccount, [string]$kioskPassword) {
-  $tn = "\AOC Bay Agent"
-  $tr = "powershell.exe -NoProfile -WindowStyle Minimized -File `"$agentHostPath`""
-
-  if ([string]::IsNullOrWhiteSpace($kioskPassword)) {
-    Write-Host "Skipping automatic creation of $tn because BayKioskPassword was not provided."
-    Write-Host "Use this command (run as Admin) once you have the password:"
-    Write-Host ("schtasks /Create /F /TN `"{0}`" /SC ONLOGON /RU `"{1}`" /RP `"<password>`" /IT /TR `"{2}`"" -f $tn, $kioskAccount, $tr)
-    return
-  }
-
-  schtasks /Create /F /TN $tn /SC ONLOGON /RU $kioskAccount /RP $kioskPassword /IT /TR $tr | Out-Null
-  Write-Host "Created/updated scheduled task: $tn (ONLOGON for $kioskAccount, Interactive)"
+  $tn = "AOC Bay Agent"
+  $psArgs = "-NoProfile -WindowStyle Minimized -File `"$agentHostPath`""
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
+  $trigger = New-ScheduledTaskTrigger -AtLogOn
+  $principal = New-ScheduledTaskPrincipal -UserId $kioskAccount -LogonType Interactive -RunLevel Limited
+  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+  Register-ScheduledTask -TaskName $tn -TaskPath "\" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+  Write-Host "Created/updated scheduled task: \$tn (at logon, Interactive as $kioskAccount, no stored password, no time limit)"
 }
 
 # ---------- Dataverse helpers ----------

@@ -96,15 +96,42 @@ function Kill-Procs([object[]]$procs, [string]$label) {
   }
 }
 
-function Start-HostTask() {
+# The name of the user signed in at the console (DOMAIN\name), or "" when nobody is. The agent task is registered
+# Interactive for BayKiosk, so it can only start inside that user's own session.
+function Get-ConsoleUser() {
   try {
-    schtasks.exe /Run /TN $HostTaskName | Out-Null
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    if ($null -ne $cs -and -not [string]::IsNullOrWhiteSpace([string]$cs.UserName)) { return [string]$cs.UserName }
+  } catch {}
+  return ""
+}
+
+# Starts the agent task and reports what Task Scheduler really said. A native program's failure does not throw, so
+# the exit code is read on the very next line. Stderr is merged in, with the error preference lowered for the call
+# (Windows PowerShell 5.1 turns merged native stderr into a terminating error under Stop), so the text of the
+# refusal, for example "ERROR: Element not found.", reaches the log. Returns $true only when schtasks exited 0.
+function Start-HostTask() {
+  $text = ""
+  $rc = -1
+  $savedPref = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = 0
+    $out = schtasks.exe /Run /TN $HostTaskName 2>&1
+    $rc = $LASTEXITCODE
+    $text = ((@($out) | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { [string]$_.Exception.Message } else { [string]$_ } } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " ").Trim()
+  } catch {
+    $text = [string]$_.Exception.Message
+    $rc = -1
+  } finally {
+    $ErrorActionPreference = $savedPref
+  }
+  if ($rc -eq 0) {
     Log "INFO" ("Started scheduled task {0}" -f $HostTaskName)
     return $true
-  } catch {
-    Log "WARN" ("Failed to start scheduled task {0}: {1}" -f $HostTaskName, $_.Exception.Message)
-    return $false
   }
+  Log "WARN" ("Failed to start scheduled task {0}: schtasks exit {1}: {2}" -f $HostTaskName, $rc, $text)
+  return $false
 }
 
 function End-HostTask() {
@@ -167,18 +194,20 @@ try {
   }
 
   Log "WARN" "AgentHost process not detected. Ensuring scheduled task is running..."
-  $started = Start-HostTask
+  $consoleUser = Get-ConsoleUser
+  if ([string]::IsNullOrWhiteSpace($consoleUser)) {
+    # The agent task is Interactive: it starts only inside the kiosk user's own session, and its logon trigger does
+    # that at the next sign-in. Nothing here can start it sooner, so say so and try again next minute.
+    Log "WARN" ("No interactive session is signed in; not starting {0}. Waiting for the kiosk user to sign in (the task's logon trigger starts the agent)." -f $HostTaskName)
+    exit 0
+  }
 
+  $started = Start-HostTask
   if (-not $started) {
-    # Fallback direct start
-    try {
-      Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -ArgumentList ('-NoProfile -WindowStyle Minimized -File "{0}"' -f $HostScriptPath) `
-        -WindowStyle Minimized | Out-Null
-      Log "WARN" "Fallback Start-Process issued for AgentHost script."
-    } catch {
-      Log "WARN" ("Fallback Start-Process failed: {0}" -f $_.Exception.Message)
-    }
+    # There is deliberately NO direct Start-Process fallback. This script runs as SYSTEM, so a process it starts
+    # lives in session 0 under the SYSTEM account: invisible, and not the kiosk user. A failed task start is logged
+    # above with the real schtasks error and retried on the next run.
+    Log "WARN" ("Task start failed with an interactive session open ({0}). AgentHost is not started directly: from this SYSTEM task it would run in session 0 as SYSTEM. Retrying next run." -f $consoleUser)
   }
 }
 catch {
