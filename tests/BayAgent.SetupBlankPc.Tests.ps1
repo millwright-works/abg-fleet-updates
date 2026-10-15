@@ -463,6 +463,52 @@ try {
         Assert-True ($ownCmds.Count -eq 2 -and $inOwnerLoop.Count -eq 2 -and $aclWrites.Count -ge 1 -and $ownTargets[0].Extent.EndOffset -lt $aclWrites[0].Extent.StartOffset) ("the owner change (" + $ownCmds.Count + " icacls forms, recursive and not) comes before the first permission write")
         $noOwnerAfter = @($ownCmds | Where-Object { $aclWrites.Count -ge 1 -and $_.Extent.StartOffset -gt $aclWrites[0].Extent.StartOffset })
         Assert-True ($noOwnerAfter.Count -eq 0) "no owner change is left after the permission writes"
+        # R1c: after the last permission write, Set-SetupFolderLock reads the four folders back (Assert-SetupFolderLockHeld),
+        # once, over all four paths, with the SID list of Administrators.
+        $rbCalls = @($lockFn[0].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Assert-SetupFolderLockHeld" }, $true))
+        $lastWrite = @($aclWrites | Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1)
+        Assert-True ($rbCalls.Count -eq 1 -and $lastWrite.Count -eq 1 -and $rbCalls[0].Extent.StartOffset -gt $lastWrite[0].Extent.EndOffset -and $rbCalls[0].Extent.Text -match '-Paths \$paths -SetupPath \$setup -OkOwners \$okOwners$') "the lock is read back after the last permission write, over all four paths"
+    }
+
+    # R1c: the read-back itself (Assert-SetupFolderLockHeld, lifted from the script), run on real scratch folders. Each condition
+    # has its own case: a link, a foreign owner (by SID), a first-three folder that inherits. The fourth (setup) may inherit.
+    Section "R1c: the setup folder lock is read back (link, owner by SID, inheritance)"
+    $rbText = Get-BlankPcFunctionText $setupAst "Assert-SetupFolderLockHeld"
+    Assert-True ($null -ne $rbText) "Assert-SetupFolderLockHeld is defined once in Setup-BayPC.ps1"
+    if ($null -ne $rbText) {
+        . ([scriptblock]::Create($rbText))
+        $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $mkLock = {
+            param([string]$name, [int]$unprotectIndex)
+            $r = Join-Path $BaseDir ("rb-" + $name)
+            $ps = @($r, (Join-Path $r "a"), (Join-Path $r "a\b"), (Join-Path $r "a\b\setup"))
+            foreach ($p in $ps) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
+            for ($i = 0; $i -lt 3; $i++) {
+                if ($i -eq $unprotectIndex) { continue }
+                $item = Get-Item -LiteralPath $ps[$i] -Force; $acl = $item.GetAccessControl(); $acl.SetAccessRuleProtection($true, $true); $item.SetAccessControl($acl)
+            }
+            return , $ps
+        }
+        $tryRb = { param($ps, $owners) try { Assert-SetupFolderLockHeld -Paths $ps -SetupPath $ps[3] -OkOwners $owners; return "none" } catch { return "$($_.Exception.Message)" } }
+        $good = & $mkLock "good" -1
+        $got = & $tryRb $good @($meSid)
+        Assert-True ($got -eq "none") ("four folders, three protected, setup inheriting, owner on the list: the read-back passes (" + $got + ")")
+        $ownerIsAdmin = ((Get-Item -LiteralPath $good[0]).GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value -eq "S-1-5-32-544")
+        if ($ownerIsAdmin) { Write-Host "  NOT RUN  foreign-owner case: this account creates folders owned by Administrators" -ForegroundColor Yellow }
+        else {
+            $got = & $tryRb $good @("S-1-5-32-544")
+            Assert-True ($got -match ("is owned by " + [regex]::Escape($meSid) + ", not Administrators")) ("an owner that is not on the SID list (icacls exited 0 and changed nothing): stops, names the owner (" + $got + ")")
+        }
+        $inh = & $mkLock "inherit" 1
+        $got = & $tryRb $inh @($meSid)
+        Assert-True ($got -match "a.* still inherits permissions" -and $got -notmatch "setup' still") ("a folder among the first three that still inherits: stops, and the setup folder itself is not held to this (" + $got + ")")
+        $lnk = & $mkLock "link" -1
+        $victim = $lnk[1]; $tgt = Join-Path $BaseDir "rb-link-target"; New-Item -ItemType Directory -Force -Path (Join-Path $tgt "b/setup") | Out-Null
+        [IO.Directory]::Delete($victim, $true)
+        New-Item -ItemType Junction -Path $victim -Target $tgt | Out-Null
+        $got = & $tryRb $lnk @($meSid)
+        Assert-True ($got -match "is a link") ("a folder swapped for a junction after the link check: stops (" + $got + ")")
+        [IO.Directory]::Delete($victim, $false)
     }
 }
 finally {

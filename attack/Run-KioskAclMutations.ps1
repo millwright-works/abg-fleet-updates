@@ -25,7 +25,7 @@ $Ps51 = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
 $WorkRoot = (Resolve-Path $WorkRoot).Path
 
-$Files = @("tools\ABG-BayAcl.ps1", "tools\ABG-Day0-Setup.ps1", "src\BayAgent\tools\Setup-BayPC.ps1", "tests\BayAgent.KioskAcl.Tests.ps1", "tests\BayAgent.SetupRun.Tests.ps1", "tests\SetupRun.Harness.ps1")
+$Files = @("tools\ABG-BayAcl.ps1", "tools\ABG-Day0-Setup.ps1", "src\BayAgent\tools\Setup-BayPC.ps1", "tests\BayAgent.KioskAcl.Tests.ps1", "tests\BayAgent.SetupRun.Tests.ps1", "tests\SetupRun.Harness.ps1", "tests\BayAgent.SetupBlankPc.Tests.ps1")
 
 # Each mutant: Id, What, File, Old, New. NL in a pattern stands for the file's own line ending.
 $Mutants = @(
@@ -132,8 +132,29 @@ $Mutants = @(
        Old = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))'
        New = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $false))' },
     @{ Id = "M33"; What = "R1b: Chain in the helper does not re-own the folder"; File = "tools\ABG-BayAcl.ps1"
-       Old = '      Set-BayFolderOwner -Path $p' + "NL" + '      Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true' + "NL" + '    }' + "NL" + '    "LockTree"'
-       New = '      Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true' + "NL" + '    }' + "NL" + '    "LockTree"' }
+       Old = '      Set-BayFolderOwner -Path $p' + "NL" + '      Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true' + "NL" + '      Assert-BayChainFolder -Path $p' + "NL" + '    }' + "NL" + '    "LockTree"'
+       New = '      Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true' + "NL" + '      Assert-BayChainFolder -Path $p' + "NL" + '    }' + "NL" + '    "LockTree"' },
+    @{ Id = "M34"; What = "R1c: the setup-folder read-back does not check for a link"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $bad += "''$p'' is a link"; continue }'
+       New = '    # mutant: no link check in the read-back' },
+    @{ Id = "M35"; What = "R1c: the setup-folder read-back does not check the owner"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = 'if ($null -eq $owner -or $OkOwners -notcontains $owner.Value) { $bad +='
+       New = 'if ($false) { $bad +=' },
+    @{ Id = "M36"; What = "R1c: the setup-folder read-back does not check inheritance"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = 'if ($p -ne $SetupPath -and -not $acl.AreAccessRulesProtected) { $bad +='
+       New = 'if ($false) { $bad +=' },
+    @{ Id = "M37"; What = "R1c: the setup-folder read-back is not called"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '  Assert-SetupFolderLockHeld -Paths $paths -SetupPath $setup -OkOwners $okOwners'
+       New = '  # mutant: no read-back' },
+    @{ Id = "M38"; What = "R1c: Chain read-back does not check for a link"; File = "tools\ABG-BayAcl.ps1"
+       Old = '  if (Test-BayIsLink $Path) { throw "ACL: ''$Path'' is a link; the lock cannot be trusted." }'
+       New = '  # mutant: no link check' },
+    @{ Id = "M39"; What = "R1c: Chain read-back does not check the owner"; File = "tools\ABG-BayAcl.ps1"
+       Old = 'if ($null -eq $owner -or $ok -notcontains $owner.Value) { throw'
+       New = 'if ($false) { throw' },
+    @{ Id = "M40"; What = "R1c: Chain read-back does not check inheritance"; File = "tools\ABG-BayAcl.ps1"
+       Old = '  if (-not $acl.AreAccessRulesProtected) { throw "ACL: ''$Path'' still inherits'
+       New = '  if ($false) { throw "ACL: ''$Path'' still inherits' }
 )
 $Only = @($Only | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 if ($Only.Count -gt 0) { $Mutants = @($Mutants | Where-Object { $Only -contains $_.Id }) }
@@ -146,7 +167,7 @@ function Copy-Tree([string]$To) {
 }
 function Invoke-Suites([string]$Tree, [string]$Tag) {
     $result = [ordered]@{}
-    foreach ($s in @("BayAgent.KioskAcl.Tests.ps1", "BayAgent.SetupRun.Tests.ps1")) {
+    foreach ($s in @("BayAgent.KioskAcl.Tests.ps1", "BayAgent.SetupRun.Tests.ps1", "BayAgent.SetupBlankPc.Tests.ps1")) {
         $log = Join-Path $WorkRoot ("{0}-{1}.log" -f $Tag, $s)
         $p = Start-Process -FilePath $Ps51 -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $Tree ("tests\" + $s))) -WorkingDirectory $Tree -RedirectStandardOutput $log -RedirectStandardError ($log + ".err") -PassThru -Wait -WindowStyle Hidden
         $txt = ""; if (Test-Path -LiteralPath $log) { $txt = [IO.File]::ReadAllText($log) }

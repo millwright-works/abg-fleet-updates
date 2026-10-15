@@ -49,6 +49,7 @@ $global:Srh = @{
   Policy = 'Undefined'; PolicyThrows = $true; PolicyTakes = $true
   FailDownloadMatch = ''; TimestampOk = $true; RebootAnswer = 'n'; RegStuck = @()
   TamperDownload = ''; MeSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  OwnerOk = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); SwapOnIcacls = $false; Swapped = $false
 }
 function global:SrhRec([string]$m) { [void]$global:Srh.Log.Add($m) }
 function global:SrhAssertScratch([string]$p) {
@@ -187,7 +188,24 @@ function global:New-SelfSignedCertificate {
 function global:Export-Certificate { [CmdletBinding()] param([string]$Cert, [string]$FilePath) SrhRec "CERT     export public certificate (recorded only)" }
 function global:Import-Certificate { [CmdletBinding()] param([string]$FilePath, [string]$CertStoreLocation) SrhRec "CERT     import into $CertStoreLocation" }
 function global:certutil { "  Unique container name: fake-container-0001" }
-function global:icacls { SrhRec ("ICACLS   " + (@($args | ForEach-Object { "$_" }) -join ' ')); "processed (recorded only)" }
+function global:icacls {
+  SrhRec ("ICACLS   " + (@($args | ForEach-Object { "$_" }) -join ' '))
+  # Model fact swapOnIcacls (R1c): at the FIRST icacls call, AllBirdies is replaced by a junction to a folder of the same shape
+  # inside this scratch root, standing in for an account acting between the link check and the permission writes. The double
+  # otherwise changes nothing and returns exit 0 (as icacls /C does when it fails).
+  if ($global:Srh.SwapOnIcacls -and -not $global:Srh.Swapped) {
+    $global:Srh.Swapped = $true
+    $ab = Join-Path $global:Srh.Root 'AllBirdies'
+    $tgt = Join-Path $global:Srh.Root 'JunctionTarget'
+    if ($ab.StartsWith($global:Srh.Root + '\') -and (Split-Path -Leaf $ab) -eq 'AllBirdies' -and (Microsoft.PowerShell.Management\Test-Path -LiteralPath $ab)) {
+      Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Join-Path $tgt 'BayAgent\bootstrap\setup') | Out-Null
+      [IO.Directory]::Delete($ab, $true)
+      Microsoft.PowerShell.Management\New-Item -ItemType Junction -Path $ab -Target $tgt | Out-Null
+    }
+  }
+  $global:LASTEXITCODE = 0
+  "processed (recorded only)"
+}
 function global:Set-AuthenticodeSignature { [CmdletBinding()] param([string]$FilePath, $Certificate, [string]$TimeStampServer) SrhRec ("SIGN     " + $FilePath.Replace($global:Srh.Root, '<root>')) }
 function global:Get-AuthenticodeSignature {
   [CmdletBinding()] param([Parameter(Position = 0)][string]$FilePath)
@@ -326,6 +344,11 @@ try {
   $rulesNeedle = '(New-BayRule (Get-BaySidObject $script:BaySid.Users) $rx "ContainerInherit, ObjectInherit" "None"))'
   if (([regex]::Matches($helperText, [regex]::Escape($rulesNeedle))).Count -ne 1) { throw "HARNESS: the Users rule of ABG-BayAcl.ps1 was not found exactly once" }
   $served = $helperText.Replace($ownerNeedle, ($ownerNeedle + ' + @("' + $meSid + '")'))
+  # Third change (R1c): the read-back after Chain accepts this harness's account as owner, unless the run's model says it
+  # does not (ownerStandIn = false), read at run time from $global:Srh.OwnerOk.
+  $rbNeedle = '$script:BayReadBackExtraOwners = @()'
+  if (([regex]::Matches($served, [regex]::Escape($rbNeedle))).Count -ne 1) { throw "HARNESS: the read-back owner line of ABG-BayAcl.ps1 was not found exactly once" }
+  $served = $served.Replace($rbNeedle, '$script:BayReadBackExtraOwners = @($global:Srh.OwnerOk)')
   $served = $served.Replace($rulesNeedle, ('(New-BayRule (Get-BaySidObject $script:BaySid.Users) $rx "ContainerInherit, ObjectInherit" "None"),' + "`r`n" + '    (New-BayRule (Get-BaySidObject "' + $meSid + '") $full "ContainerInherit, ObjectInherit" "None"))'))
   [IO.File]::WriteAllText($servedHelper, $served, (New-Object Text.UTF8Encoding($false)))
   $global:Srh.AclHelperServed = $servedHelper
@@ -339,6 +362,9 @@ try {
   $needle = 'return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'
   if (([regex]::Matches($setupText, [regex]::Escape($needle))).Count -ne 1) { throw "HARNESS: the Test-IsAdmin line was not found exactly once" }
   $setupText = $setupText.Replace($needle, 'return $true')
+  $okNeedle = '$okOwners = @("S-1-5-32-544")'
+  if (([regex]::Matches($setupText, [regex]::Escape($okNeedle))).Count -ne 1) { throw "HARNESS: the read-back owner list of Set-SetupFolderLock was not found exactly once" }
+  $setupText = $setupText.Replace($okNeedle, '$okOwners = @("S-1-5-32-544") + @($global:Srh.OwnerOk)')
   $lockNeedle = '(New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), $rx, $ci, $np, $allow)))'
   if (([regex]::Matches($setupText, [regex]::Escape($lockNeedle))).Count -ne 1) { throw "HARNESS: the Users rule of Set-SetupFolderLock was not found exactly once" }
   $setupText = $setupText.Replace($lockNeedle, ('(New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), $rx, $ci, $np, $allow)),' + "`r`n" + '    (New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier("' + $meSid + '")), $full, $ci, $np, $allow)))'))
@@ -363,6 +389,7 @@ try {
     # ---- the modeled facts this run starts from
     $model = $run.model
     $global:Srh.PolicyThrows = $true; $global:Srh.PolicyTakes = $true; $global:Srh.TimestampOk = $true; $global:Srh.FailDownloadMatch = ''; $global:Srh.RebootAnswer = 'n'; $global:Srh.RegStuck = @(); $global:Srh.SchtasksFailMatch = ''; $global:Srh.PowercfgExit = 0; $global:Srh.TamperDownload = ''
+    $global:Srh.OwnerOk = @($global:Srh.MeSid); $global:Srh.SwapOnIcacls = $false; $global:Srh.Swapped = $false
     if ($null -ne $model) {
       foreach ($p in $model.PSObject.Properties) {
         switch ($p.Name) {
@@ -376,6 +403,8 @@ try {
           'schtasksFailMatch' { $global:Srh.SchtasksFailMatch = [string]$p.Value }
           'powercfgExit'      { $global:Srh.PowercfgExit = [int]$p.Value }
           'tamperDownload'    { $global:Srh.TamperDownload = [string]$p.Value }
+          'ownerStandIn'      { if (-not [bool]$p.Value) { $global:Srh.OwnerOk = @() } }
+          'swapOnIcacls'      { $global:Srh.SwapOnIcacls = [bool]$p.Value }
           'regStuck'          { $global:Srh.RegStuck = @($p.Value | ForEach-Object { ([string]$_).ToLower() }) }
           'keyGrantedToKiosk' { if ([bool]$p.Value) { $kf = New-Object IO.FileInfo($keyFile); $ks = $kf.GetAccessControl(); $ks.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($global:Srh.KioskSid)), 'Read', 'Allow'))); $kf.SetAccessControl($ks) } }
           'seedDrift'         { if ([bool]$p.Value) {

@@ -639,6 +639,31 @@ try {
     Assert-True ((Get-LogCount $tD1 '^(SCHTASKS|REGTASK|CERT|SIGN) ') -eq 0 -and (Get-LogCount $tD1 '^DOWNLOAD \S*/bootstrap/') -eq 0 -and $null -eq $tD1.configText) "nothing Day0 does happened: no task, no certificate, no bootstrap download, no configuration"
     Assert-True ((Get-RunText $tD1) -match 'SHA-256 matches the pinned value: ABG-BayAcl\.ps1') "the permissions file before it matched its pin and ran (the check tells the two files apart)"
 
+    # R1c: icacls /C exits 0 even when it changed nothing, so the lock is read back from Windows and a failed lock stops the run
+    # BEFORE the first download. (1) an icacls double that returns 0 and changes nothing, on a PC where the account running setup
+    # is NOT a stand-in Administrator: the owner read back is not Administrators. (2) AllBirdies swapped for a junction at the first
+    # icacls call, i.e. after the link check. (3) the control: the same blank PC with the stand-in owner is locked and runs on.
+    Section "R1c: the folder lock is read back; a lock that did not hold stops the run before the first download"
+    $rb = Invoke-SetupPlan "readback" @(
+        [ordered]@{ title = "icacls exits 0 and changes nothing, the owner stays a non-Administrator"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ ownerStandIn = $false } },
+        [ordered]@{ title = "AllBirdies becomes a junction after the link check"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ swapOnIcacls = $true } }
+    )
+    $rb1 = Get-PlanRun $rb 0; $rb2 = Get-PlanRun $rb 1
+    Assert-True ($rb.census -eq "ok" -and [string]::IsNullOrEmpty([string]$rb.harnessError) -and @($rb.runs).Count -eq 2) ("census ok, harness clean, two runs (" + $rb.census + " " + $rb.harnessError + ")")
+    # Precondition: the account running this creates folders it owns itself. If it creates them owned by Administrators (an
+    # elevated token), the owner case cannot be built here and is reported NOT RUN, never counted as a pass.
+    $probeDir = Join-Path $BaseDir "owner-probe"; New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    $probeOwner = (Get-Item -LiteralPath $probeDir).GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($probeOwner -eq "S-1-5-32-544") { Write-Host "  NOT RUN  owner-not-Administrators case: this account creates folders owned by Administrators" -ForegroundColor Yellow }
+    else {    Assert-True ([string]$rb1.ended -match '^STOPPED: The setup folder lock did not hold when read back: .*is owned by S-1-5-21-\S+, not Administrators.*Nothing was downloaded\. Stopping\.') ("owner not Administrators after an icacls that exited 0: the run stops and names the owner (" + $rb1.ended + ")")
+    Assert-True ((Get-LogCount $rb1 '^ICACLS .*/setowner') -eq 3 -and (Get-LogCount $rb1 '^DOWNLOAD ') -eq 0 -and $null -eq $rb1.configText) ("...the double saw all three owner calls and returned 0, and nothing was downloaded (downloads: " + (Get-LogCount $rb1 '^DOWNLOAD ') + ")")
+    }
+    Assert-True ([string]$rb2.ended -match '^STOPPED: The setup folder lock did not hold when read back: .*AllBirdies. is a link.*Nothing was downloaded\. Stopping\.') ("AllBirdies swapped for a junction after the link check: the run stops (" + $rb2.ended + ")")
+    Assert-True ((Get-LogCount $rb2 '^DOWNLOAD ') -eq 0 -and $null -eq $rb2.configText) ("...and nothing was downloaded through the junction (downloads: " + (Get-LogCount $rb2 '^DOWNLOAD ') + ")")
+    $rbc = Invoke-SetupPlan "readback-control" @([ordered]@{ title = "control: owner reads back as the stand-in administrator"; computerName = "BAY1KIOSK"; args = $Step9Args })
+    $rbc1 = Get-PlanRun $rbc 0
+    Assert-True ($rbc1.ended -eq "ran to its last line" -and (Get-LogCount $rbc1 '^DOWNLOAD ') -ge 1) ("control: the same blank PC, lock read back clean, runs on and downloads (" + $rbc1.ended + ")")
+
     # =========================================================================================== the instrument can refuse
     Section "The census refuses a write through a tool nobody modeled (reg.exe)"
     $plantedDir = Join-Path $BaseDir "planted"; New-Item -ItemType Directory -Force -Path $plantedDir | Out-Null

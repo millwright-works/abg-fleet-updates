@@ -96,7 +96,7 @@ $ErrorActionPreference = "Stop"
 #   - in Git Bash, after "git add" of the changed file:  git cat-file blob :tools/ABG-BayAcl.ps1 | sha256sum
 #   - or run tests\BayAgent.SetupBlankPc.Tests.ps1: its "pinned download" lines print the value each pin must hold.
 $PinnedDownloadSha256 = @{
-  "ABG-BayAcl.ps1"     = "A86E66E9D8294CC685DCD0C87B41A2B3998DB8ECF84E835A1C348D172C09EF7D"
+  "ABG-BayAcl.ps1"     = "173B8B6BE7CF19E496E72F2589E6173ED6C92941D00729C9969A39AF0296C764"
   "ABG-Day0-Setup.ps1" = "692C810DF998A316C46816EAF89EC6D7918D30A5C6AE4DD4A95973DFED0E920E"
 }
 
@@ -138,6 +138,20 @@ function Assert-PinnedDownload([string]$Path, [string]$Name, [string]$Url) {
   Write-Host "  SHA-256 matches the pinned value: $Name" -ForegroundColor Green
 }
 
+# Reads the four setup folders back from Windows and stops the run unless each is not a link, is owned by one of $OkOwners
+# (SIDs, never localized names), and, all but $SetupPath, has inheritance cut. One throw lists every problem found.
+function Assert-SetupFolderLockHeld([string[]]$Paths, [string]$SetupPath, [string[]]$OkOwners) {
+  $bad = @()
+  foreach ($p in $Paths) {
+    $item = Get-Item -LiteralPath $p -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $bad += "'$p' is a link"; continue }
+    $acl = $item.GetAccessControl([Security.AccessControl.AccessControlSections]"Owner, Access")
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if ($null -eq $owner -or $OkOwners -notcontains $owner.Value) { $bad += ("'$p' is owned by " + $(if ($null -eq $owner) { "an unknown account" } else { $owner.Value }) + ", not Administrators") }
+    if ($p -ne $SetupPath -and -not $acl.AreAccessRulesProtected) { $bad += "'$p' still inherits permissions" }
+  }
+  if ($bad.Count -gt 0) { throw ("The setup folder lock did not hold when read back: " + ($bad -join "; ") + ". Nothing was downloaded. Stopping.") }
+}
 # Locks BayAgent\bootstrap\setup BEFORE anything is downloaded into it: the file that defines the permissions
 # (ABG-BayAcl.ps1) is itself one of the downloads, so it cannot do this first. The rules are the ones it applies a moment
 # later (Chain and LockTree there): the root, BayAgent and bootstrap get SYSTEM and Administrators full control and Users
@@ -179,6 +193,12 @@ function Set-SetupFolderLock([string]$Root) {
     if (-not $isSetup) { foreach ($r in $lockRules) { $acl.AddAccessRule($r) } }
     $item.SetAccessControl($acl)
   }
+  # READ BACK, from what Windows holds now. icacls /C exits 0 even when it changed nothing ("Failed processing 1 files"), and the
+  # link check above ran before the icacls calls, so neither can be trusted to have held. All four folders: not a link, owned by
+  # Administrators (compared by SID, never by a localized name), and the first three with inheritance cut. Anything else stops
+  # the run here, before the first download. $okOwners is the SID list; a test harness that cannot be elevated adds its account.
+  $okOwners = @("S-1-5-32-544")
+  Assert-SetupFolderLockHeld -Paths $paths -SetupPath $setup -OkOwners $okOwners
 }
 
 function Get-ShellActivationPlan {

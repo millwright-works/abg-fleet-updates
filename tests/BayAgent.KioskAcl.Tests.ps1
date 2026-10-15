@@ -57,6 +57,8 @@ $KioskSidText = "S-1-5-21-1111111111-2222222222-3333333333-1001"
 $Kiosk = New-Object System.Security.Principal.SecurityIdentifier($KioskSidText)
 $MeSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $Me = New-Object System.Security.Principal.SecurityIdentifier($MeSid)
+# R1c: the read-back after Chain accepts this (unelevated) account as the owner, standing in for Administrators.
+$script:BayReadBackExtraOwners = @($MeSid)
 $Base = Join-Path $env:TEMP ("bayagent-kioskacl-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $Base | Out-Null
 
@@ -278,6 +280,41 @@ try {
         Assert-True ((Get-RowResult $rows $RowBoot) -match "^FAIL.*owned by $([regex]::Escape($MeSid))") ("owned by $MeSid : the row FAILs and names the owner (" + (Get-RowResult $rows $RowBoot) + ")")
         Assert-True ((Get-RowResult (Get-Report $ro) $RowBoot) -eq "PASS") "...and reads PASS once that account is the declared stand-in"
     }
+
+    # R1c: icacls /C exits 0 when it changed nothing, so Chain reads each chain folder back after writing it: not a link, owned
+    # by Administrators (by SID), inheritance cut. The owner change is doubled above (changes nothing, as a failed /C does).
+    Section "B-readback. Chain reads the folder back after the owner change and the permission write"
+    $rr = New-Tree "breadback"
+    $script:BayReadBackExtraOwners = @()
+    $thrown = ""
+    try { Set-BayAcls -Root $rr -KioskSid $Kiosk } catch { $thrown = "$($_.Exception.Message)" }
+    if (@("S-1-5-32-544", "S-1-5-18") -contains $elevatedOwner) {
+        Write-Host "  SKIP  this account creates folders owned by Administrators (it is elevated); the owner read-back case cannot be built here"
+    } else {
+        Assert-True ($thrown -match "is owned by $([regex]::Escape($MeSid)), not Administrators") ("an owner change that changed nothing (double, exit 0) stops Chain and names the owner (" + $thrown + ")")
+    }
+    $script:BayReadBackExtraOwners = @($MeSid)
+    $lnTarget = Join-Path $Base "breadback-target"; New-Item -ItemType Directory -Force -Path $lnTarget | Out-Null
+    $lnPath = Join-Path $Base "breadback-link"
+    New-Item -ItemType Junction -Path $lnPath -Target $lnTarget | Out-Null
+    $thrown = ""
+    try { Assert-BayChainFolder -Path $lnPath } catch { $thrown = "$($_.Exception.Message)" }
+    Assert-True ($thrown -match "is a link") ("a chain folder swapped for a junction is refused by the read-back (" + $thrown + ")")
+    [IO.Directory]::Delete($lnPath, $false)
+    $inh = Join-Path $Base "breadback-inherits"; New-Item -ItemType Directory -Force -Path $inh | Out-Null
+    $thrown = ""
+    try { Assert-BayChainFolder -Path $inh } catch { $thrown = "$($_.Exception.Message)" }
+    Assert-True ($thrown -match "still inherits") ("a chain folder whose inheritance is not cut is refused by the read-back (" + $thrown + ")")
+    Set-BayDacl -Path $inh -Rules (Get-BayLockRules) -Protect $true
+    $thrown = "none"
+    try { Assert-BayChainFolder -Path $inh } catch { $thrown = "$($_.Exception.Message)" }
+    Assert-True ($thrown -eq "none") ("...and the same folder passes once it is protected and owned by the declared stand-in (" + $thrown + ")")
+    $chainAst = [System.Management.Automation.Language.Parser]::ParseFile($Helper, [ref]$null, [ref]$null)
+    $pe = @($chainAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq "Set-BayPlanEntry" }, $true))[0]
+    $cc = @(@($pe.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.SwitchStatementAst] }, $true))[0].Clauses | Where-Object { $_.Item1.Extent.Text.Trim('"') -eq "Chain" } | ForEach-Object { $_.Item2 })[0]
+    $cDacl = @($cc.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Set-BayDacl" }, $true))
+    $cRb = @($cc.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Assert-BayChainFolder" }, $true))
+    Assert-True ($cDacl.Count -eq 1 -and $cRb.Count -eq 1 -and $cRb[0].Extent.StartOffset -gt $cDacl[0].Extent.StartOffset) "in Chain the read-back comes after the permission write (DACL writes $($cDacl.Count), read-backs $($cRb.Count))"
 
     # =========================================================================================== C. the SYSTEM task
     Section "C. SYSTEM scheduled tasks: what they run, and from where"

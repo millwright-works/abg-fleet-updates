@@ -134,6 +134,20 @@ function Set-BayFolderOwner([string]$Path) {
   if ($LASTEXITCODE -ne 0) { throw "ACL: could not set the owner of '$Path' to Administrators (icacls exit $LASTEXITCODE)." }
 }
 
+# Read back what Windows holds for a chain folder after its owner and permissions were written. icacls /C exits 0 when it
+# changed nothing, so the exit code proves nothing: the folder must not be a link, must be owned by Administrators (by SID), and
+# must have inheritance cut. Anything else stops the run. A test that cannot be elevated names its own account in
+# $script:BayReadBackExtraOwners.
+$script:BayReadBackExtraOwners = @()
+function Assert-BayChainFolder([string]$Path) {
+  if (Test-BayIsLink $Path) { throw "ACL: '$Path' is a link; the lock cannot be trusted." }
+  $acl = (Get-Item -LiteralPath $Path -Force).GetAccessControl([System.Security.AccessControl.AccessControlSections]"Owner, Access")
+  $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+  $ok = @($script:BaySid.Admins) + @($script:BayReadBackExtraOwners)
+  if ($null -eq $owner -or $ok -notcontains $owner.Value) { throw ("ACL: '$Path' is owned by " + $(if ($null -eq $owner) { "an unknown account" } else { $owner.Value }) + ", not Administrators, after the owner change.") }
+  if (-not $acl.AreAccessRulesProtected) { throw "ACL: '$Path' still inherits permissions after they were written." }
+}
+
 # Every file and folder under a locked folder inherits only: explicit ACEs removed, inheritance on. A link inside is
 # a hard stop (it was planted while the folder was writable, or the tree is not what the installer made).
 function Reset-BayLockTreeChildren([string]$Path) {
@@ -158,6 +172,7 @@ function Set-BayPlanEntry($Entry, $KioskSid) {
       if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
       Set-BayFolderOwner -Path $p
       Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true
+      Assert-BayChainFolder -Path $p
     }
     "LockTree" {
       if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
