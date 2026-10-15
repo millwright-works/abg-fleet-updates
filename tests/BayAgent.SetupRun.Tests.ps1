@@ -563,9 +563,9 @@ try {
     }
     # Day0 applies the folder rules itself (it is also run alone), and Setup applies them before it (the -SkipDay0 run has only Setup's).
     $arA = Get-PlanRun $aclPlan 0; $arC = Get-PlanRun $aclPlan 2
-    # Three owner resets with Day0: Set-SetupFolderLock before the first download, the helper's in Phase 3A, the helper's in Day0.
-    Assert-True ((Get-LogCount $arA '^ICACLS .*/setowner') -eq 3) "a run with Day0 applies the locked-folder rules three times: before the first download, in Setup's Phase 3A, and inside Day0"
-    Assert-True ((Get-LogCount $arC '^ICACLS .*/setowner') -eq 2) "a -SkipDay0 run applies them twice, before the download and in Setup's Phase 3A (so a lockdown-only run still repairs a bay)"
+    # Nine owner resets with Day0: three (AllBirdies, BayAgent, bootstrap) from Set-SetupFolderLock before the first download, three from the helper in Phase 3A (two Chain folders and bootstrap), three from the helper in Day0.
+    Assert-True ((Get-LogCount $arA '^ICACLS .*/setowner') -eq 9) "a run with Day0 applies the locked-folder rules three times: before the first download, in Setup's Phase 3A, and inside Day0"
+    Assert-True ((Get-LogCount $arC '^ICACLS .*/setowner') -eq 6) "a -SkipDay0 run applies them twice, before the download and in Setup's Phase 3A (so a lockdown-only run still repairs a bay)"
     Assert-True ((Get-RunText $arA) -match 'Folder permissions \(SYSTEM-run scripts are not writable by BayKiosk\)' -and (Get-RunText $arA) -match 'Lock the code-signing private key') "Day0's own steps are on the screen"
 
     Section "A0.699 permissions: no BayKiosk account on the PC (-SkipKioskSetup): Day0's self-check refuses to finish"
@@ -601,6 +601,17 @@ try {
     $iOwn = -1; $iDl = -1
     for ($i = 0; $i -lt $logA.Count; $i++) { if ($iOwn -lt 0 -and $logA[$i] -match '^ICACLS .*\\BayAgent\\bootstrap /setowner \*S-1-5-32-544 /T') { $iOwn = $i }; if ($iDl -lt 0 -and $logA[$i] -match '^DOWNLOAD \S*/tools/ABG-BayAcl\.ps1$') { $iDl = $i } }
     Assert-True ($iOwn -ge 0 -and $iDl -gt $iOwn) ("on a blank PC the owner of bootstrap is reset to Administrators before the first download (owner reset at record " + $iOwn + ", download at " + $iDl + ")")
+    # R1b: the owner of AllBirdies, BayAgent (those two alone) and bootstrap (recursive) is Administrators BEFORE the first download.
+    $ownIdx = [ordered]@{ AllBirdies = -1; BayAgent = -1; bootstrap = -1 }
+    for ($i = 0; $i -lt $logA.Count; $i++) {
+      if ($logA[$i] -match '^DOWNLOAD ') { break }
+      if ($logA[$i] -notmatch '^ICACLS\s+(\S.*?) /setowner \*S-1-5-32-544( /T)? /C /L /Q$') { continue }
+      $leaf = Split-Path -Leaf $Matches[1]; $rec = ($null -ne $Matches[2])
+      if ($leaf -eq 'AllBirdies' -and -not $rec -and $ownIdx['AllBirdies'] -lt 0) { $ownIdx['AllBirdies'] = $i }
+      if ($leaf -eq 'BayAgent' -and -not $rec -and $ownIdx['BayAgent'] -lt 0) { $ownIdx['BayAgent'] = $i }
+      if ($leaf -eq 'bootstrap' -and $rec -and $ownIdx['bootstrap'] -lt 0) { $ownIdx['bootstrap'] = $i }
+    }
+    Assert-True ($ownIdx['AllBirdies'] -ge 0 -and $ownIdx['BayAgent'] -ge 0 -and $ownIdx['bootstrap'] -ge 0) ("before the first download the owner is set to Administrators on AllBirdies (not recursive), BayAgent (not recursive) and bootstrap (/T) (records " + ($ownIdx.Values -join ", ") + ")")
 
     # (b) a file whose SHA-256 is not the pinned one is never run. The harness serves it with one added line that leaves a
     # marker file when it runs; the marker is the proof of running, read from disk, not from what the script printed.

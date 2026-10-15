@@ -449,6 +449,21 @@ try {
     $firstDl = @(Get-BlankPcCommands $setupAst "Invoke-WebRequest" | Sort-Object { $_.Extent.StartOffset }) | Select-Object -First 1
     $lockTop = ($lockCalls.Count -eq 1 -and $lockCalls[0].Parent -is [System.Management.Automation.Language.PipelineAst] -and $lockCalls[0].Parent.Parent -is [System.Management.Automation.Language.NamedBlockAst] -and $null -eq $lockCalls[0].Parent.Parent.Parent.Parent)
     Assert-True ($lockTop -and $null -ne $firstDl -and $lockCalls[0].Extent.StartOffset -lt $firstDl.Extent.StartOffset) "Set-SetupFolderLock is called once, at the top level of the script (no switch can skip it), before the first download"
+    # R1b: inside Set-SetupFolderLock the owner is set to Administrators on AllBirdies and BayAgent (each alone) and on
+    # bootstrap (recursive), and every one of those owner changes comes BEFORE the first permission write (SetAccessControl).
+    $lockFn = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq "Set-SetupFolderLock" }, $true))
+    Assert-True ($lockFn.Count -eq 1) "Set-SetupFolderLock is defined once"
+    if ($lockFn.Count -eq 1) {
+        $ownTargets = @($lockFn[0].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] -and $n.Variable.VariablePath.UserPath -eq "o" }, $true))
+        $targetText = $(if ($ownTargets.Count -eq 1) { ($ownTargets[0].Condition.Extent.Text -replace '\s+', ' ') } else { "" })
+        Assert-True ($ownTargets.Count -eq 1 -and $targetText -match '^@\(@\(\$Root, \$false\), @\(\(Join-Path \$Root "BayAgent"\), \$false\), @\(\$bootstrap, \$true\)\)$') ("the owner change names exactly AllBirdies (not recursive), BayAgent (not recursive) and bootstrap (recursive) (" + $targetText + ")")
+        $ownCmds = @($lockFn[0].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "icacls" -and $n.Extent.Text -match '/setowner "\*S-1-5-32-544"' }, $true))
+        $aclWrites = @($lockFn[0].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Value -eq "SetAccessControl" }, $true))
+        $inOwnerLoop = @($ownCmds | Where-Object { $ownTargets.Count -eq 1 -and $_.Extent.StartOffset -ge $ownTargets[0].Extent.StartOffset -and $_.Extent.EndOffset -le $ownTargets[0].Extent.EndOffset })
+        Assert-True ($ownCmds.Count -eq 2 -and $inOwnerLoop.Count -eq 2 -and $aclWrites.Count -ge 1 -and $ownTargets[0].Extent.EndOffset -lt $aclWrites[0].Extent.StartOffset) ("the owner change (" + $ownCmds.Count + " icacls forms, recursive and not) comes before the first permission write")
+        $noOwnerAfter = @($ownCmds | Where-Object { $aclWrites.Count -ge 1 -and $_.Extent.StartOffset -gt $aclWrites[0].Extent.StartOffset })
+        Assert-True ($noOwnerAfter.Count -eq 0) "no owner change is left after the permission writes"
+    }
 }
 finally {
     try { Remove-Item -LiteralPath $BaseDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}

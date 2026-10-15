@@ -119,9 +119,21 @@ $Mutants = @(
     @{ Id = "M28"; What = "the early lock does not cut inheritance on AllBirdies, BayAgent and bootstrap"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
        Old = '$acl.SetAccessRuleProtection((-not $isSetup), $false)'
        New = '$acl.SetAccessRuleProtection($false, $false)' },
-    @{ Id = "M29"; What = "the early lock does not re-own bootstrap to Administrators"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
-       Old = '  icacls $bootstrap /setowner "*S-1-5-32-544" /T /C /L /Q | Out-Null'
-       New = '  # mutant: no owner reset' }
+    @{ Id = "M29"; What = "the early lock does not re-own bootstrap to Administrators (R1b: dropped from the owner list)"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))'
+       New = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false))' },
+    @{ Id = "M30"; What = "R1b: the early lock does not re-own AllBirdies"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))'
+       New = '@(@((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))' },
+    @{ Id = "M31"; What = "R1b: the early lock does not re-own BayAgent"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))'
+       New = '@(@($Root, $false), @($bootstrap, $true))' },
+    @{ Id = "M32"; What = "R1b: bootstrap is re-owned but not recursively"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))'
+       New = '@(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $false))' },
+    @{ Id = "M33"; What = "R1b: Chain in the helper does not re-own the folder"; File = "tools\ABG-BayAcl.ps1"
+       Old = '      Set-BayFolderOwner -Path $p' + "NL" + '      Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true' + "NL" + '    }' + "NL" + '    "LockTree"'
+       New = '      Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true' + "NL" + '    }' + "NL" + '    "LockTree"' }
 )
 $Only = @($Only | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 if ($Only.Count -gt 0) { $Mutants = @($Mutants | Where-Object { $Only -contains $_.Id }) }

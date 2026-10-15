@@ -96,7 +96,7 @@ $ErrorActionPreference = "Stop"
 #   - in Git Bash, after "git add" of the changed file:  git cat-file blob :tools/ABG-BayAcl.ps1 | sha256sum
 #   - or run tests\BayAgent.SetupBlankPc.Tests.ps1: its "pinned download" lines print the value each pin must hold.
 $PinnedDownloadSha256 = @{
-  "ABG-BayAcl.ps1"     = "DADFB54F5143E7169C598C4E727E8E5E513F5E3C479F247E7B16AEBA05FA3317"
+  "ABG-BayAcl.ps1"     = "A86E66E9D8294CC685DCD0C87B41A2B3998DB8ECF84E835A1C348D172C09EF7D"
   "ABG-Day0-Setup.ps1" = "692C810DF998A316C46816EAF89EC6D7918D30A5C6AE4DD4A95973DFED0E920E"
 }
 
@@ -161,6 +161,17 @@ function Set-SetupFolderLock([string]$Root) {
   foreach ($p in $paths) {
     $item = Get-Item -LiteralPath $p -Force
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "'$p' is a link, so the folder setup runs its downloads from cannot be locked. Remove it by hand (as Administrator) and run setup again." }
+  }
+  # OWNER FIRST, before any permission is changed: an owner keeps the right to rewrite a folder's permissions, so an account
+  # that owns AllBirdies or BayAgent could unlock it again after the lock and swap a checked file before it runs. AllBirdies and
+  # BayAgent only (not their contents, BayKiosk's data lives there); bootstrap and everything in it.
+  foreach ($o in @(@($Root, $false), @((Join-Path $Root "BayAgent"), $false), @($bootstrap, $true))) {
+    $global:LASTEXITCODE = 0
+    if ($o[1]) { icacls $o[0] /setowner "*S-1-5-32-544" /T /C /L /Q | Out-Null } else { icacls $o[0] /setowner "*S-1-5-32-544" /C /L /Q | Out-Null }
+    if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of '$($o[0])' to Administrators (icacls exit $LASTEXITCODE); nothing was downloaded. Stopping." }
+  }
+  foreach ($p in $paths) {
+    $item = Get-Item -LiteralPath $p -Force
     $isSetup = ($p -eq $setup)
     $acl = $item.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
     $acl.SetAccessRuleProtection((-not $isSetup), $false)
@@ -168,9 +179,6 @@ function Set-SetupFolderLock([string]$Root) {
     if (-not $isSetup) { foreach ($r in $lockRules) { $acl.AddAccessRule($r) } }
     $item.SetAccessControl($acl)
   }
-  $global:LASTEXITCODE = 0
-  icacls $bootstrap /setowner "*S-1-5-32-544" /T /C /L /Q | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of '$bootstrap' to Administrators (icacls exit $LASTEXITCODE); nothing was downloaded. Stopping." }
 }
 
 function Get-ShellActivationPlan {

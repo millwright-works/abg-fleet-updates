@@ -46,6 +46,8 @@ function Section([string]$name) { Write-Host ""; Write-Host "== $name" -Foregrou
 # Doubles: no owner change (the account running this is not elevated), and the key comes from a scratch file, not the
 # machine store. Everything else in the helper is the real function.
 function Set-BayLockTreeOwner([string]$Path) { }
+$script:OwnerCalls = New-Object System.Collections.Generic.List[string]
+function Set-BayFolderOwner([string]$Path) { [void]$script:OwnerCalls.Add($Path) }
 $script:TestKeyPath = ""
 function Get-BayCodeSigningThumbprints { return @("AABBCC") }
 function Get-BayKeyContainerName([string]$Thumbprint) { return "scratch-key" }
@@ -169,6 +171,14 @@ try {
     Assert-True (@(Read-Icacls (Join-Path $rootA "BayAgent\bootstrap\ABG.HostWatchdog.ps1") | Where-Object { $_.Who -eq $KioskSidText }).Count -eq 0) "the planted explicit BayKiosk grant on the watchdog file is gone"
     $rootE = @(Read-Icacls $rootA)
     Assert-True (@($rootE | Where-Object { $_.Flags -contains "I" }).Count -eq 0) "AllBirdies inherits nothing from C:\ (Authenticated Users:Modify is not there)"
+    # R1b: a chain folder (AllBirdies, BayAgent) is re-owned to Administrators, and BEFORE its permissions are written.
+    Assert-True (($script:OwnerCalls -contains $rootA) -and ($script:OwnerCalls -contains (Join-Path $rootA "BayAgent"))) "Chain re-owns AllBirdies and BayAgent to Administrators (owner calls: $($script:OwnerCalls.Count))"
+    $helperAst = [System.Management.Automation.Language.Parser]::ParseFile($Helper, [ref]$null, [ref]$null)
+    $planFn = @($helperAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq "Set-BayPlanEntry" }, $true))[0]
+    $chainClause = @($planFn.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.SwitchStatementAst] }, $true))[0].Clauses | Where-Object { $_.Item1.Extent.Text.Trim('"') -eq "Chain" } | ForEach-Object { $_.Item2 }
+    $chOwn = @($chainClause.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Set-BayFolderOwner" }, $true))
+    $chDacl = @($chainClause.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq "Set-BayDacl" }, $true))
+    Assert-True ($chOwn.Count -eq 1 -and $chDacl.Count -eq 1 -and $chOwn[0].Extent.StartOffset -lt $chDacl[0].Extent.StartOffset) "in Chain the owner change comes before the permission write (owner calls $($chOwn.Count), DACL writes $($chDacl.Count))"
 
     Section "A2. what the agent needs as BayKiosk (reads and writes), judged on icacls text"
     foreach ($d in @("state", "logs", "control", "current", "releases", "rollback", "staging", "tools")) {

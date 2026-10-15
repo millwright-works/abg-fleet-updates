@@ -126,6 +126,14 @@ function Set-BayLockTreeOwner([string]$Path) {
   if ($LASTEXITCODE -ne 0) { throw "ACL: could not set the owner of '$Path' to Administrators (icacls exit $LASTEXITCODE)." }
 }
 
+# Administrators as owner of ONE folder (not its contents), set BEFORE the folder's permissions are written: an owner keeps the
+# right to rewrite its own DACL, so a chain folder (AllBirdies, BayAgent) owned by anyone else is not locked. A test replaces this.
+function Set-BayFolderOwner([string]$Path) {
+  $global:LASTEXITCODE = 0
+  icacls $Path /setowner ("*" + $script:BaySid.Admins) /C /L /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "ACL: could not set the owner of '$Path' to Administrators (icacls exit $LASTEXITCODE)." }
+}
+
 # Every file and folder under a locked folder inherits only: explicit ACEs removed, inheritance on. A link inside is
 # a hard stop (it was planted while the folder was writable, or the tree is not what the installer made).
 function Reset-BayLockTreeChildren([string]$Path) {
@@ -148,6 +156,7 @@ function Set-BayPlanEntry($Entry, $KioskSid) {
   switch ([string]$Entry.Kind) {
     "Chain" {
       if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+      Set-BayFolderOwner -Path $p
       Set-BayDacl -Path $p -Rules (Get-BayLockRules) -Protect $true
     }
     "LockTree" {

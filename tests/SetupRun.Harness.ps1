@@ -160,6 +160,16 @@ function global:SrhFolderLockVerdict([string]$outFile) {
       if (([int]$r.FileSystemRights -band $writeBits) -ne 0) { $why += ((Split-Path -Leaf $p) + ' writable by ' + $r.IdentityReference.Value) }
     }
   }
+  # The owner: an owner can rewrite a folder's permissions, so a lock that leaves it with anyone else is not a lock. The
+  # harness is not elevated, so the owner change is a recorded icacls call: AllBirdies and BayAgent (that folder only), and
+  # bootstrap with /T, each re-owned to Administrators (S-1-5-32-544) before this download.
+  $logNow = @($global:Srh.Log.ToArray())
+  foreach ($m in $mustProtect) {
+    $isBoot = $m.EndsWith('\bootstrap')
+    $want = $(if ($isBoot) { ' /setowner *S-1-5-32-544 /T' } else { ' /setowner *S-1-5-32-544' })
+    $seen = @($logNow | Where-Object { $_ -like 'ICACLS *' -and $_.ToLowerInvariant().Contains(($m + $want).ToLowerInvariant()) -and ($isBoot -or -not $_.Contains(' /T')) })
+    if ($seen.Count -eq 0) { $why += ((Split-Path -Leaf $m) + ' not re-owned to Administrators') }
+  }
   if ($why.Count -eq 0) { return 'locked=yes' }
   return ('locked=NO (' + ($why -join '; ') + ')')
 }
