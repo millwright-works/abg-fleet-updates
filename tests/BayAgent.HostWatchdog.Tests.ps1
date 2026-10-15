@@ -38,7 +38,7 @@ $Scratch = Join-Path $env:TEMP ("bayagent-watchdogtest-" + [guid]::NewGuid().ToS
 New-Item -ItemType Directory -Force -Path $Scratch | Out-Null
 
 $SourceText = [IO.File]::ReadAllText($WatchdogScript)
-# The watchdog derives its install root from where it sits (Get-BayInstallRoot), so the copy is written to <scratch>baybootstrap.
+# The watchdog derives its install root from where it sits (Get-BayInstallRoot), so the copy is written to <scratch>bay\bootstrap.
 
 $taskLine = '$HostTaskName    = "\AOC Bay Agent"'
 
@@ -75,8 +75,8 @@ function schtasks.exe {
     $anchor = '$mutex = New-Object'
     if (-not $text.Contains($anchor)) { return [pscustomobject]@{ ok = $false; exit = -99; log = 'ANCHOR NOT FOUND'; calls = @() } }
     $text = $text.Replace($anchor, $over + $anchor)
-    New-Item -ItemType Directory -Force -Path (Join-Path $dir "baybootstrap") | Out-Null
-    $copy = Join-Path $dir "baybootstrap\watchdog.ps1"
+    New-Item -ItemType Directory -Force -Path (Join-Path $dir "bay\bootstrap") | Out-Null
+    $copy = Join-Path $dir "bay\bootstrap\watchdog.ps1"
     [IO.File]::WriteAllText($copy, $text, (New-Object Text.UTF8Encoding($false)))
     $env:WDT_CALLS = $callsFile
     $env:WDT_SCHTASKS = $Schtasks

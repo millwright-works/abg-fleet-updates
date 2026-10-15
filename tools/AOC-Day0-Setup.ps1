@@ -296,14 +296,14 @@ function Create-WatchdogTask([string]$watchdogPath) {
 # the watchdog is only a safety net that brings it back up to a minute later. The battery flags keep a UPS that reports
 # itself as a battery from stopping it. $kioskPassword is accepted for older callers and ignored.
 function Create-AgentTask([string]$agentHostPath, [string]$kioskAccount, [string]$kioskPassword) {
-  $tn = "AOC Bay Agent"
+  $tn = "\AOC Bay Agent"
   $psArgs = "-NoProfile -WindowStyle Minimized -File `"$agentHostPath`""
   $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
   $trigger = New-ScheduledTaskTrigger -AtLogOn
   $principal = New-ScheduledTaskPrincipal -UserId $kioskAccount -LogonType Interactive -RunLevel Limited
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
-  Register-ScheduledTask -TaskName $tn -TaskPath "\" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-  Write-Host "Created/updated scheduled task: \$tn (at logon, Interactive as $kioskAccount, no stored password, no time limit)"
+  Register-ScheduledTask -TaskName $tn.TrimStart([char]92) -TaskPath "\" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+  Write-Host "Created/updated scheduled task: $tn (at logon, Interactive as $kioskAccount, no stored password, no time limit)"
 }
 
 # ---------- Dataverse helpers ----------

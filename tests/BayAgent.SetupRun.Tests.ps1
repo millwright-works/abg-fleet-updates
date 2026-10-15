@@ -437,15 +437,15 @@ try {
     # =========================================================================================== Bay 1 defects, 2026-10-15
     Section "Agent task: interactive only, no stored password, no 72-hour end (Bay 1: the stored-password task could never start)"
     $reg1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^REGTASK  ' })
-    Assert-True ($reg1.Count -eq 1 -and $reg1[0] -match '^REGTASK  \\ABG Bay Agent ') "the agent task is registered once through Register-ScheduledTask"
+    Assert-True ($reg1.Count -eq 1 -and $reg1[0] -match '^REGTASK  \\AOC Bay Agent ') "the agent task is registered once through Register-ScheduledTask"
     $reg1Line = $(if ($reg1.Count -ge 1) { $reg1[0] } else { "" })
     Assert-True ($reg1Line -match 'logonType=Interactive ' -and $reg1Line -match 'runLevel=Limited ' -and $reg1Line -match 'storedCredential=absent') "...as LogonType Interactive, RunLevel Limited, no stored password"
     Assert-True ($reg1Line -match 'principal=BAY1KIOSK\\BayKiosk logonType') "...and runs as the kiosk account BAY1KIOSK\BayKiosk (not SYSTEM, not the admin running setup)"
     Assert-True ($reg1Line -match 'atLogOn=True triggerUser=\[\]') "...with an any-user logon trigger"
     Assert-True ($reg1Line -match 'multiple=IgnoreNew ' -and $reg1Line -match 'limitSeconds=0 ' -and $reg1Line -match 'battery=True') "...IgnoreNew, no execution time limit (0 = none, so Task Scheduler never ends the host), and not stopped on battery"
-    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*ABG Bay Agent') -eq 0) "...and the agent task is not created through schtasks /RP /IT any more"
+    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*AOC Bay Agent') -eq 0) "...and the agent task is not created through schtasks /RP /IT any more"
     Assert-True ((Get-LogCount $r1 '^SCHTASKS .*/RP') -eq 0 -and (Get-LogCount $r1 'ON THE COMMAND LINE') -eq 0) "no schtasks line carries a password"
-    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*ABG Host Watchdog.* /RU SYSTEM') -eq 1) "the watchdog task is still created through schtasks, as SYSTEM"
+    Assert-True ((Get-LogCount $r1 '^SCHTASKS .*AOC Host Watchdog.* /RU SYSTEM') -eq 1) "the watchdog task is still created through schtasks, as SYSTEM"
 
     Section "A schtasks refusal is not reported as 'Created' (Day0 used to Out-Null the output)"
     $schFail = Invoke-SetupPlan "schtasks-refused" @(
@@ -453,8 +453,8 @@ try {
     )
     $f1 = Get-PlanRun $schFail 0
     $ft1 = Get-RunText $f1
-    Assert-True ($ft1 -notmatch 'Created/updated scheduled task: \\ABG Host Watchdog') "the failed registration does not print 'Created/updated'"
-    Assert-True (("$($f1.ended) $ft1") -match 'Registering \\ABG Host Watchdog failed: schtasks exit 1: ERROR: Access is denied') "...it stops, naming the task, the exit code and the schtasks error text ($($f1.ended))"
+    Assert-True ($ft1 -notmatch 'Created/updated scheduled task: \\AOC Host Watchdog') "the failed registration does not print 'Created/updated'"
+    Assert-True (("$($f1.ended) $ft1") -match 'Registering \\AOC Host Watchdog failed: schtasks exit 1: ERROR: Access is denied') "...it stops, naming the task, the exit code and the schtasks error text ($($f1.ended))"
 
     Section "Power settings apply on every run, lockdown or not (a bay set up with -SkipLockdown slept after 5 idle minutes)"
     $pw1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^POWERCFG ' })
