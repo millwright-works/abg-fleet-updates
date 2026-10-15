@@ -51,7 +51,7 @@ function Section([string]$name) { Write-Host ""; Write-Host "== $name" -Foregrou
 $BaseDir = Join-Path $env:TEMP ("bayagent-setupruntest-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $BaseDir | Out-Null
 
-$EmptyRun = [pscustomobject]@{ title = "(this run did not happen)"; ended = "NOT RUN"; stoppedAt = ""; console = @(); log = @(); reg = [pscustomobject]@{}; policy = ""; tasks = @(); users = @(); configText = $null; secretToolOnDisk = $false; markerInConsole = $true }
+$EmptyRun = [pscustomobject]@{ title = "(this run did not happen)"; ended = "NOT RUN"; stoppedAt = ""; console = @(); log = @(); reg = [pscustomobject]@{}; policy = ""; tasks = @(); users = @(); configText = $null; secretToolOnDisk = $false; markerInConsole = $true; acls = $null; tamperRan = @("(this run did not happen)") }
 
 function Invoke-SetupPlan {
     # One modeled PC, its runs in order. Returns the harness result; a missing or unreadable result is a result with
@@ -110,6 +110,16 @@ function Test-NoFailedRow($Run) {
     return ($seen -and (@(Get-RowsInBucket $Run "FAIL").Count -eq 0))
 }
 function Get-LogCount($Run, [string]$Pattern) { return @(Get-RunLog $Run | Where-Object { $_ -match $Pattern }).Count }
+# "yes" when the harness found the file or folder of that key after the run, "no" when it found it absent, "unknown" when
+# the run has no such record (a run that did not happen); never an error under strict mode.
+function Get-PathPresence($Run, [string]$Key) {
+    $a = $Run.PSObject.Properties["acls"]
+    if ($null -eq $a -or $null -eq $a.Value) { return "unknown" }
+    $n = $a.Value.PSObject.Properties[$Key]
+    if ($null -eq $n) { return "unknown" }
+    if ($null -eq $n.Value) { return "no" }
+    return "yes"
+}
 function Get-LineIndex($Run, [string]$Pattern) {
     $c = @($Run.console)
     for ($i = 0; $i -lt $c.Count; $i++) { if ([string]$c[$i] -match $Pattern) { return $i } }
@@ -553,8 +563,9 @@ try {
     }
     # Day0 applies the folder rules itself (it is also run alone), and Setup applies them before it (the -SkipDay0 run has only Setup's).
     $arA = Get-PlanRun $aclPlan 0; $arC = Get-PlanRun $aclPlan 2
-    Assert-True ((Get-LogCount $arA '^ICACLS .*/setowner') -eq 2) "a run with Day0 applies the locked-folder rules twice: once in Setup's Phase 3A and once inside Day0"
-    Assert-True ((Get-LogCount $arC '^ICACLS .*/setowner') -eq 1) "a -SkipDay0 run applies them once, in Setup's Phase 3A (so a lockdown-only run still repairs a bay)"
+    # Three owner resets with Day0: Set-SetupFolderLock before the first download, the helper's in Phase 3A, the helper's in Day0.
+    Assert-True ((Get-LogCount $arA '^ICACLS .*/setowner') -eq 3) "a run with Day0 applies the locked-folder rules three times: before the first download, in Setup's Phase 3A, and inside Day0"
+    Assert-True ((Get-LogCount $arC '^ICACLS .*/setowner') -eq 2) "a -SkipDay0 run applies them twice, before the download and in Setup's Phase 3A (so a lockdown-only run still repairs a bay)"
     Assert-True ((Get-RunText $arA) -match 'Folder permissions \(SYSTEM-run scripts are not writable by BayKiosk\)' -and (Get-RunText $arA) -match 'Lock the code-signing private key') "Day0's own steps are on the screen"
 
     Section "A0.699 permissions: no BayKiosk account on the PC (-SkipKioskSetup): Day0's self-check refuses to finish"
@@ -565,6 +576,57 @@ try {
     Assert-True ($null -ne $arA.acls.day0file -and $null -eq $arA.acls.stagingday0 -and $null -ne $arA.acls.aclhelper) "the installer scripts (Day0 and the permissions definition) are run from the locked bootstrap\setup folder, never from the agent's staging folder that BayKiosk can write"
     $arB = Get-PlanRun $aclPlan 1
     Assert-True ((Get-LogCount $arB '^ICACLS .*/setowner \*S-1-5-32-544 /T /C /L /Q') -ge 1) "the folder SYSTEM runs from is re-owned to Administrators on every run (recorded: the harness cannot be elevated)"
+
+    # =========================================================================================== downloads that Setup runs
+    # (a) bootstrap\setup is locked BEFORE anything is downloaded into it. The harness writes, at the moment of every download,
+    # a DLFOLDER line judged from the raw ACLs of the destination folder and each folder above it (see SrhFolderLockVerdict):
+    # AllBirdies, BayAgent and bootstrap protected, and no write-class right for anyone but SYSTEM, Administrators and the
+    # stand-in administrator. Taken over every run that downloads: blank PCs (nothing there before the first download), the
+    # drift runs (BayKiosk Modify planted on bootstrap before the run) and the -SkipDay0 runs.
+    Section "Pinned downloads (a): bootstrap\setup is locked before anything is downloaded into it"
+    $dlRuns = @()
+    foreach ($pr in @(@($sheet, 4), @($full, 2), @($cust, 2), @($aclPlan, 3), @($nk, 1), @($sec, 1))) { for ($i = 0; $i -lt $pr[1]; $i++) { $dlRuns += , (Get-PlanRun $pr[0] $i) } }
+    $setupDl = 0; $setupDlLocked = 0; $setupDlBad = @(); $bootDl = 0; $bootDlLocked = 0
+    foreach ($dr in $dlRuns) {
+        foreach ($l in @(Get-RunLog $dr | Where-Object { $_ -match '^DLFOLDER ' })) {
+            if ($l -match '^DLFOLDER \S*/tools/(ABG-BayAcl|ABG-Day0-Setup)\.ps1 ') { $setupDl++; if ($l -match ' locked=yes$') { $setupDlLocked++ } else { $setupDlBad += ($dr.title + ": " + $l) } }
+            if ($l -match '^DLFOLDER \S*/bootstrap/ABG\.(AgentHost|HostWatchdog|SetClientSecretDpapi)\.ps1 ') { $bootDl++; if ($l -match ' locked=yes$') { $bootDlLocked++ } }
+        }
+    }
+    $setupDlTotal = 0; foreach ($dr in $dlRuns) { $setupDlTotal += (Get-LogCount $dr '^DOWNLOAD \S*/tools/(ABG-BayAcl|ABG-Day0-Setup)\.ps1$') }
+    Assert-True ($dlRuns.Count -eq 13 -and $setupDl -ge 13 -and $setupDl -eq $setupDlTotal) ("every download of the permissions file and of Day0 carries a folder verdict (" + $setupDl + " verdicts, " + $setupDlTotal + " downloads, over " + $dlRuns.Count + " runs)")
+    Assert-True ($setupDl -gt 0 -and $setupDlLocked -eq $setupDl) ("...and every one reads locked=yes: the folder and every folder above it were locked before the file arrived (" + $setupDlLocked + " of " + $setupDl + "; " + ($setupDlBad | Select-Object -First 2) + ")")
+    Assert-True ($bootDl -gt 0 -and $bootDlLocked -eq $bootDl) ("Day0's own downloads into bootstrap (the scripts SYSTEM and the agent task run) also land in a locked folder (" + $bootDlLocked + " of " + $bootDl + ")")
+    $logA = @(Get-RunLog (Get-PlanRun $aclPlan 0))
+    $iOwn = -1; $iDl = -1
+    for ($i = 0; $i -lt $logA.Count; $i++) { if ($iOwn -lt 0 -and $logA[$i] -match '^ICACLS .*\\BayAgent\\bootstrap /setowner \*S-1-5-32-544 /T') { $iOwn = $i }; if ($iDl -lt 0 -and $logA[$i] -match '^DOWNLOAD \S*/tools/ABG-BayAcl\.ps1$') { $iDl = $i } }
+    Assert-True ($iOwn -ge 0 -and $iDl -gt $iOwn) ("on a blank PC the owner of bootstrap is reset to Administrators before the first download (owner reset at record " + $iOwn + ", download at " + $iDl + ")")
+
+    # (b) a file whose SHA-256 is not the pinned one is never run. The harness serves it with one added line that leaves a
+    # marker file when it runs; the marker is the proof of running, read from disk, not from what the script printed.
+    Section "Pinned downloads (b): a permissions file that is not the pinned one stops the run before it runs"
+    $tA = Invoke-SetupPlan "tamper-acl" @(
+        [ordered]@{ title = "blank PC, the permissions file served is not the pinned one"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ tamperDownload = "ABG-BayAcl.ps1" } },
+        [ordered]@{ title = "the same PC, the right file served"; computerName = "BAY1KIOSK"; args = $Step9Args }
+    )
+    $tA1 = Get-PlanRun $tA 0; $tA2 = Get-PlanRun $tA 1
+    Assert-True ($tA.census -eq "ok" -and [string]::IsNullOrEmpty([string]$tA.harnessError) -and @($tA.runs).Count -eq 2) ("census ok, harness clean, two runs (" + $tA.census + " " + $tA.harnessError + ")")
+    Assert-True ([string]$tA1.ended -match '^STOPPED: ABG-BayAcl\.ps1 downloaded from \S+ is not the file this Setup-BayPC\.ps1 was written for: its SHA-256 is [0-9A-F]{64}, the pinned value is [0-9A-F]{64}\. It was NOT run') ("the run stops and says which file, both hashes, and that it was not run (" + $tA1.ended + ")")
+    Assert-True (@($tA1.tamperRan).Count -eq 0) ("the file that is not the pinned one did not run: no marker on disk (" + (@($tA1.tamperRan) -join ",") + ")")
+    Assert-True ((Get-PathPresence $tA1 "aclhelper") -eq "no") "...and it is not left in bootstrap\setup to be run by anyone else"
+    Assert-True ((Get-LogCount $tA1 '^DOWNLOAD ') -eq 1 -and (Get-LogCount $tA1 '^(SCHTASKS|REGTASK|CERT|SIGN) ') -eq 0 -and $null -eq $tA1.configText) ("nothing after it ran: no Day0 download, no task, no certificate, no signing, no configuration (downloads: " + (Get-LogCount $tA1 '^DOWNLOAD ') + ")")
+    Assert-True ($tA2.ended -eq "ran to its last line" -and @($tA2.tamperRan).Count -eq 0 -and (Test-NoFailedRow $tA2)) ("the next run, served the right file, sets the PC up as usual (" + $tA2.ended + ")")
+
+    Section "Pinned downloads (b): a Day0 that is not the pinned one stops the run before it runs"
+    $tD = Invoke-SetupPlan "tamper-day0" @(
+        [ordered]@{ title = "blank PC, the Day0 served is not the pinned one"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ tamperDownload = "ABG-Day0-Setup.ps1" } }
+    )
+    $tD1 = Get-PlanRun $tD 0
+    Assert-True ($tD.census -eq "ok" -and [string]::IsNullOrEmpty([string]$tD.harnessError) -and @($tD.runs).Count -eq 1) ("census ok, harness clean (" + $tD.census + " " + $tD.harnessError + ")")
+    Assert-True ([string]$tD1.ended -match '^STOPPED: ABG-Day0-Setup\.ps1 downloaded from \S+ is not the file this Setup-BayPC\.ps1 was written for: its SHA-256 is [0-9A-F]{64}, the pinned value is [0-9A-F]{64}\. It was NOT run') ("the run stops and says which file, both hashes, and that it was not run (" + $tD1.ended + ")")
+    Assert-True (@($tD1.tamperRan).Count -eq 0 -and (Get-PathPresence $tD1 "day0file") -eq "no")("Day0 did not run (no marker on disk) and is not left in bootstrap\setup (" + (@($tD1.tamperRan) -join ",") + ")")
+    Assert-True ((Get-LogCount $tD1 '^(SCHTASKS|REGTASK|CERT|SIGN) ') -eq 0 -and (Get-LogCount $tD1 '^DOWNLOAD \S*/bootstrap/') -eq 0 -and $null -eq $tD1.configText) "nothing Day0 does happened: no task, no certificate, no bootstrap download, no configuration"
+    Assert-True ((Get-RunText $tD1) -match 'SHA-256 matches the pinned value: ABG-BayAcl\.ps1') "the permissions file before it matched its pin and ran (the check tells the two files apart)"
 
     # =========================================================================================== the instrument can refuse
     Section "The census refuses a write through a tool nobody modeled (reg.exe)"

@@ -410,6 +410,45 @@ try {
         $allDl = @(Get-BlankPcCommands $day0Ast "Download-File" | ForEach-Object { $_.Extent.Text })
         Assert-True (@($five | Where-Object { $f = $_; @($allDl | Where-Object { $_.Contains($f) }).Count -eq 1 }).Count -eq 5 -and $allDl.Count -eq 6) "the five downloads that were there are still there, once each; six in all"
     }
+
+    # ---------------------------------------------------------------------------------------------- pinned downloads
+    # Outside the function gate above on purpose: these read only the AST and the repository files.
+    Section "Pinned downloads: each pin is the SHA-256 of the bytes GitHub serves, and each file is checked after its download and before it runs"
+    $pinAssign = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PinnedDownloadSha256' }, $true))
+    $pinTable = $null
+    if ($pinAssign.Count -eq 1) { $pinTable = @($pinAssign[0].Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)) | Select-Object -First 1 }
+    $pins = [ordered]@{}
+    if ($null -ne $pinTable) { foreach ($kv in $pinTable.KeyValuePairs) { $pins[[string]$kv.Item1.Value] = [string]$kv.Item2.Extent.Text.Trim().Trim('"') } }
+    Assert-True ($pinAssign.Count -eq 1 -and ((@($pins.Keys) | Sort-Object) -join ",") -eq "ABG-BayAcl.ps1,ABG-Day0-Setup.ps1") ("one pin table, assigned once, naming exactly the two files Setup runs (" + (@($pins.Keys) -join ",") + ")")
+    $repoTools = Split-Path -Parent $Day0Script
+    $repoTop = Split-Path -Parent $repoTools
+    $sha1 = [Security.Cryptography.SHA1]::Create(); $sha256 = [Security.Cryptography.SHA256]::Create()
+    foreach ($name in @("ABG-BayAcl.ps1", "ABG-Day0-Setup.ps1")) {
+        $pinned = $(if ($pins.Contains($name)) { [string]$pins[$name] } else { "" })
+        $file = Join-Path $repoTools $name
+        $bytes = [IO.File]::ReadAllBytes($file)
+        # What git stores for a *.ps1 (text eol=crlf): the working-tree bytes with every CR LF pair turned into LF.
+        $lf = New-Object System.Collections.Generic.List[byte]
+        for ($i = 0; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -eq 13 -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }; $lf.Add($bytes[$i]) }
+        $lfArr = $lf.ToArray()
+        $stored = (($sha256.ComputeHash($lfArr) | ForEach-Object { $_.ToString("X2") }) -join "")
+        Assert-True ($pinned -cmatch '^[0-9A-F]{64}$' -and $pinned -ceq $stored) ("pinned download $name : the pin is the SHA-256 of the stored (LF) bytes. The pin must read $stored (it reads " + $pinned + ")")
+        # A second producer: git's own conversion and object id for the same path, compared with the bytes hashed above.
+        $head = [Text.Encoding]::ASCII.GetBytes("blob " + $lfArr.Length + [char]0)
+        $mine = (($sha1.ComputeHash([byte[]]($head + $lfArr)) | ForEach-Object { $_.ToString("x2") }) -join "")
+        $gitId = ""
+        try { $gitId = [string](& git -C $repoTop hash-object ("--path=tools/" + $name) -- $file 2>$null | Select-Object -First 1) } catch { $gitId = "" }
+        Assert-True ($gitId -match '^[0-9a-f]{40}$' -and $gitId -eq $mine) ("pinned download $name : git stores exactly the bytes that were hashed (git object id " + $gitId + ", from those bytes " + $mine + "; git must answer from the repository)")
+        $chk = @(Get-BlankPcCommands $setupAst "Assert-PinnedDownload" | Where-Object { "$((Get-BlankPcParamValueAst $_ 'Name').Value)" -eq $name })
+        $pathVar = $(if ($chk.Count -eq 1) { "$((Get-BlankPcParamValueAst $chk[0] 'Path').Extent.Text)" } else { "" })
+        $dlCmd = @(Get-BlankPcCommands $setupAst "Invoke-WebRequest" | Where-Object { $pathVar -and "$((Get-BlankPcParamValueAst $_ 'OutFile').Extent.Text)" -eq $pathVar })
+        $runCmd = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -and $n.CommandElements[0].Extent.Text -eq $pathVar }, $true))
+        Assert-True ($chk.Count -eq 1 -and $dlCmd.Count -eq 1 -and $runCmd.Count -eq 1 -and $dlCmd[0].Extent.StartOffset -lt $chk[0].Extent.StartOffset -and $chk[0].Extent.StartOffset -lt $runCmd[0].Extent.StartOffset) ("$name is checked once, on the path it was downloaded to (" + $pathVar + "), after the download and before the one line that runs it")
+    }
+    $lockCalls = @(Get-BlankPcCommands $setupAst "Set-SetupFolderLock")
+    $firstDl = @(Get-BlankPcCommands $setupAst "Invoke-WebRequest" | Sort-Object { $_.Extent.StartOffset }) | Select-Object -First 1
+    $lockTop = ($lockCalls.Count -eq 1 -and $lockCalls[0].Parent -is [System.Management.Automation.Language.PipelineAst] -and $lockCalls[0].Parent.Parent -is [System.Management.Automation.Language.NamedBlockAst] -and $null -eq $lockCalls[0].Parent.Parent.Parent.Parent)
+    Assert-True ($lockTop -and $null -ne $firstDl -and $lockCalls[0].Extent.StartOffset -lt $firstDl.Extent.StartOffset) "Set-SetupFolderLock is called once, at the top level of the script (no switch can skip it), before the first download"
 }
 finally {
     try { Remove-Item -LiteralPath $BaseDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}

@@ -96,7 +96,32 @@ $Mutants = @(
        New = '$setupDir = Join-Path $AllBirdiesRoot "BayAgent\staging"' },
     @{ Id = "M21"; What = "the data folders lose BayKiosk's inherit-only Modify on what it creates"; File = "tools\ABG-BayAcl.ps1"
        Old = '(New-BayRule $KioskSid ([int]$R::Modify) "ContainerInherit, ObjectInherit" "InheritOnly"))'
-       New = '(New-BayRule $KioskSid ([int]$R::ReadAndExecute) "ContainerInherit, ObjectInherit" "InheritOnly"))' }
+       New = '(New-BayRule $KioskSid ([int]$R::ReadAndExecute) "ContainerInherit, ObjectInherit" "InheritOnly"))' },
+    # 2026-10-15 fix round: bootstrap\setup is locked before anything is downloaded into it, and a downloaded file runs
+    # only when its SHA-256 is the pinned one.
+    @{ Id = "M23"; What = "bootstrap\setup is locked only AFTER the permissions file is downloaded into it"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = 'Set-SetupFolderLock -Root $AllBirdiesRoot' + "NL" + '$aclHelperPath = Join-Path $setupDir "ABG-BayAcl.ps1"'
+       New = '$aclHelperPath = Join-Path $setupDir "ABG-BayAcl.ps1"'
+       Old2 = 'Invoke-WebRequest -Uri $aclHelperUrl -OutFile $aclHelperPath -UseBasicParsing'
+       New2 = 'Invoke-WebRequest -Uri $aclHelperUrl -OutFile $aclHelperPath -UseBasicParsing' + "NL" + 'Set-SetupFolderLock -Root $AllBirdiesRoot' },
+    @{ Id = "M24"; What = "the permissions file is run without its hash check"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = 'Assert-PinnedDownload -Path $aclHelperPath -Name "ABG-BayAcl.ps1" -Url $aclHelperUrl'
+       New = '# mutant: no hash check' },
+    @{ Id = "M25"; What = "Day0 is run without its hash check"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '  Assert-PinnedDownload -Path $day0Path -Name "ABG-Day0-Setup.ps1" -Url $Day0Url'
+       New = '  # mutant: no hash check' },
+    @{ Id = "M26"; What = "the hash check computes both values and never acts on a difference"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '  if ($actual -cne $expected) {'
+       New = '  if ($actual -cne $expected -and $false) {' },
+    @{ Id = "M27"; What = "a permissions file already in bootstrap\setup is overwritten in place (keeping a planted grant) instead of deleted first"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = 'if (Test-Path -LiteralPath $aclHelperPath) { [IO.File]::Delete($aclHelperPath) }'
+       New = '# mutant: no delete before the download' },
+    @{ Id = "M28"; What = "the early lock does not cut inheritance on AllBirdies, BayAgent and bootstrap"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '$acl.SetAccessRuleProtection((-not $isSetup), $false)'
+       New = '$acl.SetAccessRuleProtection($false, $false)' },
+    @{ Id = "M29"; What = "the early lock does not re-own bootstrap to Administrators"; File = "src\BayAgent\tools\Setup-BayPC.ps1"
+       Old = '  icacls $bootstrap /setowner "*S-1-5-32-544" /T /C /L /Q | Out-Null'
+       New = '  # mutant: no owner reset' }
 )
 $Only = @($Only | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 if ($Only.Count -gt 0) { $Mutants = @($Mutants | Where-Object { $Only -contains $_.Id }) }

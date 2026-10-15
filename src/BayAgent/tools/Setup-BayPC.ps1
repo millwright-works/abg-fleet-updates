@@ -84,6 +84,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------------
+# PINNED DOWNLOADS (the one place these values live)
+# ------------------------------------------------------------------
+# This script runs as Administrator and runs two files it downloads: ABG-BayAcl.ps1 (dot-sourced in Phase 3A) and
+# ABG-Day0-Setup.ps1 (run in Phase 3). Before either runs, its SHA-256 is compared with the value below; a difference
+# stops the run and the downloaded file is deleted unrun (Assert-PinnedDownload). The address decides nothing: -Day0Url
+# may name a fork or a pinned commit, and the file found there runs only if its bytes are exactly the ones pinned here.
+# HOW TO UPDATE, in the same commit that changes either file: the value is the SHA-256 of the bytes GitHub serves, which
+# are the bytes git STORES (LF line endings). It is NOT the hash of a Windows checkout of the file: .gitattributes gives
+# *.ps1 CRLF endings in a working tree (measured 2026-10-15: raw.githubusercontent.com served the stored LF bytes). Either
+#   - in Git Bash, after "git add" of the changed file:  git cat-file blob :tools/ABG-BayAcl.ps1 | sha256sum
+#   - or run tests\BayAgent.SetupBlankPc.Tests.ps1: its "pinned download" lines print the value each pin must hold.
+$PinnedDownloadSha256 = @{
+  "ABG-BayAcl.ps1"     = "DADFB54F5143E7169C598C4E727E8E5E513F5E3C479F247E7B16AEBA05FA3317"
+  "ABG-Day0-Setup.ps1" = "692C810DF998A316C46816EAF89EC6D7918D30A5C6AE4DD4A95973DFED0E920E"
+}
+
+# ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 function Write-Step($msg) {
@@ -105,6 +122,55 @@ function Test-IsAdmin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# A downloaded file runs only when its SHA-256 is the one pinned for it (PINNED DOWNLOADS, top of this script). A file
+# that differs is deleted unrun and the run stops; a name with no pin stops the run too (nothing downloaded runs unpinned).
+function Assert-PinnedDownload([string]$Path, [string]$Name, [string]$Url) {
+  $expected = [string]$PinnedDownloadSha256[$Name]
+  if ($expected -cnotmatch '^[0-9A-F]{64}$') { throw "No SHA-256 is pinned for $Name in Setup-BayPC.ps1, and a downloaded file without one is never run. Stopping." }
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { $actual = (($sha.ComputeHash([IO.File]::ReadAllBytes($Path)) | ForEach-Object { $_.ToString("X2") }) -join "") } finally { $sha.Dispose() }
+  if ($actual -cne $expected) {
+    [IO.File]::Delete($Path)
+    throw ("$Name downloaded from $Url is not the file this Setup-BayPC.ps1 was written for: its SHA-256 is $actual, the pinned value is $expected. It was NOT run, and it has been deleted. Use the Setup-BayPC.ps1 from the same commit as the file; if the file was changed on purpose, update its pin (PINNED DOWNLOADS, at the top of Setup-BayPC.ps1). Stopping.")
+  }
+  Write-Host "  SHA-256 matches the pinned value: $Name" -ForegroundColor Green
+}
+
+# Locks BayAgent\bootstrap\setup BEFORE anything is downloaded into it: the file that defines the permissions
+# (ABG-BayAcl.ps1) is itself one of the downloads, so it cannot do this first. The rules are the ones it applies a moment
+# later (Chain and LockTree there): the root, BayAgent and bootstrap get SYSTEM and Administrators full control and Users
+# read and execute, inheritance cut, so BayKiosk can neither write into setup\ nor rename or replace a folder above it;
+# setup\ keeps only what it inherits (an entry planted on it is removed); bootstrap and everything in it is re-owned to
+# Administrators (an earlier owner keeps the right to rewrite the permissions). A link on that path stops the run.
+function Set-SetupFolderLock([string]$Root) {
+  $bootstrap = Join-Path $Root "BayAgent\bootstrap"
+  $setup = Join-Path $bootstrap "setup"
+  $paths = @($Root, (Join-Path $Root "BayAgent"), $bootstrap, $setup)
+  foreach ($p in $paths) { if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
+  $full = [Security.AccessControl.FileSystemRights]::FullControl
+  $rx = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+  $ci = [Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+  $np = [Security.AccessControl.PropagationFlags]::None
+  $allow = [Security.AccessControl.AccessControlType]::Allow
+  $lockRules = @(
+    (New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier("S-1-5-18")), $full, $ci, $np, $allow)),
+    (New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")), $full, $ci, $np, $allow)),
+    (New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), $rx, $ci, $np, $allow)))
+  foreach ($p in $paths) {
+    $item = Get-Item -LiteralPath $p -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "'$p' is a link, so the folder setup runs its downloads from cannot be locked. Remove it by hand (as Administrator) and run setup again." }
+    $isSetup = ($p -eq $setup)
+    $acl = $item.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+    $acl.SetAccessRuleProtection((-not $isSetup), $false)
+    foreach ($r in @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleSpecific($r) }
+    if (-not $isSetup) { foreach ($r in $lockRules) { $acl.AddAccessRule($r) } }
+    $item.SetAccessControl($acl)
+  }
+  $global:LASTEXITCODE = 0
+  icacls $bootstrap /setowner "*S-1-5-32-544" /T /C /L /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Could not set the owner of '$bootstrap' to Administrators (icacls exit $LASTEXITCODE); nothing was downloaded. Stopping." }
 }
 
 function Get-ShellActivationPlan {
@@ -505,20 +571,26 @@ if (-not $SkipKioskSetup) {
 # ==================================================================
 # A0.699 / F-SEC: BayKiosk must not hold the code-signing key, and must not be able to change anything a SYSTEM task
 # runs. The rules live in ONE file, tools\ABG-BayAcl.ps1, downloaded beside Day0. It goes into BayAgent\bootstrap\setup\,
-# which this step locks: the agent's own staging\ folder is writable by BayKiosk, and an administrator's script must
-# never be run from a folder the kiosk account can write.
+# which is locked BEFORE the download (Set-SetupFolderLock): the agent's own staging\ folder is writable by BayKiosk, and
+# an administrator's script must never be downloaded into, or run from, a folder the kiosk account can write. It runs
+# only if its SHA-256 is the pinned one (PINNED DOWNLOADS, top of this script).
 Write-Step "Phase 3A: File permissions and the code-signing key"
 $setupDir = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\setup"
 if (-not (Test-Path $setupDir)) { New-Item -ItemType Directory -Path $setupDir -Force | Out-Null }
+Set-SetupFolderLock -Root $AllBirdiesRoot
 $aclHelperPath = Join-Path $setupDir "ABG-BayAcl.ps1"
 $aclHelperUrl = $Day0Url -replace 'ABG-Day0-Setup\.ps1$', 'ABG-BayAcl.ps1'
 Write-Host "  Downloading the permissions definition from: $aclHelperUrl"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# A file already here keeps its own permissions when it is overwritten, so it is deleted first and the download is a new
+# file that takes the locked folder's.
+if (Test-Path -LiteralPath $aclHelperPath) { [IO.File]::Delete($aclHelperPath) }
 Invoke-WebRequest -Uri $aclHelperUrl -OutFile $aclHelperPath -UseBasicParsing
 if (-not (Test-Path $aclHelperPath)) {
   Write-Error "Failed to download ABG-BayAcl.ps1. Nothing after this point is safe to run; stopping."
   exit 1
 }
+Assert-PinnedDownload -Path $aclHelperPath -Name "ABG-BayAcl.ps1" -Url $aclHelperUrl
 . $aclHelperPath
 $aclKioskSid = Get-BayKioskSid -User $BayKioskUser
 if ($null -eq $aclKioskSid) {
@@ -541,7 +613,9 @@ if (-not $SkipDay0) {
   if (-not (Test-Path $day0Dir)) { New-Item -ItemType Directory -Path $day0Dir -Force | Out-Null }
   $day0Path = Join-Path $day0Dir "ABG-Day0-Setup.ps1"
 
-  # Download Day0 from GitHub (it lives at tools/ in the repo root, not under src/BayAgent/)
+  # Download Day0 from GitHub (it lives at tools/ in the repo root, not under src/BayAgent/). Run only if its SHA-256 is
+  # the pinned one. (A Day0 already in this folder needs no delete first: Set-BayAcls in Phase 3A has just reset every
+  # file under bootstrap to inherit only and re-owned it to Administrators.)
   Write-Host "  Downloading Day0 from: $Day0Url"
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   Invoke-WebRequest -Uri $Day0Url -OutFile $day0Path -UseBasicParsing
@@ -550,6 +624,7 @@ if (-not $SkipDay0) {
     Write-Error "Failed to download ABG-Day0-Setup.ps1"
     exit 1
   }
+  Assert-PinnedDownload -Path $day0Path -Name "ABG-Day0-Setup.ps1" -Url $Day0Url
 
   # Build Day0 arguments
   $day0Args = @{

@@ -48,6 +48,7 @@ $global:Srh = @{
   Log = New-Object System.Collections.ArrayList
   Policy = 'Undefined'; PolicyThrows = $true; PolicyTakes = $true
   FailDownloadMatch = ''; TimestampOk = $true; RebootAnswer = 'n'; RegStuck = @()
+  TamperDownload = ''; MeSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 }
 function global:SrhRec([string]$m) { [void]$global:Srh.Log.Add($m) }
 function global:SrhAssertScratch([string]$p) {
@@ -116,8 +117,51 @@ function global:Invoke-WebRequest {
   if ($rel -eq 'tools\ABG-BayAcl.ps1') { $src = $global:Srh.AclHelperServed }
   if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $src)) { SrhRec "DOWNLOAD $Uri -> 404 (not in the repository tree)"; throw "The remote server returned an error: (404) Not Found." }
   SrhAssertScratch $OutFile
+  # The model's "tamperDownload": the file of that name is served with one line added that leaves a marker file when it
+  # runs, so a suite can tell whether a file that is not the pinned one was run.
+  $leaf = Split-Path -Leaf $rel
+  if ($global:Srh.TamperDownload -and $leaf -eq $global:Srh.TamperDownload) { $src = SrhTamperedCopy $src $leaf }
+  # Whether anyone but SYSTEM, Administrators and the stand-in administrator could write the folder at this moment.
+  SrhRec ("DLFOLDER $Uri " + (SrhFolderLockVerdict $OutFile))
   Microsoft.PowerShell.Management\Copy-Item -LiteralPath $src -Destination $OutFile -Force
   SrhRec "DOWNLOAD $Uri"
+}
+function global:SrhTamperedCopy([string]$src, [string]$leaf) {
+  $text = [IO.File]::ReadAllText($src)
+  $anchor = 'Set-StrictMode -Version Latest'
+  $at = $text.IndexOf($anchor)
+  if ($at -lt 0) { throw "HARNESS: no place to add the tamper marker in $leaf" }
+  $marker = Join-Path $global:Srh.Root ('TAMPERED-RAN-' + $leaf + '.txt')
+  $line = "[IO.File]::WriteAllText('" + $marker + "', 'ran')`r`n"
+  $out = Join-Path $global:Srh.Root ('tampered-' + $leaf)
+  [IO.File]::WriteAllText($out, $text.Substring(0, $at) + $line + $text.Substring($at), (New-Object Text.UTF8Encoding($false)))
+  return $out
+}
+# "locked=yes" when, at the moment of the download: AllBirdies, BayAgent and bootstrap (those on the path) have inheritance
+# cut, and no folder from the destination's up to AllBirdies, nor a file already at the destination, gives a write-class
+# right on itself to anyone but SYSTEM, Administrators or this harness's own account (the stand-in administrator). Read
+# from the ACL Windows returns, with the masks written out here; nothing from the scripts under test.
+function global:SrhFolderLockVerdict([string]$outFile) {
+  $allRoot = (Join-Path $global:Srh.Root 'AllBirdies').TrimEnd('\')
+  $mustProtect = @($allRoot, (Join-Path $allRoot 'BayAgent'), (Join-Path $allRoot 'BayAgent\bootstrap')) | ForEach-Object { $_.ToLowerInvariant() }
+  $okSids = @('S-1-5-18', 'S-1-5-32-544', $global:Srh.MeSid)
+  $writeBits = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000
+  $why = @()
+  $items = @()
+  if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $outFile) { $items += $outFile }
+  $d = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($outFile))
+  while ($d -and $d.Length -ge $allRoot.Length) { $items += $d; if ($d.ToLowerInvariant() -eq $allRoot.ToLowerInvariant()) { break }; $d = [IO.Path]::GetDirectoryName($d) }
+  foreach ($p in $items) {
+    if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $p)) { $why += "$p missing"; continue }
+    $acl = (Microsoft.PowerShell.Management\Get-Item -LiteralPath $p -Force).GetAccessControl()
+    if ($mustProtect -contains $p.ToLowerInvariant() -and -not $acl.AreAccessRulesProtected) { $why += ((Split-Path -Leaf $p) + ' inherits') }
+    foreach ($r in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+      if ($r.AccessControlType -ne 'Allow' -or (([int]$r.PropagationFlags -band 2) -ne 0) -or $okSids -contains $r.IdentityReference.Value) { continue }
+      if (([int]$r.FileSystemRights -band $writeBits) -ne 0) { $why += ((Split-Path -Leaf $p) + ' writable by ' + $r.IdentityReference.Value) }
+    }
+  }
+  if ($why.Count -eq 0) { return 'locked=yes' }
+  return ('locked=NO (' + ($why -join '; ') + ')')
 }
 function global:Invoke-RestMethod { throw "HARNESS: Invoke-RestMethod is not served (no Dataverse call may happen in a rehearsal)" }
 function global:Get-ChildItem {
@@ -261,13 +305,6 @@ try {
     }
   }
 
-  # ---------------------------------------------------------------- the script copy (one change: Test-IsAdmin)
-  $setupText = [IO.File]::ReadAllText($SetupScript)
-  $needle = 'return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'
-  if (([regex]::Matches($setupText, [regex]::Escape($needle))).Count -ne 1) { throw "HARNESS: the Test-IsAdmin line was not found exactly once" }
-  $setupCopy = Join-Path $Root 'Setup-BayPC.harness.ps1'
-  [IO.File]::WriteAllText($setupCopy, $setupText.Replace($needle, 'return $true'), (New-Object Text.UTF8Encoding($false)))
-
   # The helper as served: ONE change, the owner list also names this harness's account (see the header).
   $helperText = [IO.File]::ReadAllText((Join-Path $RepoRoot 'tools\ABG-BayAcl.ps1'))
   $ownerNeedle = '$okOwners = @($script:BaySid.System, $script:BaySid.Admins, $script:BaySid.TrustedInstaller) + @($ExtraOwners)'
@@ -282,6 +319,27 @@ try {
   $served = $served.Replace($rulesNeedle, ('(New-BayRule (Get-BaySidObject $script:BaySid.Users) $rx "ContainerInherit, ObjectInherit" "None"),' + "`r`n" + '    (New-BayRule (Get-BaySidObject "' + $meSid + '") $full "ContainerInherit, ObjectInherit" "None"))'))
   [IO.File]::WriteAllText($servedHelper, $served, (New-Object Text.UTF8Encoding($false)))
   $global:Srh.AclHelperServed = $servedHelper
+
+  # ---------------------------------------------------------------- the script copy (three changes)
+  # (1) Test-IsAdmin returns true. (2) Set-SetupFolderLock's rules also give this harness's account full control, as the
+  # served helper does and for the same reason. (3) The two pinned SHA-256 values become those of the files this harness
+  # serves (the served helper is changed above, and a suite may serve a changed Day0). The real values are pinned against
+  # the stored repository bytes by BayAgent.SetupBlankPc.Tests.ps1; here what is proven is what the script DOES with a pin.
+  $setupText = [IO.File]::ReadAllText($SetupScript)
+  $needle = 'return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'
+  if (([regex]::Matches($setupText, [regex]::Escape($needle))).Count -ne 1) { throw "HARNESS: the Test-IsAdmin line was not found exactly once" }
+  $setupText = $setupText.Replace($needle, 'return $true')
+  $lockNeedle = '(New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), $rx, $ci, $np, $allow)))'
+  if (([regex]::Matches($setupText, [regex]::Escape($lockNeedle))).Count -ne 1) { throw "HARNESS: the Users rule of Set-SetupFolderLock was not found exactly once" }
+  $setupText = $setupText.Replace($lockNeedle, ('(New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), $rx, $ci, $np, $allow)),' + "`r`n" + '    (New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier("' + $meSid + '")), $full, $ci, $np, $allow)))'))
+  foreach ($pin in @(@{ Name = 'ABG-BayAcl.ps1'; File = $servedHelper }, @{ Name = 'ABG-Day0-Setup.ps1'; File = $Day0Script })) {
+    $pinRx = '("' + [regex]::Escape($pin.Name) + '"\s*=\s*")[0-9A-F]{64}(")'
+    if (([regex]::Matches($setupText, $pinRx)).Count -ne 1) { throw "HARNESS: the pin for $($pin.Name) was not found exactly once" }
+    $servedHash = (([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($pin.File)) | ForEach-Object { $_.ToString('X2') }) -join '')
+    $setupText = [regex]::Replace($setupText, $pinRx, ('${1}' + $servedHash + '${2}'))
+  }
+  $setupCopy = Join-Path $Root 'Setup-BayPC.harness.ps1'
+  [IO.File]::WriteAllText($setupCopy, $setupText, (New-Object Text.UTF8Encoding($false)))
   # The machine key store, in the scratch root: ProgramData is this run's own, with one fake key file.
   $env:ProgramData = Join-Path $Root 'ProgramData'
   $keyDir = Join-Path $env:ProgramData 'Microsoft\Crypto\Keys'
@@ -294,7 +352,7 @@ try {
   foreach ($run in @($plan.runs)) {
     # ---- the modeled facts this run starts from
     $model = $run.model
-    $global:Srh.PolicyThrows = $true; $global:Srh.PolicyTakes = $true; $global:Srh.TimestampOk = $true; $global:Srh.FailDownloadMatch = ''; $global:Srh.RebootAnswer = 'n'; $global:Srh.RegStuck = @(); $global:Srh.SchtasksFailMatch = ''; $global:Srh.PowercfgExit = 0
+    $global:Srh.PolicyThrows = $true; $global:Srh.PolicyTakes = $true; $global:Srh.TimestampOk = $true; $global:Srh.FailDownloadMatch = ''; $global:Srh.RebootAnswer = 'n'; $global:Srh.RegStuck = @(); $global:Srh.SchtasksFailMatch = ''; $global:Srh.PowercfgExit = 0; $global:Srh.TamperDownload = ''
     if ($null -ne $model) {
       foreach ($p in $model.PSObject.Properties) {
         switch ($p.Name) {
@@ -307,6 +365,7 @@ try {
           'regRemove'         { foreach ($k in @($p.Value)) { $global:Srh.Reg.Remove(([string]$k).ToLower()) } }
           'schtasksFailMatch' { $global:Srh.SchtasksFailMatch = [string]$p.Value }
           'powercfgExit'      { $global:Srh.PowercfgExit = [int]$p.Value }
+          'tamperDownload'    { $global:Srh.TamperDownload = [string]$p.Value }
           'regStuck'          { $global:Srh.RegStuck = @($p.Value | ForEach-Object { ([string]$_).ToLower() }) }
           'keyGrantedToKiosk' { if ([bool]$p.Value) { $kf = New-Object IO.FileInfo($keyFile); $ks = $kf.GetAccessControl(); $ks.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($global:Srh.KioskSid)), 'Read', 'Allow'))); $kf.SetAccessControl($ks) } }
           'seedDrift'         { if ([bool]$p.Value) {
@@ -316,6 +375,9 @@ try {
               if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $dp) { $di = New-Object IO.DirectoryInfo($dp); $ds = $di.GetAccessControl(); $ds.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ksid, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))); $di.SetAccessControl($ds) }
               $wf = Join-Path $allRoot 'BayAgent\bootstrap\ABG.HostWatchdog.ps1'
               if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $wf) { $fi = New-Object IO.FileInfo($wf); $fs = $fi.GetAccessControl(); $fs.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ksid, 'Modify', 'Allow'))); $fi.SetAccessControl($fs) }
+              # And on the permissions file a previous run left in bootstrap\setup: overwritten in place, it would keep this grant.
+              $hf = Join-Path $allRoot 'BayAgent\bootstrap\setup\ABG-BayAcl.ps1'
+              if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $hf) { $hi = New-Object IO.FileInfo($hf); $hs = $hi.GetAccessControl(); $hs.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ksid, 'Modify', 'Allow'))); $hi.SetAccessControl($hs) }
             } }
           'placeAgent'        { if ([bool]$p.Value) { $ap = Join-Path $allRoot 'BayAgent\current\BayAgent.ps1'; Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ap) | Out-Null; [IO.File]::WriteAllText($ap, '# stand-in for the installed agent') } }
           'placeSecretFile'   { if ([bool]$p.Value) { $sp = Join-Path $allRoot 'BayAgent\secrets\clientsecret.dpapi'; Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sp) | Out-Null; [IO.File]::WriteAllText($sp, 'stand-in, not a secret') } }
@@ -357,6 +419,8 @@ try {
       secretToolOnDisk = [bool](Microsoft.PowerShell.Management\Test-Path -LiteralPath (Join-Path $allRoot 'BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1'))
       acls            = (SrhDumpAcls $allRoot $keyFile)
       markerInConsole = [bool]($consoleText.Contains($global:Srh.Marker))
+      # Marker files a tampered download left by running (cumulative over the plan's runs).
+      tamperRan       = @([IO.Directory]::GetFiles($global:Srh.Root, 'TAMPERED-RAN-*') | ForEach-Object { [IO.Path]::GetFileName($_) })
     }
   }
 }
