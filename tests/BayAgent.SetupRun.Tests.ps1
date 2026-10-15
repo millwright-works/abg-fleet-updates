@@ -439,7 +439,8 @@ try {
     $reg1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^REGTASK  ' })
     Assert-True ($reg1.Count -eq 1 -and $reg1[0] -match '^REGTASK  \\ABG Bay Agent ') "the agent task is registered once through Register-ScheduledTask"
     $reg1Line = $(if ($reg1.Count -ge 1) { $reg1[0] } else { "" })
-    Assert-True ($reg1Line -match 'logonType=Interactive ' -and $reg1Line -match 'runLevel=Limited ' -and $reg1Line -match 'password=none') "...as LogonType Interactive, RunLevel Limited, no stored password"
+    Assert-True ($reg1Line -match 'logonType=Interactive ' -and $reg1Line -match 'runLevel=Limited ' -and $reg1Line -match 'storedCredential=absent') "...as LogonType Interactive, RunLevel Limited, no stored password"
+    Assert-True ($reg1Line -match 'principal=BAY1KIOSK\\BayKiosk logonType') "...and runs as the kiosk account BAY1KIOSK\BayKiosk (not SYSTEM, not the admin running setup)"
     Assert-True ($reg1Line -match 'atLogOn=True triggerUser=\[\]') "...with an any-user logon trigger"
     Assert-True ($reg1Line -match 'multiple=IgnoreNew ' -and $reg1Line -match 'limitSeconds=0 ' -and $reg1Line -match 'battery=True') "...IgnoreNew, no execution time limit (0 = none, so Task Scheduler never ends the host), and not stopped on battery"
     Assert-True ((Get-LogCount $r1 '^SCHTASKS .*ABG Bay Agent') -eq 0) "...and the agent task is not created through schtasks /RP /IT any more"

@@ -155,7 +155,7 @@ function global:New-ScheduledTaskSettingsSet {
 }
 function global:Register-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
-  SrhRec ("REGTASK  {0}{1} execute={2} args=[{3}] atLogOn={4} triggerUser=[{5}] principal={6} logonType={7} runLevel={8} multiple={9} limitSeconds={10} battery={11} password=none" -f $TaskPath, $TaskName, $Action.Execute, $Action.Argument, $Trigger.AtLogOn, $Trigger.User, $Principal.UserId, $Principal.LogonType, $Principal.RunLevel, $Settings.MultipleInstances, $Settings.LimitSeconds, $Settings.Battery)
+  SrhRec ("REGTASK  {0}{1} execute={2} args=[{3}] atLogOn={4} triggerUser=[{5}] principal={6} logonType={7} runLevel={8} multiple={9} limitSeconds={10} battery={11} storedCredential=absent" -f $TaskPath, $TaskName, $Action.Execute, $Action.Argument, $Trigger.AtLogOn, $Trigger.User, $Principal.UserId, $Principal.LogonType, $Principal.RunLevel, $Settings.MultipleInstances, $Settings.LimitSeconds, $Settings.Battery)
   $global:Srh.Tasks[$TaskName.TrimStart('\')] = $true
 }
 function global:Get-ScheduledTask {
