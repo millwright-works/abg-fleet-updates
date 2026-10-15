@@ -423,6 +423,7 @@ $Col_CompletedOn  = "build_completedon"
 $Col_Payload      = "build_payload"
 $Col_Result       = "build_resultjson"
 $Col_Error        = "build_errordetails"
+$Col_LastErrorCode = "build_lasterrorcode"
 
 # MEASURED 2026-08-29 against Dev: build_resultjson is a Memo column with MaxLength 2000. A PATCH that
 # exceeds it is REJECTED, and the reject lands in Process-Command's catch - so an oversized result does not
@@ -6057,7 +6058,7 @@ function Process-Command {
         try { $preGate = Get-ResetGate -Running $Global:RunningSession -BoundSessionId $boundSessionId -Payload (Try-ParseJson ([string]$cmd.$Col_Payload)) -NowUtc ((Get-Date).ToUniversalTime()) } catch { $preGate = $null }
         if ($null -ne $preGate -and -not $preGate.Proceed) {
             $skippedOk = $false
-            try { Patch-Row $token $BayCommandEntitySet $cmdId @{ $Col_Status = $STATUS_SKIPPED } $etag; $skippedOk = $true }
+            try { Patch-Row $token $BayCommandEntitySet $cmdId @{ $Col_Status = $STATUS_SKIPPED; $Col_LastErrorCode = "reset-other-session" } $etag; $skippedOk = $true }
             catch { Write-Log ("Reset {0}: could not mark it Skipped ({1}); it runs, and its gate skips it" -f $cmdId, $_.Exception.Message) "WARN" }
             if ($skippedOk) {
                 Write-Log ("Reset {0} Skipped: {1}" -f $cmdId, $preGate.Why) "INFO"
@@ -6068,14 +6069,14 @@ function Process-Command {
 
     # 0b) A Start, Prep, display update or End the bay refuses outright (a session it already ended, or a canceled booking in
     # its 5-minute warning: A0.489) is closed out as Skipped the same way, so the row says Skipped instead of Succeeded with
-    # "skipped" buried in its result text. Same limits as above: Pending -> Skipped carries no execution fields (so the reason
-    # is in the agent log, not on the row), and if the write fails the command runs and its handler refuses it.
+    # "skipped" buried in its result text. Same limits as above: Pending -> Skipped carries no execution fields, but the
+    # refusal kind goes in build_lasterrorcode (A0.502: the console shows it; the kinds are cancel-warning and ended-replay, spelled as the console's reader spells them), and if the write fails the command runs and its handler refuses it.
     if ($type -eq $CMD_STARTSESSION -or $type -eq $CMD_UPDATESESSIONDISPLAY -or $type -eq $CMD_ENDSESSION) {
         $preRef = $null
         try { $preRef = Get-CommandRefusal -CommandType $type -Payload (Try-ParseJson ([string]$cmd.$Col_Payload)) -Running $Global:RunningSession -Finished $Global:RunningSessionFinished -Pending $Global:RunningSessionEndPending } catch { $preRef = $null }
         if ($null -ne $preRef) {
             $refSkippedOk = $false
-            try { Patch-Row $token $BayCommandEntitySet $cmdId @{ $Col_Status = $STATUS_SKIPPED } $etag; $refSkippedOk = $true }
+            try { Patch-Row $token $BayCommandEntitySet $cmdId @{ $Col_Status = $STATUS_SKIPPED; $Col_LastErrorCode = [string]$preRef.Kind } $etag; $refSkippedOk = $true }
             catch { Write-Log ("Command {0}: could not mark it Skipped ({1}); it runs, and its handler refuses it" -f $cmdId, $_.Exception.Message) "WARN" }
             if ($refSkippedOk) {
                 Write-Log ("Command {0} (type {1}) Skipped: {2}" -f $cmdId, $type, $preRef.Why) "INFO"
