@@ -179,7 +179,7 @@ try {
     Assert-True ((@($r1.users) -join ",") -eq "BayKiosk" -and (Get-LogCount $r1 '^USER     created local user BayKiosk') -eq 1) "the BayKiosk account was created once"
     Assert-True ((Get-RunReg $r1 ($KeyWinlogon + "defaultdomainname")) -eq "BAY1KIOSK" -and "$(Get-RunReg $r1 ($KeyWinlogon + 'autoadminlogon'))" -eq "1" -and (Get-RunReg $r1 ($KeyWinlogon + "defaultusername")) -eq "BayKiosk") "automatic sign-in: on, as BayKiosk, with the bay's name"
     $dl1 = @(Get-RunLog $r1 | Where-Object { $_ -match '^DOWNLOAD ' })
-    Assert-True ($dl1.Count -eq 6 -and @($dl1 | Where-Object { $_ -match 'REFUSED|404' }).Count -eq 0) ("six downloads, all from this repository's main branch under its current owner (" + $dl1.Count + ")")
+    Assert-True ($dl1.Count -eq 7 -and @($dl1 | Where-Object { $_ -match 'REFUSED|404' }).Count -eq 0) ("seven downloads (the five scripts, Day0 and the permissions definition), all from this repository's main branch under its current owner (" + $dl1.Count + ")")
     Assert-True (@($dl1 | Where-Object { $_ -match 'SetClientSecretDpapi' }).Count -eq 0 -and $r1.secretToolOnDisk -eq $false) "a certificate bay is NOT given the secret tool: no download, no file (A0.529)"
     Assert-True ((Get-LogCount $r1 '^SIGN ') -eq 5) "the five bootstrap and tool scripts were signed"
 
@@ -229,7 +229,7 @@ try {
     $p3 = @(Get-RunLog $r3 | Where-Object { $_ -match '^PROMPT ' })
     Assert-True ($p3.Count -eq 1 -and $p3[0] -match 'Reboot now\? \(y/N\)') "the only question is 'Reboot now? (y/N)': no password is asked for"
     Assert-True ((Get-LogCount $r3 '^SHUTDOWN /r') -eq 1) "answering y restarts the PC"
-    Assert-True ((Get-LogCount $r3 '^DOWNLOAD ') -eq 0 -and (Get-LogCount $r3 '^SCHTASKS ') -eq 0) "nothing is downloaded and no task is re-registered (-SkipDay0)"
+    Assert-True ((Get-LogCount $r3 '^DOWNLOAD ') -eq 1 -and (Get-LogCount $r3 '^DOWNLOAD .*tools/ABG-BayAcl\.ps1$') -eq 1 -and (Get-LogCount $r3 '^SCHTASKS ') -eq 0) "only the permissions definition is downloaded and no task is re-registered (-SkipDay0)"
     Assert-True ($r3.policy -eq "AllSigned") "the machine script policy is AllSigned"
 
     $r4 = Get-PlanRun $sheet 3
@@ -469,6 +469,103 @@ try {
     )
     Assert-True ((Get-RunText (Get-PlanRun $pwBad 0)) -match 'powercfg /change monitor-timeout-ac 0 failed \(exit 5\); this bay may sleep') "a failing powercfg is reported on the screen, not hidden"
 
+
+    # =========================================================================================== A0.699 F-SEC: who may touch what
+    # The harness gives the scratch folders REAL ACLs from the REAL helper, and returns them as raw entries (SID|type|rights|
+    # inherit|propagate|inherited). What is read here is read with .NET masks written out below, not through the helper.
+    Section "A0.699 permissions: a first run on a PC whose key already carries the old BayKiosk grant"
+    $KioskSid = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+    $SidSystem = "S-1-5-18"; $SidAdmins = "S-1-5-32-544"; $SidUsers = "S-1-5-32-545"; $SidAuth = "S-1-5-11"; $SidEveryone = "S-1-1-0"
+    $WriteBits = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000
+    function Get-AclEntries($Run, [string]$Key) {
+        $node = $Run.acls.PSObject.Properties[$Key]
+        if ($null -eq $node -or $null -eq $node.Value) { return $null }
+        return @($node.Value.aces | ForEach-Object { $f = ([string]$_).Split("|"); [pscustomobject]@{ Sid = $f[0]; Type = $f[1]; Rights = [int]$f[2]; Inherit = [int]$f[3]; Prop = [int]$f[4]; Inherited = ($f[5] -eq "True") } })
+    }
+    function Test-AclProtected($Run, [string]$Key) { $n = $Run.acls.PSObject.Properties[$Key]; return ($null -ne $n -and $null -ne $n.Value -and [bool]$n.Value.protected) }
+    # The write-class bits a set of SIDs hold on the object ITSELF (an inherit-only entry does not apply to it).
+    function Get-SelfWriteBits($Run, [string]$Key, [string[]]$Sids) {
+        $e = Get-AclEntries $Run $Key
+        if ($null -eq $e) { return -1 }
+        $m = 0
+        foreach ($x in @($e | Where-Object { $_.Type -eq "Allow" -and $Sids -contains $_.Sid -and (($_.Prop -band 2) -eq 0) })) { $m = $m -bor ($x.Rights -band $WriteBits) }
+        return $m
+    }
+    function Test-OnlySids($Run, [string]$Key, [string[]]$Allowed) {
+        $e = Get-AclEntries $Run $Key
+        if ($null -eq $e) { return $false }
+        return (@($e | Where-Object { $Allowed -notcontains $_.Sid }).Count -eq 0)
+    }
+    # The harness's own account stands in for the elevated administrator and is not a principal under test.
+    $AllKioskSids = @($KioskSid, $SidUsers, $SidAuth, $SidEveryone)
+
+    $aclPlan = Invoke-SetupPlan "acl" @(
+        [ordered]@{ title = "first run; the key carries the old BayKiosk read grant"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ keyGrantedToKiosk = $true } },
+        [ordered]@{ title = "second run, with drift planted: BayKiosk can modify bootstrap and the watchdog, and holds the key again"; computerName = "BAY1KIOSK"; args = $Step9Args; model = [ordered]@{ seedDrift = $true; keyGrantedToKiosk = $true } },
+        [ordered]@{ title = "third run, -SkipDay0, with the drift planted again"; computerName = "BAY1KIOSK"; args = $Step16Args; model = [ordered]@{ seedDrift = $true; keyGrantedToKiosk = $true } }
+    )
+    Assert-True ($aclPlan.census -eq "ok" -and [string]::IsNullOrEmpty([string]$aclPlan.harnessError)) ("the census and the harness are clean (" + $aclPlan.census + " " + $aclPlan.harnessError + ")")
+    foreach ($ix in 0, 1, 2) {
+        $ar = Get-PlanRun $aclPlan $ix
+        Section ("permissions, run " + ($ix + 1) + ": " + $ar.title)
+        Assert-True ($ar.ended -eq "ran to its last line") ("the run reaches its last line (" + $ar.ended + " " + $ar.stoppedAt + ")")
+        # (1) the key: SYSTEM and Administrators only, whatever it carried before.
+        $keyE = Get-AclEntries $ar "key"
+        Assert-True ($null -ne $keyE -and @($keyE | Where-Object { $_.Sid -eq $KioskSid }).Count -eq 0) "the key file holds NO entry for BayKiosk (the planted grant is gone)"
+        # the harness account's own entry is the stand-in administrator; only the system accounts and that one may appear
+        Assert-True ($null -ne $keyE -and @($keyE | Where-Object { @($SidSystem, $SidAdmins) -notcontains $_.Sid }).Count -eq 0 -and (Test-AclProtected $ar "key")) "the key file's entries are exactly SYSTEM and Administrators, and inheritance from its folder is cut"
+        Assert-True ((Get-SelfWriteBits $ar "key" $AllKioskSids) -eq 0 -and @($keyE | Where-Object { $AllKioskSids -contains $_.Sid }).Count -eq 0) "...and BayKiosk, Users, Authenticated Users and Everyone hold nothing on it"
+        Assert-True ((Get-LogCount $ar '^ICACLS ') -eq (Get-LogCount $ar '^ICACLS .*/setowner ') -and (Get-LogCount $ar '^ICACLS .*/grant') -eq 0) "no icacls /grant is run at all: the only icacls calls are owner resets of the locked folder"
+        Assert-True ((Get-RunText $ar) -notmatch 'Kiosk key ACL granted') "the run does not print that a key grant was made"
+        # (2) the folders a SYSTEM task runs code from.
+        foreach ($k in "root", "agent", "bootstrap") {
+            Assert-True ((Test-AclProtected $ar $k) -and (Get-SelfWriteBits $ar $k $AllKioskSids) -eq 0) "$k : inheritance cut from C:\, and BayKiosk, Users, Authenticated Users and Everyone hold no write-class right"
+        }
+        foreach ($k in "watchdog", "agenthost", "setupdir") {
+            $e = Get-AclEntries $ar $k
+            Assert-True ($null -ne $e -and @($e | Where-Object { -not $_.Inherited }).Count -eq 0 -and (Get-SelfWriteBits $ar $k $AllKioskSids) -eq 0 -and @($e | Where-Object { $_.Sid -eq $KioskSid }).Count -eq 0) "$k : only inherited entries, and no right for BayKiosk (the planted explicit grant is gone)"
+        }
+        # (3) what the agent needs as BayKiosk keeps its access, and cannot replace its own folder.
+        foreach ($k in "state", "logs", "control", "current", "releases", "rollback", "staging", "tools") {
+            $e = Get-AclEntries $ar $k
+            $selfE = @($e | Where-Object { $_.Sid -eq $KioskSid -and (($_.Prop -band 2) -eq 0) })
+            $childE = @($e | Where-Object { $_.Sid -eq $KioskSid -and (($_.Inherit -band 3) -eq 3) })
+            $selfBits = 0; foreach ($x in $selfE) { $selfBits = $selfBits -bor $x.Rights }
+            $childBits = 0; foreach ($x in $childE) { $childBits = $childBits -bor $x.Rights }
+            Assert-True (($selfBits -band (0x2 -bor 0x4 -bor 0x40)) -eq (0x2 -bor 0x4 -bor 0x40) -and ($selfBits -band (0x10000 -bor 0x40000 -bor 0x80000)) -eq 0) "$k : BayKiosk can create files and folders in it and clear it, and cannot delete, re-permission or take over the folder itself"
+            Assert-True (($childBits -band 0x1301BF) -eq 0x1301BF) "$k : everything BayKiosk creates inside is Modify for BayKiosk (inherit-only entry)"
+        }
+        $dispE = Get-AclEntries $ar "display"
+        Assert-True (@($dispE | Where-Object { $_.Sid -eq $KioskSid -and (($_.Rights -band 0x1301BF) -eq 0x1301BF) -and (($_.Inherit -band 3) -eq 3) }).Count -ge 1) "SessionDisplay : BayKiosk has Modify over the folder and what is inside"
+        $stagingE = Get-AclEntries $ar "staging"
+        Assert-True ($null -ne $stagingE) "the agent's staging folder exists (the updater writes there as BayKiosk), separate from the folder the installer runs from"
+        # (4) the SYSTEM task.
+        $wd = @(Get-RunLog $ar | Where-Object { $_ -match '^SCHTASKS .*ABG Host Watchdog' })
+        Assert-True ($wd.Count -eq 1 -or $ix -eq 2) "the watchdog is registered once on a run that runs Day0"
+        if ($ix -ne 2) {
+            Assert-True ($wd[0] -match '/RU SYSTEM' -and $wd[0] -match '/TR \S*\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe -NoProfile -File "?[^ ]*\\BayAgent\\bootstrap\\ABG\.HostWatchdog\.ps1') "the watchdog runs powershell.exe by its full System32 path, and a script that sits in the locked bootstrap folder"
+            Assert-True (Test-Row $ar "SYSTEM tasks run only files from bootstrap" "PASS") "the self-check row for the SYSTEM task reads PASS"
+        }
+        # (5) the self-check rows are on the screen and read PASS after the repair.
+        foreach ($row in "Code-signing key: SYSTEM and Administrators only", "Folders above the scripts: BayKiosk cannot write", "SYSTEM-run folder (bootstrap): BayKiosk and Users cannot write", "Agent data folders: BayKiosk keeps the access it needs") {
+            Assert-True (Test-Row $ar $row "PASS") "self-check row '$row' : PASS"
+        }
+    }
+    # Day0 applies the folder rules itself (it is also run alone), and Setup applies them before it (the -SkipDay0 run has only Setup's).
+    $arA = Get-PlanRun $aclPlan 0; $arC = Get-PlanRun $aclPlan 2
+    Assert-True ((Get-LogCount $arA '^ICACLS .*/setowner') -eq 2) "a run with Day0 applies the locked-folder rules twice: once in Setup's Phase 3A and once inside Day0"
+    Assert-True ((Get-LogCount $arC '^ICACLS .*/setowner') -eq 1) "a -SkipDay0 run applies them once, in Setup's Phase 3A (so a lockdown-only run still repairs a bay)"
+    Assert-True ((Get-RunText $arA) -match 'Folder permissions \(SYSTEM-run scripts are not writable by BayKiosk\)' -and (Get-RunText $arA) -match 'Lock the code-signing private key') "Day0's own steps are on the screen"
+
+    Section "A0.699 permissions: no BayKiosk account on the PC (-SkipKioskSetup): Day0's self-check refuses to finish"
+    $nk = Invoke-SetupPlan "nokiosk" @([ordered]@{ title = "blank PC, kiosk setup skipped"; computerName = "BAY1KIOSK"; args = [ordered]@{ BayNumber = 1; BayId = $Bay1; SkipLockdown = $true; SkipReboot = $true; SkipKioskSetup = $true } })
+    $nk1 = Get-PlanRun $nk 0
+    Assert-True ($nk.census -eq "ok" -and $nk1.ended -match 'ACL self-check failed' -and (Get-RunText $nk1) -match 'Agent data folders: BayKiosk keeps the access it needs') ("Day0 stops on a failed permissions row and names it (" + $nk1.ended + ")")
+    Assert-True ((Get-RunText $nk1) -match 'does not exist') "...and says the BayKiosk account does not exist"
+    Assert-True ($null -ne $arA.acls.day0file -and $null -eq $arA.acls.stagingday0 -and $null -ne $arA.acls.aclhelper) "the installer scripts (Day0 and the permissions definition) are run from the locked bootstrap\setup folder, never from the agent's staging folder that BayKiosk can write"
+    $arB = Get-PlanRun $aclPlan 1
+    Assert-True ((Get-LogCount $arB '^ICACLS .*/setowner \*S-1-5-32-544 /T /C /L /Q') -ge 1) "the folder SYSTEM runs from is re-owned to Administrators on every run (recorded: the harness cannot be elevated)"
+
     # =========================================================================================== the instrument can refuse
     Section "The census refuses a write through a tool nobody modeled (reg.exe)"
     $plantedDir = Join-Path $BaseDir "planted"; New-Item -ItemType Directory -Force -Path $plantedDir | Out-Null
@@ -485,6 +582,13 @@ try {
     } else { Assert-True $false "skipped -- the anchor was not found" }
 }
 finally {
+    # The harness gave the scratch folders REAL locked-down ACLs (that is the point), so this account no longer has delete
+    # rights on them. It is the owner of every one (the owner-change call is only recorded), so it can give itself full control
+    # back, and only on this run's own uniquely named folder, before the delete.
+    if ((Split-Path -Leaf $BaseDir) -like 'bayagent-setupruntest-*') {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        & (Join-Path $env:WINDIR 'System32\icacls.exe') $BaseDir /grant ("*" + $me + ":F") /T /C /Q | Out-Null
+    }
     try { Remove-Item -LiteralPath $BaseDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
 }
 

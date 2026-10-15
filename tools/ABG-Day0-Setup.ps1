@@ -83,6 +83,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Who may touch what on the bay (the code-signing key, the folders SYSTEM runs code from, what the agent writes) is defined
+# in ONE file that sits beside this one. Setup-BayPC.ps1 downloads both into the same folder.
+$aclHelper = Join-Path $PSScriptRoot "ABG-BayAcl.ps1"
+if (-not (Test-Path -LiteralPath $aclHelper)) { throw "ABG-BayAcl.ps1 must be in the same folder as this script ($aclHelper). It defines the permissions on the bay's key and folders; this script will not run without it." }
+. $aclHelper
+
 function Ensure-Dir([string]$p) {
   if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
 }
@@ -137,17 +143,8 @@ function Get-CertUniqueContainerName([string]$thumbprint) {
   return $match.Groups[1].Value.Trim()
 }
 
-function Grant-Kiosk-KeyAccess([string]$uniqueName, [string]$kioskAccount) {
-  $keyPath = Join-Path $env:ProgramData ("Microsoft\Crypto\Keys\{0}" -f $uniqueName)
-  if (-not (Test-Path -LiteralPath $keyPath)) { throw "Key file not found: $keyPath" }
-
-  Write-Host "Granting $kioskAccount read access to key file:"
-  Write-Host "  $keyPath"
-  icacls "$keyPath" /grant "${kioskAccount}:(R)" | Out-Null
-
-  Write-Host "Key ACL now:"
-  icacls "$keyPath"
-}
+# NOTE: there is deliberately NO function here that grants BayKiosk anything on the signing key (A0.699, F-SEC). The key file
+# is locked to SYSTEM and Administrators by Set-BayKeyFileAcl (ABG-BayAcl.ps1).
 
 function Sign-File([string]$path, $cert, [string]$timeStampServer) {
   if (-not (Test-Path -LiteralPath $path)) { throw "Cannot sign missing file: $path" }
@@ -278,7 +275,9 @@ function Invoke-SchtasksChecked([string[]]$schtasksArgs, [string]$what) {
 
 function Create-WatchdogTask([string]$watchdogPath) {
   $tn = "\ABG Host Watchdog"
-  $tr = "powershell.exe -NoProfile -File `"$watchdogPath`""
+  # The program is named by full path (no spaces in it, so no quoting): SYSTEM must not find a powershell.exe by search.
+  $psExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $tr = "$psExe -NoProfile -File `"$watchdogPath`""
   Invoke-SchtasksChecked -schtasksArgs @("/Create", "/F", "/TN", $tn, "/SC", "MINUTE", "/MO", "1", "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR", $tr) -what "Registering $tn"
   Write-Host "Created/updated scheduled task: $tn (SYSTEM, every 1 minute)"
 }
@@ -410,6 +409,12 @@ $sessionDir    = Join-Path $AllBirdiesRoot "SessionDisplay"
 
 Ensure-SessionDisplayPersistentFiles -dataDir (Join-Path $sessionDir "data")
 
+Write-Step "Folder permissions (SYSTEM-run scripts are not writable by BayKiosk)"
+$kioskSid = Get-BayKioskSid -User $BayKioskUser
+if ($null -eq $kioskSid) { Write-Host "  WARNING: the account '$BayKioskUser' does not exist; the agent's data folders get no BayKiosk grant until it does. Run this again after it is created." }
+Set-BayAcls -Root $AllBirdiesRoot -KioskSid $kioskSid
+Write-Host "  Locked: $AllBirdiesRoot, BayAgent, bootstrap. BayKiosk can write only: state, logs, control, current, releases, rollback, staging, tools, SessionDisplay."
+
 Write-Step "Download bootstrap/tools scripts"
 $agentHostPath     = Join-Path $bayAgentDir "bootstrap\ABG.AgentHost.ps1"
 $watchdogPath      = Join-Path $bayAgentDir "bootstrap\ABG.HostWatchdog.ps1"
@@ -442,12 +447,15 @@ if ($PlaceSecretTool) {
 Write-Step "Create/trust code-signing certificate"
 $cert = Get-CodeSigningCertOrCreate
 
-Write-Step "Grant BayKiosk access to private key file (Crypto\Keys)"
+Write-Step "Lock the code-signing private key (SYSTEM and Administrators only)"
 $kioskAccount = "$env:COMPUTERNAME\$BayKioskUser"
 $uniqueName = Get-CertUniqueContainerName -thumbprint $cert.Thumbprint
 Write-Host "Unique container name: $uniqueName"
-Grant-Kiosk-KeyAccess -uniqueName $uniqueName -kioskAccount $kioskAccount
-
+# BayKiosk is given NOTHING on this key (A0.699). An earlier setup granted it read; this removes that grant, on this
+# certificate's key and on every other ABG code-signing key on the PC.
+$lockedKeys = @(Set-BayAllKeyFileAcls)
+if ($lockedKeys.Count -eq 0) { throw "No key file was found for the code-signing certificate (container $uniqueName); it could not be locked. Not continuing." }
+foreach ($lk in $lockedKeys) { Write-Host "  Key file locked to SYSTEM and Administrators: $lk" }
 Write-Step "Sign bootstrap/tools scripts"
 Sign-File -path $agentHostPath     -cert $cert -timeStampServer $TimeStampServer
 Sign-File -path $watchdogPath      -cert $cert -timeStampServer $TimeStampServer
@@ -507,10 +515,16 @@ Write-Host '  "Write-Output ''sign test ok''" | Set-Content -Path $test -Encodin
 Write-Host '  Set-AuthenticodeSignature -FilePath $test -Certificate $cert -TimeStampServer http://timestamp.digicert.com | Out-Null'
 Write-Host '  Get-AuthenticodeSignature $test | Format-List Status, StatusMessage'
 
+Write-Step "ACL self-check"
+$aclRows = @(Get-BayAclReport -Root $AllBirdiesRoot -KioskSid $kioskSid -Tasks @(Get-BayTaskFacts) -RequiredTaskNames $(if ($CreateWatchdogTask) { @("ABG Host Watchdog") } else { @() }))
+foreach ($r in $aclRows) { Write-Host ("  {0}: {1}" -f $r.Result.Split(" ")[0], $r.Check) }
+$aclFailed = @($aclRows | Where-Object { $_.Result -match "^FAIL" })
+if ($aclFailed.Count -gt 0) { foreach ($f in $aclFailed) { Write-Host ("  " + $f.Check + " -> " + $f.Result) -ForegroundColor Red }; throw ("ACL self-check failed on " + $aclFailed.Count + " row(s); see above. The bay is not safe to leave as it is.") }
+
 Write-Step "DONE"
 Write-Host "BayAgent root: $bayAgentDir"
 Write-Host "SessionDisplay root: $sessionDir"
 Write-Host "Code signing thumbprint: $($cert.Thumbprint)"
 Write-Host "Key unique name: $uniqueName"
-Write-Host "Kiosk key ACL granted to: $kioskAccount"
+Write-Host "Kiosk key access: NONE (SYSTEM and Administrators only)"
 Write-Host "PromosPack updater installed at: $updatePromosPath"

@@ -17,7 +17,11 @@ DisableTaskMgr, no AutoAdminLogon; its machine script policy is Undefined; Remot
 Start is 3; and Set-ExecutionPolicy -Scope LocalMachine, in a process started with -ExecutionPolicy Bypass, WRITES
 the value and then raises a terminating error.
 
-The one change made to script text: Test-IsAdmin returns true (the harness is never elevated).
+The changes made to script text: Test-IsAdmin returns true (the harness is never elevated), and the served copy of
+ABG-BayAcl.ps1 accepts the harness's own account as an owner and gives it full control of the locked folders (it cannot be
+elevated, so it cannot re-own a folder to Administrators, and it stands in for the administrator who runs setup; the real
+icacls /setowner call is recorded only). Everything else about permissions is REAL: the scratch
+folders under -Root get real NTFS ACLs from the real helper, and the result carries them back as raw entries.
 A census runs first, default deny: a command in either script that is neither recorded here nor on the read-only
 list stops everything before a line of the script runs (so a write through a tool nobody modeled cannot slip by).
 
@@ -40,6 +44,7 @@ $Root = (Microsoft.PowerShell.Management\Get-Item -LiteralPath $Root).FullName.T
 $global:Srh = @{
   Root = $Root; RepoRoot = $RepoRoot; Marker = $SrhMarker; Day0Source = $Day0Script
   Reg = @{}; RegKeys = @{}; Users = @{}; Certs = New-Object System.Collections.ArrayList; Tasks = @{}
+  KioskSid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
   Log = New-Object System.Collections.ArrayList
   Policy = 'Undefined'; PolicyThrows = $true; PolicyTakes = $true
   FailDownloadMatch = ''; TimestampOk = $true; RebootAnswer = 'n'; RegStuck = @()
@@ -108,6 +113,7 @@ function global:Invoke-WebRequest {
   $rel = $m.Groups[1].Value -replace '/', '\'
   $src = Join-Path $global:Srh.RepoRoot $rel
   if ($rel -eq 'tools\ABG-Day0-Setup.ps1') { $src = $global:Srh.Day0Source }
+  if ($rel -eq 'tools\ABG-BayAcl.ps1') { $src = $global:Srh.AclHelperServed }
   if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $src)) { SrhRec "DOWNLOAD $Uri -> 404 (not in the repository tree)"; throw "The remote server returned an error: (404) Not Found." }
   SrhAssertScratch $OutFile
   Microsoft.PowerShell.Management\Copy-Item -LiteralPath $src -Destination $OutFile -Force
@@ -141,7 +147,10 @@ function global:schtasks {
   # A task whose name matches the model's "schtasksFailMatch" is refused the way Task Scheduler refuses: exit 1 and an
   # ERROR line (here as the output, which is where the script under test must find the text).
   if ($global:Srh.SchtasksFailMatch -and $tn -match $global:Srh.SchtasksFailMatch) { $global:LASTEXITCODE = 1; return "ERROR: Access is denied. (injected)" }
-  $global:LASTEXITCODE = 0; $global:Srh.Tasks[$tn.TrimStart('\')] = $true; "SUCCESS (recorded only)"
+  $ru = ''; $tr = ''
+  for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -eq '/RU' -and ($i + 1) -lt $a.Count) { $ru = $a[$i + 1] }; if ($a[$i] -eq '/TR' -and ($i + 1) -lt $a.Count) { $tr = $a[$i + 1] } }
+  $sp = $tr.IndexOf(' '); $exe = $(if ($sp -gt 0) { $tr.Substring(0, $sp) } else { $tr }); $argText = $(if ($sp -gt 0) { $tr.Substring($sp + 1) } else { '' })
+  $global:LASTEXITCODE = 0; $global:Srh.Tasks[$tn.TrimStart('\')] = [pscustomobject]@{ TaskName = $tn.TrimStart('\'); State = 'Ready'; Principal = [pscustomobject]@{ UserId = $ru }; Actions = @([pscustomobject]@{ Execute = $exe; Arguments = $argText }) }; "SUCCESS (recorded only)"
 }
 # The ScheduledTasks cmdlets Day0 uses for the agent task. Each New-* returns a tagged object; Register-ScheduledTask records
 # the whole definition on one line so a test can assert the principal, the trigger and the limits, and no password.
@@ -155,11 +164,12 @@ function global:New-ScheduledTaskSettingsSet {
 function global:Register-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
   SrhRec ("REGTASK  {0}{1} execute={2} args=[{3}] atLogOn={4} triggerUser=[{5}] principal={6} logonType={7} runLevel={8} multiple={9} limitSeconds={10} battery={11} storedCredential=absent" -f $TaskPath, $TaskName, $Action.Execute, $Action.Argument, $Trigger.AtLogOn, $Trigger.User, $Principal.UserId, $Principal.LogonType, $Principal.RunLevel, $Settings.MultipleInstances, $Settings.LimitSeconds, $Settings.Battery)
-  $global:Srh.Tasks[$TaskName.TrimStart('\')] = $true
+  $global:Srh.Tasks[$TaskName.TrimStart('\')] = [pscustomobject]@{ TaskName = $TaskName.TrimStart('\'); State = 'Ready'; Principal = [pscustomobject]@{ UserId = $Principal.UserId }; Actions = @([pscustomobject]@{ Execute = $Action.Execute; Arguments = $Action.Argument }) }
 }
 function global:Get-ScheduledTask {
   [CmdletBinding()] param([string]$TaskName)
-  if ($global:Srh.Tasks.ContainsKey($TaskName)) { return [pscustomobject]@{ TaskName = $TaskName; State = 'Ready' } }
+  if (-not $TaskName) { return @($global:Srh.Tasks.Values) }
+  if ($global:Srh.Tasks.ContainsKey($TaskName)) { return $global:Srh.Tasks[$TaskName] }
   Write-Error "No task $TaskName"
 }
 function global:Read-Host {
@@ -171,7 +181,7 @@ function global:Read-Host {
 function global:Rename-Computer { [CmdletBinding()] param([string]$NewName, [switch]$Force) SrhRec "RENAME   computer to $NewName (takes effect at restart)" }
 function global:Get-LocalUser {
   [CmdletBinding()] param([string]$Name)
-  if ($global:Srh.Users.ContainsKey($Name)) { return [pscustomobject]@{ Name = $Name; Enabled = $true } }
+  if ($global:Srh.Users.ContainsKey($Name)) { return [pscustomobject]@{ Name = $Name; Enabled = $true; SID = (New-Object System.Security.Principal.SecurityIdentifier($global:Srh.KioskSid)) } }
   Write-Error "User $Name was not found."
 }
 function global:New-LocalUser {
@@ -206,19 +216,46 @@ $SrhStubbed = @('Test-Path', 'Get-ItemProperty', 'Set-ItemProperty', 'New-Item',
 $SrhReadOnly = @('Add-Type', 'ForEach-Object', 'Format-Table', 'Get-FileHash', 'Get-Item', 'Join-Path', 'New-Object', 'Out-Null', 'Out-String', 'Set-StrictMode', 'Split-Path',
   'Where-Object', 'New-TimeSpan', 'Write-Error', 'Write-Host', 'ConvertTo-Json', 'Sort-Object')
 
+# Raw ACL entries (SID|type|rights mask|inheritance flags|propagation flags|inherited) and the owner, per path, as Windows
+# holds them. The suite reads these without any help from the helper under test.
+function SrhDumpAcls([string]$allRoot, [string]$keyFile) {
+  $out = [ordered]@{}
+  $paths = [ordered]@{
+    root = $allRoot; agent = (Join-Path $allRoot 'BayAgent'); bootstrap = (Join-Path $allRoot 'BayAgent\bootstrap'); watchdog = (Join-Path $allRoot 'BayAgent\bootstrap\ABG.HostWatchdog.ps1')
+    agenthost = (Join-Path $allRoot 'BayAgent\bootstrap\ABG.AgentHost.ps1'); setupdir = (Join-Path $allRoot 'BayAgent\bootstrap\setup'); staging = (Join-Path $allRoot 'BayAgent\staging')
+    state = (Join-Path $allRoot 'BayAgent\state'); logs = (Join-Path $allRoot 'BayAgent\logs'); control = (Join-Path $allRoot 'BayAgent\control'); current = (Join-Path $allRoot 'BayAgent\current')
+    day0file = (Join-Path $allRoot 'BayAgent\bootstrap\setup\ABG-Day0-Setup.ps1'); stagingday0 = (Join-Path $allRoot 'BayAgent\staging\ABG-Day0-Setup.ps1'); aclhelper = (Join-Path $allRoot 'BayAgent\bootstrap\setup\ABG-BayAcl.ps1'); releases = (Join-Path $allRoot 'BayAgent\releases'); rollback = (Join-Path $allRoot 'BayAgent\rollback'); tools = (Join-Path $allRoot 'BayAgent\tools'); display = (Join-Path $allRoot 'SessionDisplay'); key = $keyFile
+  }
+  foreach ($k in $paths.Keys) {
+    $pp = $paths[$k]
+    if (-not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $pp)) { $out[$k] = $null; continue }
+    $it = Microsoft.PowerShell.Management\Get-Item -LiteralPath $pp -Force
+    $acl = $it.GetAccessControl()
+    $aces = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, $_.AccessControlType, [int]$_.FileSystemRights, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, $_.IsInherited })
+    $out[$k] = [ordered]@{ owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; protected = $acl.AreAccessRulesProtected; aces = $aces }
+  }
+  return $out
+}
 $SrhResult = [ordered]@{ census = 'ok'; harnessError = ''; runs = @() }
 function Write-SrhResult { [IO.File]::WriteAllText($ResultFile, ($SrhResult | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false))) }
 
 try {
   # ---------------------------------------------------------------- census (default deny)
-  foreach ($f in @($SetupScript, $Day0Script)) {
+  # The permissions helper is censused too, and its function names count as defined for the two scripts that call it.
+  $helperFile = Join-Path $RepoRoot 'tools\ABG-BayAcl.ps1'
+  $htok = $null; $herr = $null
+  $hast = [System.Management.Automation.Language.Parser]::ParseFile($helperFile, [ref]$htok, [ref]$herr)
+  if (@($herr).Count -gt 0) { throw "CENSUS: $helperFile does not parse" }
+  $helperDefs = @($hast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+  foreach ($f in @($SetupScript, $Day0Script, $helperFile)) {
     $tok = $null; $err = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$tok, [ref]$err)
     if (@($err).Count -gt 0) { throw "CENSUS: $f does not parse" }
     $defs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+    $defs += $helperDefs
     foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
       $n = $c.GetCommandName()
-      if (-not $n) { if ($c.CommandElements[0].Extent.Text -ne '$day0Path') { throw "CENSUS: a command whose name is not written out, in $(Split-Path -Leaf $f): $($c.Extent.Text)" }; continue }
+      if (-not $n) { if (@('$day0Path', '. $aclHelperPath', '. $aclHelper') -notcontains $c.Extent.Text.Trim() -and $c.CommandElements[0].Extent.Text -ne '$day0Path') { throw "CENSUS: a command whose name is not written out, in $(Split-Path -Leaf $f): $($c.Extent.Text)" }; continue }
       if ($defs -contains $n -or $SrhStubbed -contains $n -or $SrhReadOnly -contains $n) { continue }
       throw "CENSUS: command '$n' in $(Split-Path -Leaf $f) is neither recorded nor on the read-only list. Nothing was run."
     }
@@ -231,6 +268,26 @@ try {
   $setupCopy = Join-Path $Root 'Setup-BayPC.harness.ps1'
   [IO.File]::WriteAllText($setupCopy, $setupText.Replace($needle, 'return $true'), (New-Object Text.UTF8Encoding($false)))
 
+  # The helper as served: ONE change, the owner list also names this harness's account (see the header).
+  $helperText = [IO.File]::ReadAllText((Join-Path $RepoRoot 'tools\ABG-BayAcl.ps1'))
+  $ownerNeedle = '$okOwners = @($script:BaySid.System, $script:BaySid.Admins, $script:BaySid.TrustedInstaller) + @($ExtraOwners)'
+  if (([regex]::Matches($helperText, [regex]::Escape($ownerNeedle))).Count -ne 1) { throw "HARNESS: the owner line of ABG-BayAcl.ps1 was not found exactly once" }
+  $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $servedHelper = Join-Path $Root 'ABG-BayAcl.served.ps1'
+  # Second change: the folders also grant this harness's account full control, standing in for the elevated administrator
+  # who runs setup on a bay (the harness cannot be elevated; without it the run could not write below its own locked folders).
+  $rulesNeedle = '(New-BayRule (Get-BaySidObject $script:BaySid.Users) $rx "ContainerInherit, ObjectInherit" "None"))'
+  if (([regex]::Matches($helperText, [regex]::Escape($rulesNeedle))).Count -ne 1) { throw "HARNESS: the Users rule of ABG-BayAcl.ps1 was not found exactly once" }
+  $served = $helperText.Replace($ownerNeedle, ($ownerNeedle + ' + @("' + $meSid + '")'))
+  $served = $served.Replace($rulesNeedle, ('(New-BayRule (Get-BaySidObject $script:BaySid.Users) $rx "ContainerInherit, ObjectInherit" "None"),' + "`r`n" + '    (New-BayRule (Get-BaySidObject "' + $meSid + '") $full "ContainerInherit, ObjectInherit" "None"))'))
+  [IO.File]::WriteAllText($servedHelper, $served, (New-Object Text.UTF8Encoding($false)))
+  $global:Srh.AclHelperServed = $servedHelper
+  # The machine key store, in the scratch root: ProgramData is this run's own, with one fake key file.
+  $env:ProgramData = Join-Path $Root 'ProgramData'
+  $keyDir = Join-Path $env:ProgramData 'Microsoft\Crypto\Keys'
+  Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
+  $keyFile = Join-Path $keyDir 'fake-container-0001'
+  [IO.File]::WriteAllText($keyFile, 'stand-in, not a key')
   $plan = [IO.File]::ReadAllText($PlanFile) | ConvertFrom-Json
   SrhSeedBlankPc
   $allRoot = Join-Path $Root 'AllBirdies'
@@ -251,6 +308,15 @@ try {
           'schtasksFailMatch' { $global:Srh.SchtasksFailMatch = [string]$p.Value }
           'powercfgExit'      { $global:Srh.PowercfgExit = [int]$p.Value }
           'regStuck'          { $global:Srh.RegStuck = @($p.Value | ForEach-Object { ([string]$_).ToLower() }) }
+          'keyGrantedToKiosk' { if ([bool]$p.Value) { $kf = New-Object IO.FileInfo($keyFile); $ks = $kf.GetAccessControl(); $ks.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($global:Srh.KioskSid)), 'Read', 'Allow'))); $kf.SetAccessControl($ks) } }
+          'seedDrift'         { if ([bool]$p.Value) {
+              # What a bay holds before this change: the kiosk account can modify the folder SYSTEM runs from, and an explicit grant sits on the watchdog.
+              $ksid = New-Object Security.Principal.SecurityIdentifier($global:Srh.KioskSid)
+              $dp = Join-Path $allRoot 'BayAgent\bootstrap'
+              if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $dp) { $di = New-Object IO.DirectoryInfo($dp); $ds = $di.GetAccessControl(); $ds.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ksid, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))); $di.SetAccessControl($ds) }
+              $wf = Join-Path $allRoot 'BayAgent\bootstrap\ABG.HostWatchdog.ps1'
+              if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $wf) { $fi = New-Object IO.FileInfo($wf); $fs = $fi.GetAccessControl(); $fs.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ksid, 'Modify', 'Allow'))); $fi.SetAccessControl($fs) }
+            } }
           'placeAgent'        { if ([bool]$p.Value) { $ap = Join-Path $allRoot 'BayAgent\current\BayAgent.ps1'; Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ap) | Out-Null; [IO.File]::WriteAllText($ap, '# stand-in for the installed agent') } }
           'placeSecretFile'   { if ([bool]$p.Value) { $sp = Join-Path $allRoot 'BayAgent\secrets\clientsecret.dpapi'; Microsoft.PowerShell.Management\New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sp) | Out-Null; [IO.File]::WriteAllText($sp, 'stand-in, not a secret') } }
           default             { throw "HARNESS: unknown model fact '$($p.Name)'" }
@@ -289,6 +355,7 @@ try {
       users           = @($global:Srh.Users.Keys | Sort-Object)
       configText      = $cfgText
       secretToolOnDisk = [bool](Microsoft.PowerShell.Management\Test-Path -LiteralPath (Join-Path $allRoot 'BayAgent\bootstrap\ABG.SetClientSecretDpapi.ps1'))
+      acls            = (SrhDumpAcls $allRoot $keyFile)
       markerInConsole = [bool]($consoleText.Contains($global:Srh.Marker))
     }
   }

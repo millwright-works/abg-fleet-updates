@@ -326,10 +326,13 @@ try {
         }
         $day0Param = @($setupAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "Day0Url" })
         Assert-True ($day0Param.Count -eq 1 -and "$($day0Param[0].DefaultValue.Value)" -match '/tools/ABG-Day0-Setup\.ps1$') "-Day0Url points at tools/ABG-Day0-Setup.ps1"
+        # Two downloads (A0.699): Day0, and the permissions definition that sits beside it. Both by variable, never a literal
+        # address; the second address is DERIVED from $Day0Url, so it can only name the same repository and branch.
         $iwr = @(Get-BlankPcCommands $setupAst "Invoke-WebRequest")
-        $iwrUri = $null
-        if ($iwr.Count -eq 1) { $iwrUri = Get-BlankPcParamValueAst $iwr[0] "Uri" }
-        Assert-True ($iwr.Count -eq 1 -and $iwrUri -is [System.Management.Automation.Language.VariableExpressionAst] -and $iwrUri.VariablePath.UserPath -eq "Day0Url") "the one download in Setup-BayPC.ps1 fetches `$Day0Url (no literal address)"
+        $iwrNames = @($iwr | ForEach-Object { $u = Get-BlankPcParamValueAst $_ "Uri"; if ($u -is [System.Management.Automation.Language.VariableExpressionAst]) { $u.VariablePath.UserPath } else { "<literal>" } } | Sort-Object)
+        Assert-True ($iwr.Count -eq 2 -and ($iwrNames -join ",") -eq "aclHelperUrl,Day0Url") ("the two downloads in Setup-BayPC.ps1 fetch `$Day0Url and `$aclHelperUrl (no literal address) (" + ($iwrNames -join ",") + ")")
+        $derive = @($setupAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$aclHelperUrl' }, $true))
+        Assert-True ($derive.Count -eq 1 -and $derive[0].Right.Extent.Text -match '^\$Day0Url -replace ''ABG-Day0-Setup') "`$aclHelperUrl is derived from `$Day0Url (same repository, same branch)"
         $oldOwner = @((Get-BlankPcStringLiterals $setupAst) + (Get-BlankPcStringLiterals $day0Ast) | Where-Object { $_ -match "(?i)kedaheaven" })
         Assert-True ($oldOwner.Count -eq 0) "no string the code can act on, in either script, names the previous owner"
 

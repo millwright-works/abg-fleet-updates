@@ -333,7 +333,7 @@ function Sign-File([string]$path, $cert, [string]$timeStampServer) {
   $sig = Get-AuthenticodeSignature -FilePath $path
 
   if ($sig.Status -ne "Valid") {
-    throw "Signature invalid for $path. Status=$($sig.Status) Message=$($sig.StatusMessage)"
+    throw ("Signature invalid for $path. Status=$($sig.Status) Message=$($sig.StatusMessage)" + " NOTE (A0.699): the bay's code-signing key is readable by SYSTEM and Administrators ONLY; BayKiosk, the account the agent runs this script as, has no access to it and cannot sign. Nothing was promoted to current\. Run this script as Administrator (or from the bay's SYSTEM maintenance task once it exists).")
   }
   if ($null -eq $sig.TimeStamperCertificate) {
     # Set-AuthenticodeSignature can silently sign WITHOUT a timestamp and still report

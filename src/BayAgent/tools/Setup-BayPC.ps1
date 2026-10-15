@@ -501,6 +501,33 @@ if (-not $SkipKioskSetup) {
 }
 
 # ==================================================================
+# PHASE 3A: WHO MAY TOUCH WHAT (runs on every run, with or without -SkipDay0)
+# ==================================================================
+# A0.699 / F-SEC: BayKiosk must not hold the code-signing key, and must not be able to change anything a SYSTEM task
+# runs. The rules live in ONE file, tools\ABG-BayAcl.ps1, downloaded beside Day0. It goes into BayAgent\bootstrap\setup\,
+# which this step locks: the agent's own staging\ folder is writable by BayKiosk, and an administrator's script must
+# never be run from a folder the kiosk account can write.
+Write-Step "Phase 3A: File permissions and the code-signing key"
+$setupDir = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\setup"
+if (-not (Test-Path $setupDir)) { New-Item -ItemType Directory -Path $setupDir -Force | Out-Null }
+$aclHelperPath = Join-Path $setupDir "ABG-BayAcl.ps1"
+$aclHelperUrl = $Day0Url -replace 'ABG-Day0-Setup\.ps1$', 'ABG-BayAcl.ps1'
+Write-Host "  Downloading the permissions definition from: $aclHelperUrl"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $aclHelperUrl -OutFile $aclHelperPath -UseBasicParsing
+if (-not (Test-Path $aclHelperPath)) {
+  Write-Error "Failed to download ABG-BayAcl.ps1. Nothing after this point is safe to run; stopping."
+  exit 1
+}
+. $aclHelperPath
+$aclKioskSid = Get-BayKioskSid -User $BayKioskUser
+if ($null -eq $aclKioskSid) {
+  Write-Host "  WARNING: the account '$BayKioskUser' does not exist; the agent's data folders get no BayKiosk grant. The self-check below will FAIL until it exists." -ForegroundColor Yellow
+}
+Set-BayAcls -Root $AllBirdiesRoot -KioskSid $aclKioskSid
+$aclLockedKeys = @(Set-BayAllKeyFileAcls)
+Write-Host "  Folders locked or repaired. Code-signing key files locked to SYSTEM and Administrators: $($aclLockedKeys.Count)" -ForegroundColor Green
+# ==================================================================
 # PHASE 3: CALL DAY0
 # ==================================================================
 if (-not $SkipDay0) {
@@ -508,7 +535,9 @@ if (-not $SkipDay0) {
 
   # Day0 is in the tools\ folder at the repo root (sibling to src\)
   # When running on a new PC, download it first
-  $day0Dir = Join-Path $AllBirdiesRoot "BayAgent\staging"
+  # Phase 3A locked this folder (bootstrap\setup): an administrator runs this script, so the kiosk account must not be
+  # able to replace it between the download and the run (it could, in staging\, which the agent writes as BayKiosk).
+  $day0Dir = $setupDir
   if (-not (Test-Path $day0Dir)) { New-Item -ItemType Directory -Path $day0Dir -Force | Out-Null }
   $day0Path = Join-Path $day0Dir "ABG-Day0-Setup.ps1"
 
@@ -1045,6 +1074,15 @@ foreach ($taskName in @("ABG Bay Agent", "ABG Host Watchdog")) {
   }
 }
 
+# Who may touch what (A0.699): the code-signing key, the folders SYSTEM runs code from, the SYSTEM task, and what the
+# agent still needs as BayKiosk. Read back from the ACLs Windows holds, not from what Phase 3A was asked to do.
+$aclRows = @()
+try {
+  $aclRows = @(Get-BayAclReport -Root $AllBirdiesRoot -KioskSid (Get-BayKioskSid -User $BayKioskUser) -Tasks @(Get-BayTaskFacts) -RequiredTaskNames @("ABG Host Watchdog"))
+} catch {
+  $aclRows = @([PSCustomObject]@{ Check = "Permissions self-check"; Result = "FAIL (could not run: $($_.Exception.Message))" })
+}
+foreach ($ar in $aclRows) { $checks += [PSCustomObject]@{ Check = $ar.Check; Result = $ar.Result } }
 # BayKiosk user
 $checks += [PSCustomObject]@{
   Check  = "BayKiosk user exists"
