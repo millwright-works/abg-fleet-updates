@@ -276,7 +276,7 @@ function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
     # which silently drops the placeholder and prints a URL-less message on an unmanned machine.
     $msg = ("PackageUrl points at Dataverse ({0}). Dataverse file-column hosting is retired: " +
             "this script no longer impersonates a user to read file columns. Publish the package " +
-            "as a GitHub Release asset and set the Fleet.BayAgent.PackageUrl ConfigItem to that " +
+            "as a GitHub Release asset and pass that URL as -PackageUrl " +
             "URL -- the SHA256 does not change, because the package bytes do not change.")
     throw ($msg -f $url)
   }
