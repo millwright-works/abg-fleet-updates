@@ -29,7 +29,7 @@ foreach ($e in $expected) { if ($Suites -notcontains $e) { $bad += "suite on dis
 if ($bad.Count -gt 0) { $bad | ForEach-Object { Write-Host ('LIST ERROR: ' + $_) }; exit 2 }
 foreach ($e in $Excluded) { Write-Host ('EXCLUDED (reported residual, not run): ' + $e) }
 
-$ran = 0; $failed = @()
+$ran = 0; $failed = @(); $allCodes = @()
 Push-Location -LiteralPath $Root
 try {
   foreach ($s in $Suites) {
@@ -38,17 +38,24 @@ try {
     $null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $testsDir $s) *>&1 | Out-File -Encoding utf8 -LiteralPath $log
     $code = $LASTEXITCODE
     $ran++
+    $allCodes += ('{0}={1}' -f $s.Replace('.Tests.ps1', ''), $code)
     $line = (Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'RESULT:' } | Select-Object -Last 1)
     Write-Host ('{0} exit={1} {2}' -f $s, $code, $line)
     if ($code -ne 0) {
       $failed += $s
       Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'FAIL' } | Select-Object -First 20 | ForEach-Object { Write-Host ('   ' + $_) }
+      # A GitHub error annotation, so the reason is readable on the run page without downloading the log artifact.
+      $why = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*FAIL\s|Exception|CategoryInfo|FullyQualifiedErrorId' } | Select-Object -First 4 | ForEach-Object { $_.Trim() })
+      $msg = ('{0} exit={1}: {2}' -f $s, $code, ($why -join ' // '))
+      if ($msg.Length -gt 900) { $msg = $msg.Substring(0, 900) }
+      Write-Host ('::error title=suite failed::' + $msg.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A'))
     }
   }
 } finally { Pop-Location }
 
 # Guard 2: fewer suites ran than expected.
 if ($ran -lt $expected.Count) { Write-Host ('FAIL: ran {0} suites, expected at least {1}' -f $ran, $expected.Count); exit 1 }
+Write-Host ('::notice title=suite exit codes::' + ($allCodes -join ' '))
 Write-Host ('SUMMARY: ran {0}, failed {1}, excluded {2}' -f $ran, $failed.Count, @($Excluded).Count)
 if ($failed.Count -gt 0) { Write-Host ('FAILED: ' + ($failed -join ', ')); exit 1 }
 exit 0
