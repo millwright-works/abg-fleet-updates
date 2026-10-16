@@ -100,7 +100,10 @@ function Get-FleetVaultLeaks([string]$Root) {
     foreach ($rel in $list) {
         $p = Join-Path $Root $rel
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
-        $text = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($p))
+        # Shared read: a file another process is still writing (the runner's own log of this suite) must not abort the scan.
+        $fs = New-Object IO.FileStream($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try { $ms = New-Object IO.MemoryStream; $fs.CopyTo($ms); $bytes = $ms.ToArray() } finally { $fs.Dispose() }
+        $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
         if ($text.IndexOf($script:VaultPrefix, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or [regex]::IsMatch($text, $script:VaultHostRx, 'IgnoreCase')) { $leaks += $rel }
     }
     return $leaks
@@ -152,6 +155,7 @@ try {
     Section "C5 / T5e vault name census"
     $realLeaks = @(Get-FleetVaultLeaks $RepoRoot)
     Assert-True ($realLeaks.Count -eq 0) ("no tracked or unignored file holds a vault name" + $(if ($realLeaks.Count) { ": " + ($realLeaks -join ", ") } else { "" }))
+    Assert-True (@([IO.File]::ReadAllLines((Join-Path $RepoRoot ".gitignore")) | Where-Object { $_.Trim() -eq 'fleet-test-logs/' }).Count -eq 1) "the runner's log folder is git-ignored (the scan must not read logs it is still writing)"
     $gitRepo = Join-Path $tmp "gitrepo"
     $null = New-Item -ItemType Directory -Path (Join-Path $gitRepo "tools")
     $ErrorActionPreference = 'Continue'

@@ -21,3 +21,6 @@ Thumbs.db
 
 # Build output -- the release zip is published to GitHub, never committed
 dist/
+
+# Logs written by tools/ci/Run-FleetSuites.ps1 (DEV-02); the workflow uploads them as an artifact
+fleet-test-logs/
