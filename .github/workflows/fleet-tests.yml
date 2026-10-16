@@ -1,0 +1,65 @@
+# Runs every non-Live fleet test suite under Windows PowerShell 5.1 on a hosted Windows runner (DEV-02, OPS-16).
+# The suite list below is read by tests/FleetCi.Census.Tests.ps1: a non-Live suite missing from the list (or from the
+# explicit exclusion list) fails the census, and so does a Live suite, the live-check switch, continue-on-error, or an
+# or-true tail on a test step. The Live suites need a bay PC and are never run here (named by the .Live. file name).
+name: fleet-tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Run every non-Live suite under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          # SUITES-BEGIN
+          $suites = @(
+            'BayAgent.Credential.Tests.ps1'
+            'BayAgent.Day0Enroll.Tests.ps1'
+            'BayAgent.EStopPersist.Tests.ps1'
+            'BayAgent.EStopRouting.Tests.ps1'
+            'BayAgent.HostWatchdog.Tests.ps1'
+            'BayAgent.Identity.Tests.ps1'
+            'BayAgent.Kiosk.Tests.ps1'
+            'BayAgent.KioskAcl.Tests.ps1'
+            'BayAgent.KioskPackage.Tests.ps1'
+            'BayAgent.Launch.Tests.ps1'
+            'BayAgent.PidParam.Tests.ps1'
+            'BayAgent.RemoteReport.Tests.ps1'
+            'BayAgent.SelfHeal.Tests.ps1'
+            'BayAgent.SetupBlankPc.Tests.ps1'
+            'BayAgent.SetupRun.Tests.ps1'
+            'BayAgent.SetupShell.Tests.ps1'
+            'BayAgent.StartupOrder.Tests.ps1'
+            'BayAgent.UpdateGuard.Tests.ps1'
+            'FleetCi.Census.Tests.ps1'
+            'FleetRelease.Helper.Tests.ps1'
+          )
+          # SUITES-END
+          # EXCLUDED-BEGIN
+          # One quoted name per line with the reason after a hash sign. An excluded suite is a reported residual.
+          $excluded = @(
+          )
+          # EXCLUDED-END
+          & .\tools\ci\Run-FleetSuites.ps1 -Suites $suites -Excluded $excluded -LogDir fleet-test-logs
+          $codeFleet = $LASTEXITCODE
+          if ($codeFleet -ne 0) { exit $codeFleet }
+          exit 0
+
+      - name: Upload suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-test-logs
+          path: fleet-test-logs
+          if-no-files-found: warn

@@ -867,7 +867,11 @@ try {
         "StartProcess still refuses a path that does not exist"
     # The gap was a file that EXISTS but cannot be launched: Start-Process threw, and the throw escaped as an
     # opaque command failure rather than a result saying the process never ran.
-    $unlaunchable = Join-Path $BaseDir "not-a-program.abgnope"
+    # DEV-02 (2026-10-16): this file was "not-a-program.abgnope". On a PC where that unknown extension has a handler
+    # (or an Open-with fallback) Start-Process LAUNCHES it, so the two assertions below failed on the base. A text file
+    # named .exe is refused by Windows on every machine ("not a valid application for this OS platform"), which is the
+    # launch failure this section is about. Test-only fix; src/ is unchanged.
+    $unlaunchable = Join-Path $BaseDir "not-a-program.exe"
     [IO.File]::WriteAllText($unlaunchable, "this is not an executable")
     $bad = Start-GenericProcess ([pscustomobject]@{ path = $unlaunchable })
     Assert-True ($bad.started -eq $false -and "$($bad.error)".Length -gt 0) "StartProcess reports started=false with a reason when the launch itself fails"
