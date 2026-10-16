@@ -111,11 +111,13 @@ function Get-D0InstallFingerprint([string]$Root) {
     # there): every file under the install with its sha256, and this run's certificates. Two equal fingerprints mean
     # nothing was made, removed or rewritten. An unreadable file gets a value that can never equal another's.
     $rows = @()
-    foreach ($f in @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName)) {
-        $rel = $f.FullName.Substring($Root.Length).TrimStart("\")
+    # DEV-02: relative names come from -Name, not from FullName.Substring($Root.Length). On a hosted runner $Root is an 8.3
+    # path (C:\Users\RUNNER~1\...) while FullName is the long form, so the cut landed mid-name, "logs\*" no longer matched,
+    # and the run's own log made every comparison differ.
+    foreach ($rel in @(Get-ChildItem -LiteralPath $Root -Recurse -File -Name -ErrorAction SilentlyContinue | Sort-Object)) {
         if ($rel -like "logs\*") { continue }
         $hash = $null
-        try { $hash = Get-D0Sha256Hex ([IO.File]::ReadAllBytes($f.FullName)) } catch { $hash = "UNREADABLE-" + [guid]::NewGuid().ToString("N") }
+        try { $hash = Get-D0Sha256Hex ([IO.File]::ReadAllBytes((Join-Path $Root $rel))) } catch { $hash = "UNREADABLE-" + [guid]::NewGuid().ToString("N") }
         $rows += ("{0}|{1}" -f $rel, $hash)
     }
     $rows += ("certs|" + ((@(Get-D0RunCerts) + @(Get-D0PlaceholderCerts)) -join ","))
@@ -134,8 +136,7 @@ function Test-D0Unchanged([string]$Root, [string]$Before) {
 }
 
 function Get-D0InstallFiles([string]$Root) {
-    return @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.FullName.Substring($Root.Length).TrimStart("\") } | Sort-Object)
+    return @(Get-ChildItem -LiteralPath $Root -Recurse -File -Name -ErrorAction SilentlyContinue | Sort-Object)
 }
 
 # ---------------------------------------------------------------- the recorder (Entra token endpoint + Dataverse)
