@@ -77,7 +77,7 @@ function Invoke-Scenario([string]$Lib, [string]$Pkg, [string]$Scenario) {
         if ($m -eq 'POST' -and $u -eq "$api/git/refs") { $script:TestTagMade = $true; return @{ ref = 'x' } }
         if ($m -eq 'POST' -and $u -eq "$api/releases") { return @{ id = 424242 } }
         if ($m -eq 'POST' -and $u -like 'https://uploads.github.com/repos/millwright-works/abg-fleet-updates/releases/424242/assets?name=*') {
-            if ($script:TestScenario -eq 'uploadfails') { throw (New-Object FleetHelperFakeHttpException ("boom " + $FakeToken), 500) }
+            if ($script:TestScenario -eq 'uploadfails') { throw (New-Object FleetHelperFakeHttpException ("boom FAKE0123456789abcdef"), 500) }
             return @{ id = 1 }
         }
         if ($m -eq 'GET' -and $u -eq "$api/releases/424242") {
@@ -171,7 +171,7 @@ try {
     Section "T5d the vault read throws"
     $rv = Invoke-Scenario $LibPath $pkg 'vaultthrows'
     Assert-True ($rv.Code -eq 2) "exit code 2 (got $($rv.Code))"
-    Assert-True ($rv.Text -match '-VaultName') "the message names -VaultName"
+    Assert-True ($rv.Text -match 'named by -VaultName') "the message names the -VaultName parameter"
     Assert-True ($rv.Text.IndexOf($SentinelVault, [StringComparison]::OrdinalIgnoreCase) -lt 0) "the message does not echo the vault name the caller passed"
     Assert-True ($rv.Calls.Count -eq 0) "no GitHub call was recorded"
 
