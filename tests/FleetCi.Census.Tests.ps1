@@ -125,6 +125,7 @@ try {
     Assert-True ($diskNonLive.Count -ge 20) ("the census sees the non-Live suites on disk (count $($diskNonLive.Count))")
     Assert-True ($listed.Count + @(Get-FleetListed $wf 'EXCLUDED-BEGIN' 'EXCLUDED-END').Count -eq $diskNonLive.Count) "listed plus excluded equals the non-Live suites on disk, no more and no fewer"
     Assert-True ($wf -match 'actions/checkout@' -and $wf -match 'upload-artifact@') "the workflow checks out and uploads the logs as an artifact"
+    Assert-True ($wf -match '(?m)^\s*fetch-depth:\s*0\s*$') "the checkout has full history (BayAgent.UpdateGuard replays commit 514ad6d with git show; a shallow clone failed on the hosted runner)"
 
     Section "T2 one suite removed from the workflow's set"
     $victim = $listed[3].Name

@@ -122,6 +122,17 @@ function Get-D0InstallFingerprint([string]$Root) {
     return ($rows -join "`n")
 }
 
+# True when the install is byte-for-byte what it was. When it is not, name the rows that differ (DEV-02: on a hosted CI
+# runner three of these comparisons failed with no way to see why from a log).
+function Test-D0Unchanged([string]$Root, [string]$Before) {
+    $now = Get-D0InstallFingerprint $Root
+    if ($now -eq $Before) { return $true }
+    $a = @($Before -split "`n"); $b = @($now -split "`n")
+    foreach ($row in @($a | Where-Object { $b -notcontains $_ } | Select-Object -First 6)) { Write-Host ("  FAIL  (fingerprint, before only) " + $row) }
+    foreach ($row in @($b | Where-Object { $a -notcontains $_ } | Select-Object -First 6)) { Write-Host ("  FAIL  (fingerprint, after only) " + $row) }
+    return $false
+}
+
 function Get-D0InstallFiles([string]$Root) {
     return @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
         ForEach-Object { $_.FullName.Substring($Root.Length).TrimStart("\") } | Sort-Object)
@@ -557,7 +568,7 @@ try {
         Assert-True ($resLines.Count -eq 1 -and $resLines[0] -eq "RESULT: REFUSED") "[$($case.label)] exactly one RESULT line, and it is REFUSED"
         Assert-True ((Get-D0ReportField $r.StdOut "Reason code") -eq $case.reason) "[$($case.label)] reason code $($case.reason) (got $(Get-D0ReportField $r.StdOut 'Reason code'))"
         Assert-True ($r.StdOut -match "Nothing was changed on this PC") "[$($case.label)] it says nothing was changed"
-        Assert-True ((Get-D0InstallFingerprint $b2.Root) -eq $before) "[$($case.label)] ...and nothing was: no key, no state file, no .cer"
+        Assert-True ((Test-D0Unchanged $b2.Root $before)) "[$($case.label)] ...and nothing was: no key, no state file, no .cer"
         Assert-True (@(Get-D0RequestsSince $mark).Count -eq 0) "[$($case.label)] nothing was sent anywhere"
     }
     # Every refusal's console text and log, not only the last one's: the value typed by mistake is in the FIRST case.
@@ -573,7 +584,7 @@ try {
     Show-D0Run $r "S2 value missing"
     Assert-True (-not $r.TimedOut -and $r.ExitCode -ne 0) "[value missing] a non-zero exit (got $($r.ExitCode))"
     Assert-True (($r.StdOut + $r.StdErr) -notmatch "ENROLLED") "[value missing] nothing claims an enrollment"
-    Assert-True ((Get-D0InstallFingerprint $b2.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[value missing] nothing was changed and nothing was sent"
+    Assert-True ((Test-D0Unchanged $b2.Root $before) -and @(Get-D0RequestsSince $mark).Count -eq 0) "[value missing] nothing was changed and nothing was sent"
 
     # -EnrollClientId without -EnrollCert: it must not be ignored (the agent would start its normal loop).
     $before = Get-D0InstallFingerprint $b2.Root; $mark = Get-D0Mark
@@ -581,7 +592,7 @@ try {
     Show-D0Run $r "S2 without -EnrollCert"
     Assert-True (-not $r.TimedOut -and $r.ExitCode -eq 1) "[without -EnrollCert] it stops with exit 1 instead of starting the agent (got $($r.ExitCode), timedOut=$($r.TimedOut))"
     Assert-True ($r.Log -match "-EnrollClientId is used only together with -EnrollCert") "[without -EnrollCert] ...and says why"
-    Assert-True ((Get-D0InstallFingerprint $b2.Root) -eq $before -and @(Get-D0RequestsSince $mark).Count -eq 0) "[without -EnrollCert] nothing was changed and nothing was sent"
+    Assert-True ((Test-D0Unchanged $b2.Root $before) -and @(Get-D0RequestsSince $mark).Count -eq 0) "[without -EnrollCert] nothing was changed and nothing was sent"
 
     # A configuration that still holds a placeholder for the bay is not a bay yet.
     $b2c = New-D0Bay -Name "refusal-config" -LeaveBayIdPlaceholder

@@ -477,7 +477,12 @@ try {
     Assert-True ($null -ne $rbText) "Assert-SetupFolderLockHeld is defined once in Setup-BayPC.ps1"
     if ($null -ne $rbText) {
         . ([scriptblock]::Create($rbText))
-        $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        # DEV-02: the owner of the folders THIS process creates. It is the account's own SID on a normal PC, but an elevated
+        # administrator (a hosted CI runner) creates folders owned by the Administrators group (S-1-5-32-544), so the account
+        # SID alone made "owner on the list" fail there. Reading the owner back keeps the case meaning what it said.
+        $ownerProbe = Join-Path $BaseDir "rb-owner-probe"
+        New-Item -ItemType Directory -Force -Path $ownerProbe | Out-Null
+        $meSid = (Get-Item -LiteralPath $ownerProbe).GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value
         $mkLock = {
             param([string]$name, [int]$unprotectIndex)
             $r = Join-Path $BaseDir ("rb-" + $name)

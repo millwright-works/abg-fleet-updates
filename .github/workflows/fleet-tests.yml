@@ -18,6 +18,9 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          # BayAgent.UpdateGuard replays a historical commit (git show 514ad6d...:path); a shallow clone does not hold it.
+          fetch-depth: 0
 
       - name: Run every non-Live suite under Windows PowerShell 5.1
         shell: powershell

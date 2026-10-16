@@ -45,9 +45,10 @@ try {
       $failed += $s
       Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'FAIL' } | Select-Object -First 20 | ForEach-Object { Write-Host ('   ' + $_) }
       # A GitHub error annotation, so the reason is readable on the run page without downloading the log artifact.
-      $why = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*FAIL\s|Exception|CategoryInfo|FullyQualifiedErrorId' } | Select-Object -First 4 | ForEach-Object { $_.Trim() })
+      $why = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*FAIL\s' } | Select-Object -First 8 | ForEach-Object { $_.Trim() })
+      if ($why.Count -eq 0) { $why = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'Exception|CategoryInfo|FullyQualifiedErrorId' } | Select-Object -First 4 | ForEach-Object { $_.Trim() }) }
       $msg = ('{0} exit={1}: {2}' -f $s, $code, ($why -join ' // '))
-      if ($msg.Length -gt 900) { $msg = $msg.Substring(0, 900) }
+      if ($msg.Length -gt 1800) { $msg = $msg.Substring(0, 1800) }
       Write-Host ('::error title=suite failed::' + $msg.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A'))
     }
   }
