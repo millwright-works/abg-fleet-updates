@@ -52,8 +52,10 @@ jobs:
           )
           # EXCLUDED-END
           & .\tools\ci\Run-FleetSuites.ps1 -Suites $suites -Excluded $excluded -LogDir fleet-test-logs
+          $okFleet = $?
           $codeFleet = $LASTEXITCODE
-          if ($codeFleet -ne 0) { exit $codeFleet }
+          if ($codeFleet) { exit $codeFleet }
+          if (-not $okFleet) { exit 1 }
           exit 0
 
       - name: Upload suite logs
